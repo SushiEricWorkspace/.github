@@ -48,6 +48,27 @@ type: 変更内容の概要
 概要は変更の目的が分かる簡潔な文にする。
 主な`type`は`feat`、`fix`、`refactor`、`docs`、`test`、`build`、`chore`とする。
 
+### ラベル
+
+- ラベル名は`<分類>: <値>`形式を使用し、分類名と値は小文字の英字で統一する。
+- 優先度ラベルは次の4種類だけを使用する。
+  - `priority: critical`
+  - `priority: high`
+  - `priority: medium`
+  - `priority: low`
+- 種別ラベルは次の7種類だけを使用する。
+  - `type: bug`
+  - `type: feature`
+  - `type: refactor`
+  - `type: docs`
+  - `type: test`
+  - `type: build`
+  - `type: chore`
+- `priority`は依頼内容、Issue、既存情報などから優先度が明確な場合だけ付与し、AIが独断で優先度を推測しない。
+- PRの`type`ラベルは主な変更種別に合わせる。`fix`は`type: bug`、`feat`は`type: feature`とし、`refactor`、`docs`、`test`、`build`、`chore`は同名の`type`ラベルへ対応させる。
+- 上記と同じ意味の別表記、大文字小文字違い、接頭辞なしのラベルを作成・使用しない。
+- 一覧にないOrganization共通ラベルをAIが独断で新規作成しない。
+
 ### Pull Request
 
 - PRを作成する場合は、SushiEricWorkspaceのOrganization共通PRテンプレートに従う。
