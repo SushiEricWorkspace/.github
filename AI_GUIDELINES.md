@@ -51,6 +51,7 @@
 - `run/`など、gitの追跡外だが実行に必要なディレクトリはスクリプトが複製する。`.idea/`はIDE用のため複製しない。
 - `build/`や`.gradle/`はworktreeごとに独立するため、初回ビルドはフルビルドになる。
 - worktreeを削除するときは`--remove`または`git worktree remove`を使用する。ディレクトリを直接削除すると管理情報が残り、`git worktree prune`が必要になる。
+- Claude Code用スキルの原本は`.github`が持つ。`--install-skill`で各リポジトリの`.claude/`へ配置するが、`.claude/`はgit管理対象外とし、コミットしない。原本との差異を防ぐため、各自がローカルで配置する。
 
 ### コミットメッセージ
 

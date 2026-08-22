@@ -41,7 +41,8 @@ python scripts/setup-worktrees.py --remove   # 削除
 - `--agents claude` … 対象エージェントを限定する
 - `--base develop` … 起点ブランチを明示する。省略時はoriginの既定ブランチ
 - `--no-copy` … git追跡外ディレクトリ（`run/`など）を複製しない
-- `--install-skill` … このスキルを各リポジトリの`.claude/skills/`へ配置する
+- `--install-skill` … このスキルを各リポジトリの`.claude/skills/`へ配置する。
+  `.claude/`はgit管理対象外なので、環境ごとに各自で実行する
 
 ## 作成後の作業手順
 
