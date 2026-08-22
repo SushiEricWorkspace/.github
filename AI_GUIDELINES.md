@@ -33,6 +33,25 @@
 - 同一目的の実装、呼び出し元変更、必要なドキュメント更新は、原則として1つの論理的なコミットにまとめる。
 - 無関係な変更は同じコミットへ含めない。
 
+### worktree運用
+
+複数のAIを同時に運用するため、エージェントごとにgit worktreeを分ける。同じ作業ディレクトリを共有するとブランチの切り替えと作業ツリーが衝突するためである。
+
+`<repo>`は対象リポジトリのディレクトリ名を指す。
+
+| ディレクトリ | 担当 |
+|---|---|
+| `<repo>/` | 人間・IDE（primary worktree） |
+| `<repo>-claude/` | Claude Code |
+| `<repo>-codex/` | Codex |
+
+- 自分の担当以外のworktreeで作業しない。primary worktreeは人間が使用するため、AIから勝手にブランチを切り替えない。
+- worktreeの作成・削除は`.github`リポジトリの`scripts/setup-worktrees.py`を使用する。`.github`は各リポジトリと同じ親ディレクトリへcloneしておく。
+- worktreeはdetached HEADで作成される。同じブランチは1つのworktreeでしかチェックアウトできないため、作成時点ではブランチを占有しない。作業開始時に`feature/issue-<Issue番号>`を作成する。
+- `run/`など、gitの追跡外だが実行に必要なディレクトリはスクリプトが複製する。`.idea/`はIDE用のため複製しない。
+- `build/`や`.gradle/`はworktreeごとに独立するため、初回ビルドはフルビルドになる。
+- worktreeを削除するときは`--remove`または`git worktree remove`を使用する。ディレクトリを直接削除すると管理情報が残り、`git worktree prune`が必要になる。
+
 ### コミットメッセージ
 
 コミットメッセージは次の形式で日本語を使用する。
