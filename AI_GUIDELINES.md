@@ -23,6 +23,16 @@
 - ドキュメントやKDocのコード例は、現在存在する型、メソッド、引数、パッケージと一致させる。
 - 実装変更によって既存ドキュメントが不正確になる場合は同じ作業内で更新する。
 
+### ビルド環境
+
+- JDK 21を使用する。他のバージョンではビルドが失敗する。
+- Gradle daemonのJVMは各リポジトリの`gradle/gradle-daemon-jvm.properties`で21に固定している。`JAVA_HOME`が別バージョンを指していても、daemonはJDK 21で起動する。このファイルを削除・変更しない。
+- 上記はJDK 21がインストール済みであることを前提とする。未インストールの環境では`No matching toolchains`で失敗するため、JDK 21を導入する。
+- 新しいJDKでビルドすると次の失敗が起きるため、原因を切り分ける手がかりとする。
+  - `Inconsistent JVM-target compatibility detected for tasks 'compileJava' and 'compileKotlin'` … Javaのtoolchain指定が効いておらず、KotlinがGradleのJVMを使っている。
+  - `IllegalArgumentException: <バージョン>` が`org.jetbrains.kotlin.com.intellij.util.lang.JavaVersion.parse`で発生 … KotlinコンパイラがそのJDKに未対応。daemonのJVMを21へ固定して回避する。
+- Javaのtoolchain指定を実行中のJVMバージョンで条件分岐させない。条件付きにすると、新しいJDKでGradleを動かしたときにtoolchainが未設定となり、JavaとKotlinのJVM targetが食い違う。
+
 ### Git操作
 
 - commitまたはpushは、ユーザーが明示的に依頼した場合だけ実行する。
