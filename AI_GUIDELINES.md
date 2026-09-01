@@ -58,6 +58,8 @@
 - 自分の担当以外のworktreeで作業しない。primary worktreeは人間が使用するため、AIから勝手にブランチを切り替えない。
 - worktreeの作成・削除は`.github`リポジトリの`scripts/setup-worktrees.py`を使用する。`.github`は各リポジトリと同じ親ディレクトリへcloneしておく。
 - worktreeはdetached HEADで作成される。同じブランチは1つのworktreeでしかチェックアウトできないため、作成時点ではブランチを占有しない。作業開始時に`feature/issue-<Issue番号>`を作成する。
+- 作業ブランチをマージして削除したあとなど、チェックアウトすべき作業ブランチが無い状態では、開発基準ブランチの最新commitでdetached HEADへ戻す。`git checkout --detach origin/main`のように指定する。`develop`を開発基準としているリポジトリでは`origin/develop`を使用する。
+- `main`や`develop`はprimary worktreeが占有しているため、AI用worktreeでこれらのブランチを直接チェックアウトしない。
 - `run/`など、gitの追跡外だが実行に必要なディレクトリはスクリプトが複製する。`.idea/`はIDE用のため複製しない。
 - `build/`や`.gradle/`はworktreeごとに独立するため、初回ビルドはフルビルドになる。
 - worktreeを削除するときは`--remove`または`git worktree remove`を使用する。ディレクトリを直接削除すると管理情報が残り、`git worktree prune`が必要になる。
