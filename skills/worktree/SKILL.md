@@ -65,6 +65,8 @@ git checkout -b feature/issue-<Issue番号> origin/<開発基準ブランチ>
   スクリプトは`run/`だけを複製する。`.idea/`はIDE用のため複製しない。
 - **ビルド成果物** … `build/`と`.gradle/`はworktreeごとに独立するため、
   初回ビルドはフルビルドになる。共有キャッシュの再取得は発生しない。
-- **サーバーの同時起動** … 同じポートを使うため複数worktreeで同時に起動できない。
+- **サーバーの同時起動** … 待ち受けポートとRCONポートをworktreeごとに分ける。
+  同じポートのままでは後から起動した側が`BindException`で失敗する。
+  停止はRCONへ`stop`を送る。強制終了は保存処理が行われない。
 - **削除** … 必ず`--remove`か`git worktree remove`を使う。ディレクトリを直接消すと
   管理情報が残り`git worktree prune`が必要になる。
