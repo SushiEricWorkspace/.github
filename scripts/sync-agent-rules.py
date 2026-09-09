@@ -9,7 +9,7 @@ START = "<!-- COMMON-RULES:START -->"
 END = "<!-- COMMON-RULES:END -->"
 TARGETS = (
     "Common/AGENTS.md",
-    "SushiEricDataEditor/AGENTS.md",
+    "SushiEricServerManager/AGENTS.md",
     "SushiEricServerMod/AGENTS.md",
 )
 

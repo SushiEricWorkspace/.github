@@ -23,7 +23,7 @@ from pathlib import Path
 
 REPOSITORIES = (
     "Common",
-    "SushiEricDataEditor",
+    "SushiEricServerManager",
     "SushiEricServerMod",
 )
 
