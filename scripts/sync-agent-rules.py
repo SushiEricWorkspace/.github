@@ -11,6 +11,7 @@ TARGETS = (
     "Common/AGENTS.md",
     "SushiEricServerManager/AGENTS.md",
     "SushiEricServerMod/AGENTS.md",
+    "SushiEricCombatCore/AGENTS.md",
 )
 
 
