@@ -25,6 +25,7 @@ REPOSITORIES = (
     "Common",
     "SushiEricServerManager",
     "SushiEricServerMod",
+    "SushiEricCombatCore",
 )
 
 DEFAULT_AGENTS = ("claude", "codex")
