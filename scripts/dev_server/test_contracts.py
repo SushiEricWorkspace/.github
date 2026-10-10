@@ -96,6 +96,15 @@ class ContractTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(ContractError):
                 absolute_path(path)
 
+    def test_macos_backup_case_and_unicode_overlap_rejected(self):
+        for root, backup in (("/synthetic/Root", "/synthetic/root/backup"),
+                             ("/synthetic/é", "/synthetic/e\u0301/backup")):
+            value = deepcopy(self.documents["inventory"])
+            value["managementRoot"] = root
+            value["backup"]["destination"] = backup
+            with self.subTest(root=root), self.assertRaises(ContractError):
+                validate("inventory", value)
+
     def test_a08_same_uuid_and_generation(self):
         fixture = deepcopy(self.documents["fixture"])
         fixture["expected"]["modProfileFile"] = "config/SushiEricServerMod/player_data/other/profile.yml"

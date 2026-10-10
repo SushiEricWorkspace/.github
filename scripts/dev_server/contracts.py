@@ -96,6 +96,10 @@ def validate(kind: str, value: dict) -> None:
         root = absolute_path(value["managementRoot"], "inventory.managementRoot")
         destination = absolute_path(backup["destination"], "inventory.backup.destination")
         _require(type(root) is type(destination), kind, "管理rootとバックアップ先のOS形式を揃えてください")
+        # APFSの大小文字・Unicode同名解決も、安全側に重複として扱う。
+        flavor = type(root)
+        root = flavor(unicodedata.normalize("NFC", str(root)).casefold())
+        destination = flavor(unicodedata.normalize("NFC", str(destination)).casefold())
         _require(root != destination and root not in destination.parents and destination not in root.parents, kind, "バックアップ先と管理rootを分離してください")
         ids, ports = [], []
         for instance in value["instances"]:
