@@ -5,6 +5,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from dev_server.task_worktrees import workspace_for
+
 START = "<!-- COMMON-RULES:START -->"
 END = "<!-- COMMON-RULES:END -->"
 TARGETS = (
@@ -73,7 +75,7 @@ def main() -> int:
     workspace_root = (
         args.workspace_root.resolve()
         if args.workspace_root
-        else github_repo_root.parent
+        else workspace_for(github_repo_root)
     )
     common_rules = (github_repo_root / "AI_GUIDELINES.md").read_text(encoding="utf-8")
 

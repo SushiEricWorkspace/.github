@@ -55,6 +55,12 @@ def worktrees(repo: Path) -> dict[Path, str | None]:
     return result
 
 
+def workspace_for(repo: Path) -> Path:
+    """スクリプト自身がタスクworktreeにある場合もprimaryの親をworkspaceにする。"""
+    common = Path(git(repo, "rev-parse", "--git-common-dir"))
+    return (repo / common).resolve().parent.parent
+
+
 def clean(target: Path, *, deleting: bool = False) -> None:
     require(not git(target, "status", "--porcelain", "--untracked-files=all"),
             f"未コミット変更があります: {target}")
@@ -126,6 +132,7 @@ class TaskWorktrees:
         require(name in REPOSITORIES, f"対象外のrepoです: {name}")
         repo = self.workspace / name
         plain_path(repo)
+        plain_path(repo / ".git")
         require((repo / ".git").is_dir(), f"primary repositoryがありません: {repo}")
         common = Path(git(repo, "rev-parse", "--git-common-dir"))
         require((repo / common).resolve() == (repo / ".git").resolve(),

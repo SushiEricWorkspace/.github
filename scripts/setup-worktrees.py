@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sys
 
-from dev_server.task_worktrees import REPOSITORIES, TaskError, TaskWorktrees, git, require
+from dev_server.task_worktrees import REPOSITORIES, TaskError, TaskWorktrees, git, require, workspace_for
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        manager = TaskWorktrees(args.workspace_root or Path(__file__).resolve().parents[2])
+        manager = TaskWorktrees(args.workspace_root or workspace_for(Path(__file__).resolve().parents[1]))
         if args.list_legacy:
             result = {name: git(manager.primary(name), "worktree", "list")
                       for name in REPOSITORIES if (manager.workspace / name / ".git").is_dir()}

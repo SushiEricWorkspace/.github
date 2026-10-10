@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from dev_server.task_worktrees import TaskError, TaskWorktrees, git, worktrees
+from dev_server.task_worktrees import TaskError, TaskWorktrees, git, worktrees, workspace_for
 
 
 class TaskWorktreesTest(unittest.TestCase):
@@ -205,6 +205,12 @@ class TaskWorktreesTest(unittest.TestCase):
     def test_list_does_not_create_workspace_state(self):
         self.assertEqual([], self.manager.list())
         self.assertFalse((self.root / "worktrees").exists())
+
+    def test_workspace_is_resolved_from_primary_git_directory(self):
+        self.create()
+        task = self.manager.target("task-a", "SushiEricServerMod")
+        self.assertEqual(self.root.resolve(), workspace_for(task))
+        self.assertEqual(self.root.resolve(), workspace_for(self.root / "SushiEricServerMod"))
 
 
 if __name__ == "__main__":
