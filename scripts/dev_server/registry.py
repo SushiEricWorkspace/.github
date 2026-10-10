@@ -6,6 +6,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 import sqlite3
+import threading
 import time
 import uuid
 
@@ -47,7 +48,7 @@ CREATE TABLE instances(
  epoch INTEGER NOT NULL DEFAULT 0, lease TEXT, owner TEXT, expires REAL,
  generation_bound INTEGER NOT NULL DEFAULT 0,
  writers INTEGER NOT NULL DEFAULT 0, children INTEGER NOT NULL DEFAULT 0,
- pending INTEGER NOT NULL DEFAULT 0, clean_proof TEXT);
+ pending INTEGER NOT NULL DEFAULT 0, clean_proof TEXT, artifact TEXT, run_id TEXT, runtime_proof TEXT);
 CREATE TABLE ports(port INTEGER PRIMARY KEY, instance TEXT NOT NULL REFERENCES instances(id), service TEXT NOT NULL);
 CREATE TABLE operations(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL);
 CREATE TABLE reservations(operation TEXT NOT NULL, reference TEXT NOT NULL,
@@ -56,6 +57,14 @@ CREATE TABLE reservations(operation TEXT NOT NULL, reference TEXT NOT NULL,
 CREATE TABLE reference_operations(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, instance TEXT NOT NULL,
  lease TEXT NOT NULL, epoch INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE audit(sequence INTEGER PRIMARY KEY, at REAL NOT NULL, operation TEXT NOT NULL, command TEXT NOT NULL);
+CREATE TABLE runtime_operations(
+ id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, command TEXT NOT NULL, instance TEXT NOT NULL,
+ status TEXT NOT NULL, response TEXT NOT NULL);
+CREATE TABLE runs(id TEXT PRIMARY KEY, instance TEXT NOT NULL, generation TEXT NOT NULL, record TEXT NOT NULL);
+CREATE TABLE endpoint_reservations(
+ run TEXT NOT NULL, instance TEXT NOT NULL, service TEXT NOT NULL,
+ host TEXT NOT NULL, protocol TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, v6Only INTEGER NOT NULL,
+ PRIMARY KEY(run,service));
 """
 
 
@@ -95,7 +104,7 @@ def initialize(inventory: dict, *, operation_id: str, dry_run: bool = False) -> 
         directory = root / "manager" / name
         directory.mkdir()
         make_private(directory, directory=True)
-    for name in ["supervisor"] + [f"instance-{row['instanceId']}" for row in inventory["instances"]]:
+    for name in ["supervisor", "deployment"] + [f"instance-{row['instanceId']}" for row in inventory["instances"]]:
         lock = root / "manager" / "locks" / f"{name}.lock"
         lock.write_bytes(b"0")
         make_private(lock)
@@ -112,7 +121,7 @@ def initialize(inventory: dict, *, operation_id: str, dry_run: bool = False) -> 
         connection.execute("PRAGMA synchronous=FULL")
         connection.executescript(SCHEMA)
         with connection:
-            connection.execute("INSERT INTO meta VALUES ('schemaVersion','1')")
+            connection.execute("INSERT INTO meta VALUES ('schemaVersion','2')")
             connection.execute("INSERT INTO meta VALUES ('initOperation',?)", (operation_id,))
             digest = hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
             connection.execute("INSERT INTO meta VALUES ('inventoryHash',?)", (digest,))
@@ -124,7 +133,7 @@ def initialize(inventory: dict, *, operation_id: str, dry_run: bool = False) -> 
         connection.close()
     make_private(database)
     marker = root / "manager" / "INITIALIZED"
-    marker.write_text("registry-v1\n", encoding="utf-8")
+    marker.write_text("registry-v2\n", encoding="utf-8")
     make_private(marker)
     return {"initialized": True, "instances": [row["instanceId"] for row in inventory["instances"]]}
 
@@ -134,6 +143,7 @@ class Registry:
     def __init__(self, root: Path, *, clock=time.time):
         self.root = root
         self.clock = clock
+        self.db_lock = threading.RLock()
         if os.name == "nt":
             from .windows_security import require_local_volume
             require_local_volume(root)
@@ -141,7 +151,7 @@ class Registry:
             require_private(directory, directory=True)
         for name in ("inventory.json", "registry.sqlite", "INITIALIZED"):
             require_private(root / "manager" / name)
-        require((root / "manager" / "INITIALIZED").read_text(encoding="utf-8") == "registry-v1\n",
+        require((root / "manager" / "INITIALIZED").read_text(encoding="utf-8") == "registry-v2\n",
                 "RECOVERY_REQUIRED", "初期化が完了していません")
         self.inventory = json.loads((root / "manager" / "inventory.json").read_text(encoding="utf-8"))
         validate("inventory", self.inventory)
@@ -149,7 +159,7 @@ class Registry:
         with self.transaction(read_only=True) as connection:
             meta = dict(connection.execute("SELECT key,value FROM meta"))
             digest = hashlib.sha256(json.dumps(self.inventory, sort_keys=True).encode()).hexdigest()
-            require(meta.get("schemaVersion") == "1" and meta.get("inventoryHash") == digest,
+            require(meta.get("schemaVersion") == "2" and meta.get("inventoryHash") == digest,
                     "RECOVERY_REQUIRED", "Registryとinventoryが一致しません")
             actual_ids = {row[0] for row in connection.execute("SELECT id FROM instances")}
             declared_ids = {row["instanceId"] for row in self.inventory["instances"]}
@@ -157,27 +167,30 @@ class Registry:
             declared_ports = {(port, row["instanceId"], service) for row in self.inventory["instances"] for service, port in row["ports"].items()}
             require(actual_ids == declared_ids and actual_ports == declared_ports,
                     "RECOVERY_REQUIRED", "登録枠またはポートがinventoryと一致しません")
+        from .runtime_control import RuntimeControl
+        self.runtime = RuntimeControl(self)
 
     @contextmanager
     def transaction(self, *, read_only: bool = False):
         """短いDB操作のみ。コピー・IPC・OS lock待機をtransactionへ持ち込まない。"""
-        database = self.root / "manager" / "registry.sqlite"
-        require_private(database)
-        connection = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=0)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA foreign_keys=ON")
-            connection.execute("PRAGMA synchronous=FULL")
-            if read_only:
-                connection.execute("PRAGMA query_only=ON")
-            connection.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
-            yield connection
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        with self.db_lock:
+            database = self.root / "manager" / "registry.sqlite"
+            require_private(database)
+            connection = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=0)
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("PRAGMA synchronous=FULL")
+                if read_only:
+                    connection.execute("PRAGMA query_only=ON")
+                connection.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
+                yield connection
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def begin_supervision(self) -> str:
         """前回起動の有無を検査し、再起動時には全枠を復旧待ちにする。"""
@@ -207,11 +220,11 @@ class Registry:
         require(not any(row[field] for field in ("writers", "children", "pending")), "BUSY", "writer・child・未完了操作が残っています")
         require(not connection.execute("SELECT 1 FROM reservations WHERE instance=?", (row["id"],)).fetchone(),
                 "BUSY", "参照予約が残っています")
-        # #529/#530/#533が保存証跡と実プロセス照合を提供するまでは、実データ枠を解放しない。
+        # 外部writer/世代引継ぎの照合は#531/#533で接続する。runtime証明だけでは解放しない。
         path = self.root / "instances" / row["id"]
         plain_path(path)
         require(row["generation"] is None and (not path.exists() or (path.is_dir() and not any(path.iterdir()))),
-                "PROOF_REQUIRED", "保存・プロセス終了証跡の対応前は実データ枠を解放できません")
+                "PROOF_REQUIRED", "外部writer・世代引継ぎ照合前は実データ枠を解放できません")
 
     def _cached_valid(self, connection, command, payload, result):
         if command == "shutdown":
@@ -230,6 +243,10 @@ class Registry:
 
     def execute(self, command: str, payload: dict, *, operation_id: str, dry_run: bool = False) -> dict:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
+        if command in {"prepare", "start", "stop"}:
+            return self.runtime.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
+        if command in {"list", "status", "doctor"} and not dry_run:
+            self.runtime.refresh()
         mutations = {"acquire", "renew", "release", "shutdown"}
         require(command in mutations | {"list", "status", "doctor"}, "NOT_IMPLEMENTED", "この操作は未実装です")
         identifier(operation_id, "operationId")
@@ -247,12 +264,15 @@ class Registry:
                     rows = connection.execute("SELECT * FROM instances ORDER BY id").fetchall()
                 result = [{"instanceId": row["id"], "state": row["state"], "generation": row["generation"],
                            "epoch": row["epoch"], "owner": row["owner"], "leaseExpired": bool(row["lease"] and row["expires"] <= self.clock()),
-                           "generationBound": bool(row["generation_bound"])} for row in rows]
-                return {"instances": result, "supervisor": "reachable", "ports": "declaration-only-not-bound",
-                        "unimplemented": ["prepare", "start", "stop", "snapshot", "restore", "recover", "gc"]}
+                           "generationBound": bool(row["generation_bound"]),
+                           "runtimeStopProof": bool(row["runtime_proof"]), "snapshotClean": False} for row in rows]
+                return {"instances": result, "supervisor": "reachable", "ports": "inventory-and-runtime-reservations",
+                        "unimplemented": ["snapshot", "restore", "recover", "gc"]}
             cached = connection.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
             require(not connection.execute("SELECT 1 FROM reference_operations WHERE id=?", (operation_id,)).fetchone(),
                     "OPERATION_CONFLICT", "同じoperationIdが参照予約で使用されています")
+            require(not connection.execute("SELECT 1 FROM runtime_operations WHERE id=?", (operation_id,)).fetchone(),
+                    "OPERATION_CONFLICT", "同じoperationIdがruntime操作で使用されています")
             if cached:
                 require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "同じoperationIdに異なるpayloadを指定できません")
                 result = json.loads(cached["response"])
@@ -261,6 +281,8 @@ class Registry:
                     return dict(result, shutdown=not dry_run, replayed=True, dryRun=dry_run)
                 return dict(result, replayed=True, dryRun=dry_run)
             if command == "shutdown":
+                require(not connection.execute("SELECT 1 FROM instances WHERE pending != 0 AND state != 'RECOVERY_REQUIRED'").fetchone(),
+                        "BUSY", "進行中runtime操作があるため監督を終了できません")
                 boot = connection.execute("SELECT value FROM meta WHERE key='supervisorBoot'").fetchone()
                 require(boot is not None, "INVALID_STATE", "監督の起動識別がありません")
                 if dry_run:
@@ -311,6 +333,8 @@ class Registry:
             fingerprint = hashlib.sha256(json.dumps({"payload": payload, "references": sorted(expected)}, sort_keys=True).encode()).hexdigest()
             require(not connection.execute("SELECT 1 FROM operations WHERE id=?", (operation_id,)).fetchone(),
                     "OPERATION_CONFLICT", "同じoperationIdが別の変更で使用されています")
+            require(not connection.execute("SELECT 1 FROM runtime_operations WHERE id=?", (operation_id,)).fetchone(),
+                    "OPERATION_CONFLICT", "同じoperationIdがruntime操作で使用されています")
             recorded = connection.execute("SELECT * FROM reference_operations WHERE id=?", (operation_id,)).fetchone()
             if recorded:
                 require(recorded["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "参照予約のoperationIdが別の入力で使用されています")

@@ -43,8 +43,13 @@ def _sid_string(sid) -> str:
 
 def current_sid() -> str:
     """実効プロセス所有者のSIDを返す。ユーザー名・環境変数から推測しない。"""
+    return process_sid(kernel.GetCurrentProcess())
+
+
+def process_sid(handle) -> str:
+    """指定した実プロセス所有者のSIDを取得する。"""
     token = w.HANDLE()
-    _check(advapi.OpenProcessToken(kernel.GetCurrentProcess(), 8, ctypes.byref(token)))
+    _check(advapi.OpenProcessToken(handle, 8, ctypes.byref(token)))
     try:
         length = w.DWORD()
         advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(length))

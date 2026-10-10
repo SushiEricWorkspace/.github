@@ -288,25 +288,36 @@ def verify_bundle(root: Path) -> dict:
     return manifest
 
 
-def launch_command(root: Path, profile: str, run: Path) -> list[str]:
-    """検証済みbundleからコマンドを組む。JVMの開始・世代操作は呼出側の責務。"""
+def launch_command(root: Path, profile: str, run: Path, *, auxiliary: Path | None = None,
+                   jvm_properties: dict[str, str] | None = None) -> list[str]:
+    """補助設定だけを新規auxiliaryへ出力し、runのcwd/rootは変更しない。
+
+    管理propertyは全5項目または未指定。JVMの開始・世代操作は呼出側の責務。
+    """
     verify_bundle(root)
     descriptor = json.loads(regular_bytes(root / "launch/profiles.json"))
     _require(descriptor["version"] == 1 and descriptor["platform"] == platform.system()
              and descriptor["machine"] == platform.machine(), "launch: 作成OS/アーキテクチャと一致しません")
     recipe = descriptor["profiles"][profile]
     _directory(run)
-    _require(root != run and root not in run.parents and run not in root.parents, "launch: bundleと実行データを分離してください")
-    auxiliary = run / ".launch"
+    _require(root != run and root not in run.parents, "launch: bundle内へ実行データを置けません")
+    auxiliary = auxiliary if auxiliary is not None else run / ".launch"
+    properties = jvm_properties if jvm_properties is not None else {}
+    _require(not properties or properties.keys() == {"instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest"},
+             "launch: 管理propertyは全項目が必要です")
+    _require(all(type(value) is str and value for value in properties.values()), "launch: 管理propertyが不正です")
+    _require(auxiliary.is_absolute() and not auxiliary.exists(), "launch: 新しい絶対補助pathが必要です")
+    _require(root != auxiliary and root not in auxiliary.parents, "launch: bundleへ起動補助を書き込めません")
     # 古い起動設定を上書きしない。ハーネスがrun-idごとの新規ディレクトリを用意する。
     auxiliary.mkdir(parents=True, exist_ok=False)
-    replace = lambda value: value.replace("${bundle}", str(root.absolute())).replace("${run}", str(run.absolute()))
+    replace = lambda value: value.replace("${run}/.launch", str(auxiliary)).replace("${bundle}", str(root.absolute())).replace("${run}", str(run.absolute()))
     for suffix in ("launch.cfg", "remap-classpath.txt"):
         source = root / f"launch/{profile}-{suffix}"
         data = replace(regular_bytes(source).decode())
         (auxiliary / f"{profile}-{suffix}").write_text(data, encoding="utf-8")
     java = root / "jdk/bin" / ("java.exe" if os.name == "nt" else "java")
-    arguments = [*map(replace, recipe["jvmArgs"]), "-cp",
+    additions = ["-Dsushieric.managed." + key + "=" + value for key, value in properties.items()]
+    arguments = [*additions, *map(replace, recipe["jvmArgs"]), "-cp",
                  os.pathsep.join(str(root / entry) for entry in recipe["classpath"]), recipe["mainClass"], *recipe["args"]]
     # Windowsのコマンド長上限を避ける。Javaの引用内ではbackslashをescapeする。
     argfile = auxiliary / "java.args"

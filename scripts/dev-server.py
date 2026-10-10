@@ -30,6 +30,7 @@ def main() -> int:
     parser.add_argument("--payload", default="{}", help="command固有のJSON object")
     parser.add_argument("--payload-file", type=Path, help="shellの引用符処理を避けてJSON objectをファイルで指定")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--timeout-seconds", type=int, default=5, help="IPC応答の待機期限。期限後も自動再送/killしない")
     args = parser.parse_args()
     operation_id = args.operation_id
     try:
@@ -49,6 +50,8 @@ def main() -> int:
             supervise(args.root)
             return 0
         else:
+            if args.command in {"prepare", "start", "stop"} and operation_id is None:
+                raise RegistryError("INVALID_INPUT", "runtime操作には再送用の--operation-idを明示してください")
             if args.inventory is not None:
                 raise RegistryError("INVALID_INPUT", "--inventoryはinitだけで指定してください")
             if args.payload_file is not None and args.payload != "{}":
@@ -59,7 +62,9 @@ def main() -> int:
                 raise RegistryError("INVALID_INPUT", "payloadは有限値・重複項目なしのJSON objectで指定してください") from None
             message = new_request(args.command, payload, operation_id=operation_id, dry_run=args.dry_run)
             operation_id = message["operationId"]
-            response = request(args.root, message)
+            if args.timeout_seconds <= 0:
+                raise RegistryError("INVALID_INPUT", "IPC待機期限は正整数で指定してください")
+            response = request(args.root, message, timeout=args.timeout_seconds)
     except (RegistryError, ContractError) as error:
         response = {"ok": False, "operationId": operation_id, "error": {"code": getattr(error, "code", "INVALID_INPUT"), "message": str(error)}}
     except BuildLockError:

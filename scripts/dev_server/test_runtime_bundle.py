@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -105,6 +106,38 @@ class RuntimeBundleTests(unittest.TestCase):
         argfile = Path(next(arg[1:] for arg in self.recipe["profiles"]["server"]["jvmArgs"] if arg.startswith("@")))
         argfile.write_text("-classpath\n" + os.pathsep.join(self.recipe["profiles"]["server"]["classpath"]) + "\n")
         verify_bundle(self.freeze())
+
+    def test_same_generation_relaunch_uses_new_auxiliary_without_changing_cwd(self):
+        bundle = self.freeze()
+        generation = self.root / "generation"
+        generation.mkdir()
+        deployed = generation / "runtime"
+        shutil.copytree(bundle, deployed)
+        properties = {"instanceId": "persistent-01", "generationId": "generation-01", "startNonce": "nonce-01",
+                      "proofPath": str(self.root / "proof.json"), "runtimeManifest": str(deployed / "runtime.json")}
+        first = self.root / "diagnostics/run-01"
+        second = self.root / "diagnostics/run-02"
+        one = launch_command(deployed, "server", generation, auxiliary=first, jvm_properties=properties)
+        preserved = (first / "java.args").read_bytes()
+        two = launch_command(deployed, "server", generation, auxiliary=second,
+                             jvm_properties=dict(properties, startNonce="nonce-02"))
+        self.assertNotEqual(one, two)
+        self.assertEqual(preserved, (first / "java.args").read_bytes())
+        self.assertIn(str(second).replace("\\", "\\\\"), (second / "java.args").read_text())
+        self.assertIn(str(second), (second / "server-launch.cfg").read_text())
+        verify_bundle(deployed)
+        with self.assertRaises(ContractError):
+            launch_command(deployed, "server", deployed / "data", auxiliary=self.root / "invalid")
+        with self.assertRaises(ContractError):
+            launch_command(deployed, "server", generation, auxiliary=first)
+
+    def test_partial_management_properties_rejected_before_writing(self):
+        bundle = self.freeze()
+        run = self.root / "run"
+        run.mkdir()
+        with self.assertRaises(ContractError):
+            launch_command(bundle, "server", run, jvm_properties={"startNonce": "incomplete"})
+        self.assertFalse((run / ".launch").exists())
 
     def test_actual_remapped_fabric_api_is_recorded(self):
         item = next(item for item in self.recipe["artifacts"] if item["coordinate"].startswith("net.fabricmc.fabric-api:fabric-api:"))
