@@ -93,6 +93,37 @@ class RegistryTests(RegistryFixture, unittest.TestCase):
             self.assertEqual(0, connection.execute("SELECT count(*) FROM operations").fetchone()[0])
             self.assertIsNone(connection.execute("SELECT lease FROM instances WHERE id='persistent-01'").fetchone()[0])
 
+    def test_shutdown_conflict_with_lease_and_reference_operations(self):
+        token = self.acquire()
+        self.registry.reserve_references(token, "reserve-test", ["artifact:test"])
+        for operation in ("acquire-test", "reserve-test"):
+            response = dispatch(self.registry, new_request("shutdown", {}, operation_id=operation))
+            self.assertEqual("OPERATION_CONFLICT", response["error"]["code"])
+        self.assertEqual("LEASED_STOPPED", self.command("status", {"instanceId": "persistent-01"})["instances"][0]["state"])
+
+    def test_shutdown_replay_is_bound_to_supervisor_boot(self):
+        first = self.command("shutdown", {}, "shutdown-test")
+        self.assertTrue(first["shutdown"])
+        repeated = self.command("shutdown", {}, "shutdown-test")
+        self.assertEqual(first["bootId"], repeated["bootId"])
+        self.assertTrue(repeated["replayed"])
+        preview = self.command("shutdown", {}, "shutdown-test", True)
+        self.assertFalse(preview["shutdown"])
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(1, connection.execute("SELECT count(*) FROM audit WHERE command='shutdown'").fetchone()[0])
+        self.registry.begin_supervision()
+        self.assert_code("STALE_SUPERVISOR", lambda: self.command("shutdown", {}, "shutdown-test"))
+
+    def test_shutdown_dry_run_does_not_change_state_or_operations(self):
+        self.acquire()
+        before = self.command("list", {})
+        preview = self.command("shutdown", {}, "shutdown-preview", True)
+        self.assertTrue(preview["dryRun"])
+        self.assertFalse(preview.get("shutdown", False))
+        self.assertEqual(before, self.command("list", {}))
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM operations WHERE id='shutdown-preview'").fetchone())
+
     def test_restart_marks_all_frames_recovery(self):
         token = self.acquire()
         self.registry.begin_supervision()
@@ -192,7 +223,8 @@ class RegistryTests(RegistryFixture, unittest.TestCase):
                 require_local_volume(self.root)
 
     def test_json_only_duplicate_keys_and_nonfinite_rejected(self):
-        for value in (b'{"x":1,"x":2}', b'{"x":NaN}', b'[]', b'not-a-pickle'):
+        for value in (b'{"x":1,"x":2}', b'{"x":NaN}', b'[]', b'not-a-pickle',
+                      b'{"x":' + b'[' * 30000 + b']' * 30000 + b'}'):
             with self.assertRaises(ValueError):
                 decode(value)
         with self.assertRaises(ValueError):
@@ -258,6 +290,26 @@ class SupervisorProcessTests(RegistryFixture, unittest.TestCase):
             results = list(executor.map(lambda _: request(self.root, new_request("list", {})), range(32)))
         self.assertTrue(all(result["ok"] for result in results))
         self.assertIsNone(process.poll())
+
+    def test_native_deep_json_is_rejected_without_stopping_supervisor(self):
+        process = self._start()
+        payload = b'{"x":' + b'[' * 30000 + b']' * 30000 + b'}'
+        with patch("dev_server.local_ipc.encode", return_value=payload):
+            with self.assertRaises((OSError, EOFError)):
+                request(self.root, new_request("list", {}))
+        self.assertTrue(request(self.root, new_request("doctor", {}))["ok"])
+        self.assertIsNone(process.poll())
+
+    def test_native_old_shutdown_does_not_stop_restarted_supervisor(self):
+        first = self._start()
+        message = new_request("shutdown", {}, operation_id="shutdown-first")
+        self.assertTrue(request(self.root, message)["ok"])
+        first.wait(timeout=5)
+        second = self._start()
+        response = request(self.root, message)
+        self.assertEqual("STALE_SUPERVISOR", response["error"]["code"])
+        self.assertTrue(request(self.root, new_request("doctor", {}))["ok"])
+        self.assertIsNone(second.poll())
 
     def test_native_singleton_and_restart_recovery(self):
         first = self._start()

@@ -83,6 +83,8 @@ supervisor再起動では、空いていた枠も含め全枠を`RECOVERY_REQUIR
 現段階のrecoverは未実装なので、DBを手編集して貸出を強行しません。
 `shutdown`は監督だけを終了して全枠を復旧待ちにする補助操作です。leaseは解放されません。
 Minecraftの停止コマンドではなく、同一rootの監督停止にだけ使います。
+shutdownもoperationIdを記録し、他の変更とのID衝突を拒否します。
+前回の監督を停止した要求の再送は`STALE_SUPERVISOR`となり、再起動した監督を停止しません。
 
 AVAILABLEのacquireのみ、停止した空枠のreleaseのみを許可します。
 writer/child/pending/参照予約が残る場合もrelease不可です。
@@ -96,6 +98,7 @@ writer/child/pending/参照予約が残る場合もrelease不可です。
 - Windows: owner SIDだけの保護DACL、`PIPE_REJECT_REMOTE_CLIENTS`、byte-range lock。
 - 両方: singleton OS lockを監督期間中保持し、instance OS lockを取得した後に短いSQLite transactionを開始。
 - IPCは64KiB以下のJSON bytesだけ。pickleの復元、秘密を含むpayloadのログ出力は行いません。
+  JSONの解析に失敗する深さの入力は、その接続だけを拒否して監督を継続します。
 
 Windowsのoverlapped I/OはPython 3.12の`_winapi`/`PipeConnection`を使用します。
 Pythonのメジャー/マイナーバージョンを変更するときはnativeテストを再実行してください。

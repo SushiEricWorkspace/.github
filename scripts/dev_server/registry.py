@@ -188,10 +188,6 @@ class Registry:
             connection.execute("INSERT OR REPLACE INTO meta VALUES ('supervisorBoot',?)", (boot,))
         return boot
 
-    def stop_supervision(self):
-        with self.transaction() as connection:
-            connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED'")
-
     def _instance(self, connection, instance_id):
         identifier(instance_id, "instanceId")
         row = connection.execute("SELECT * FROM instances WHERE id=?", (instance_id,)).fetchone()
@@ -218,6 +214,11 @@ class Registry:
                 "PROOF_REQUIRED", "保存・プロセス終了証跡の対応前は実データ枠を解放できません")
 
     def _cached_valid(self, connection, command, payload, result):
+        if command == "shutdown":
+            boot = connection.execute("SELECT value FROM meta WHERE key='supervisorBoot'").fetchone()
+            require(boot is not None and boot[0] == result["bootId"],
+                    "STALE_SUPERVISOR", "前の監督に対する停止要求を再適用できません")
+            return
         row = self._instance(connection, payload["instanceId"])
         if command == "acquire":
             self._token(row, {"leaseId": result["leaseId"], "epoch": result["epoch"], "expectedGeneration": result["generation"]})
@@ -229,13 +230,13 @@ class Registry:
 
     def execute(self, command: str, payload: dict, *, operation_id: str, dry_run: bool = False) -> dict:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
-        mutations = {"acquire", "renew", "release"}
+        mutations = {"acquire", "renew", "release", "shutdown"}
         require(command in mutations | {"list", "status", "doctor"}, "NOT_IMPLEMENTED", "この操作は未実装です")
         identifier(operation_id, "operationId")
         required = {"acquire": {"instanceId", "owner", "ttlSeconds"},
                     "renew": {"instanceId", "leaseId", "epoch", "expectedGeneration", "ttlSeconds"},
                     "release": {"instanceId", "leaseId", "epoch", "expectedGeneration"},
-                    "list": set(), "status": {"instanceId"}, "doctor": set()}
+                    "list": set(), "status": {"instanceId"}, "doctor": set(), "shutdown": set()}
         fields(payload, required[command])
         fingerprint = hashlib.sha256(json.dumps({"command": command, "payload": payload}, sort_keys=True).encode()).hexdigest()
         with self.transaction(read_only=command not in mutations or dry_run) as connection:
@@ -256,7 +257,19 @@ class Registry:
                 require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "同じoperationIdに異なるpayloadを指定できません")
                 result = json.loads(cached["response"])
                 self._cached_valid(connection, command, payload, result)
+                if command == "shutdown":
+                    return dict(result, shutdown=not dry_run, replayed=True, dryRun=dry_run)
                 return dict(result, replayed=True, dryRun=dry_run)
+            if command == "shutdown":
+                boot = connection.execute("SELECT value FROM meta WHERE key='supervisorBoot'").fetchone()
+                require(boot is not None, "INVALID_STATE", "監督の起動識別がありません")
+                if dry_run:
+                    return {"dryRun": True, "wouldExecute": command}
+                result = {"shutdown": True, "bootId": boot[0]}
+                connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED'")
+                connection.execute("INSERT INTO operations VALUES (?,?,?)", (operation_id, fingerprint, json.dumps(result)))
+                connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,?)", (self.clock(), operation_id, command))
+                return result
             row = self._instance(connection, payload["instanceId"])
             if command == "acquire":
                 identifier(payload["owner"], "owner")

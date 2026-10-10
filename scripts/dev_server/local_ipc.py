@@ -78,7 +78,10 @@ def decode(payload: bytes) -> dict:
                 raise ValueError("JSONの項目が重複しています")
             result[key] = value
         return result
-    value = json.loads(payload, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("非有限数です")))
+    try:
+        value = json.loads(payload, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("非有限数です")))
+    except RecursionError as error:
+        raise ValueError("JSONのネストが深すぎます") from error
     if type(value) is not dict:
         raise ValueError("JSON objectが必要です")
     return value

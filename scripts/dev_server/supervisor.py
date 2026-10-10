@@ -31,11 +31,6 @@ def dispatch(registry: Registry, message: dict) -> dict:
         if type(command) is not str:
             raise RegistryError("INVALID_INPUT", "commandは文字列で指定してください")
         payload = message["payload"]
-        if command == "shutdown":
-            fields(payload, set())
-            if not message["dryRun"]:
-                registry.stop_supervision()
-            return {"ok": True, "operationId": operation_id, "result": {"shutdown": not message["dryRun"], "dryRun": message["dryRun"]}}
         if command in {"acquire", "renew", "release"} and type(payload) is dict and "instanceId" in payload:
             instance = identifier(payload["instanceId"], "instanceId")
             if instance not in {row["instanceId"] for row in registry.inventory["instances"]}:
