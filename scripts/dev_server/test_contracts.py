@@ -79,6 +79,23 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             validate("inventory", value)
 
+    def test_windows_absolute_paths_and_backup_overlap(self):
+        value = deepcopy(self.documents["inventory"])
+        value["managementRoot"] = "C:/minecraft-dev"
+        value["backup"]["destination"] = "D:/backup"
+        validate("inventory", value)
+        value["backup"]["destination"] = "c:\\MINECRAFT-DEV\\backup"
+        with self.assertRaises(ContractError):
+            validate("inventory", value)
+
+    def test_unsafe_absolute_paths(self):
+        from dev_server.contracts import absolute_path
+        for path in ("C:relative", "C:/", "C:/data/../outside", "C:/data/CON.txt", "C:/data/LPT¹",
+                     "C:/data/file.", "C:/data/file ", "C:/data/file:stream", "C:/data/*",
+                     "//server/share/data", "\\\\server\\share\\data", "/", "/data/../outside"):
+            with self.subTest(path=path), self.assertRaises(ContractError):
+                absolute_path(path)
+
     def test_a08_same_uuid_and_generation(self):
         fixture = deepcopy(self.documents["fixture"])
         fixture["expected"]["modProfileFile"] = "config/SushiEricServerMod/player_data/other/profile.yml"
