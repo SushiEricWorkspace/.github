@@ -1,5 +1,7 @@
 # 分離テスト環境の契約
 
+タスクのソースworktreeを作成・引き継ぎ・削除する場合は[worktreeガイド](worktrees-guide.md)を参照してください。
+
 [ServerMod #525](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/525)の契約・fixtureを管理します。
 確定設計は[#524](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/524)、
 保存root/writerの接続表・検証境界はServerModの`docs/core/test-environment-guide.md`にあります。

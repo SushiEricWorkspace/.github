@@ -5,6 +5,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from dev_server.task_worktrees import workspace_for
+
 START = "<!-- COMMON-RULES:START -->"
 END = "<!-- COMMON-RULES:END -->"
 TARGETS = (
@@ -29,6 +31,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="ファイルを書き換えず、同期ずれがあれば終了コード1を返す。",
     )
+    parser.add_argument(
+        "--repo-root", action="append", default=[], metavar="REPO=PATH",
+        help="同期先worktreeを明示する。指定時は列挙したrepoだけを対象にする。複数指定可。",
+    )
     return parser.parse_args()
 
 
@@ -42,19 +48,40 @@ def replace_common_block(text: str, common_rules: str) -> str:
     return text[:start_index] + replacement + text[end_index:]
 
 
+def target_paths(workspace: Path, overrides: list[str]) -> list[Path]:
+    """worktree指定を検査し、未指定repoやprimaryへ暗黙に書き込まない。"""
+    if not overrides:
+        return [workspace / relative for relative in TARGETS]
+    known = {Path(relative).parts[0] for relative in TARGETS}
+    result = []
+    used = set()
+    for pair in overrides:
+        name, separator, root = pair.partition("=")
+        if not separator or not root or name not in known or name in used:
+            raise ValueError("--repo-rootは対象REPO=PATHを一度ずつ指定してください。")
+        path = Path(root)
+        if not path.is_absolute():
+            path = workspace / path
+        result.append(path.resolve() / "AGENTS.md")
+        used.add(name)
+    if len(set(result)) != len(result):
+        raise ValueError("異なるrepoに同じ同期先は指定できません。")
+    return result
+
+
 def main() -> int:
     args = parse_args()
     github_repo_root = Path(__file__).resolve().parents[1]
     workspace_root = (
         args.workspace_root.resolve()
         if args.workspace_root
-        else github_repo_root.parent
+        else workspace_for(github_repo_root)
     )
     common_rules = (github_repo_root / "AI_GUIDELINES.md").read_text(encoding="utf-8")
 
-    drifted: list[Path] = []
-    for relative_target in TARGETS:
-        target = workspace_root / relative_target
+    # 全対象を検査してから書き込む。対象欠落やマーカー不正で半端な同期をしない。
+    planned = []
+    for target in target_paths(workspace_root, args.repo_root):
         if not target.is_file():
             raise FileNotFoundError(f"対象AGENTS.mdが見つかりません: {target}")
 
@@ -63,7 +90,9 @@ def main() -> int:
         if updated == current:
             continue
 
-        drifted.append(target)
+        planned.append((target, updated))
+    drifted = [target for target, _ in planned]
+    for target, updated in planned:
         if not args.check:
             target.write_text(updated, encoding="utf-8")
             print(f"updated: {target}")
