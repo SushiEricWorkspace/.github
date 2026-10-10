@@ -2,6 +2,7 @@
 
 タスクのソースworktreeを作成・引き継ぎ・削除する場合は[worktreeガイド](worktrees-guide.md)を参照してください。
 固定した開発runtimeを出力する場合は[runtime出力ガイド](runtime-export-guide.md)を参照してください。
+宣言設定・貸出Registry・supervisorを扱う場合は[監督・貸出ガイド](supervisor-guide.md)を参照してください。
 
 [ServerMod #525](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/525)の契約・fixtureを管理します。
 確定設計は[#524](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/524)、
@@ -30,11 +31,14 @@ Minecraftワールド、NBT、独自定義YAML、JARを実生成しません。
 合成文書をruntime登録・snapshot公開・昇格の実証跡に使用しないでください。
 
 契約検証はコピー/削除/設定変換/ポート予約/JVM起動を実行しません。
-管理CLI `scripts/dev-server.py`も未実装です。既存worktreeやrun/への操作は行いません。
+管理CLI `scripts/dev-server.py`の初期化・監督・貸出は実装済みです。
+JVM起動停止・保存証跡・snapshot/restore/recoverは未接続で、成功扱いせず拒否します。
+既存worktreeやrun/への操作は行いません。
 
 ## テスト結果の扱い
 
 契約テストで確認するのはA08/A09/A20/A23/A24に対する入力/期待値・拒否条件です。
 実NBTの保存往復、設定解析・秘密除去/注入、実FSのリンクや差替え、別媒体、ポート占有、
-macOS 15の耐久化・停電耐性は後続試験に残します。
-運用の初期対象はmacOS 15/Python 3.12/JDK 21。Windowsで単体検証しても運用適合とは扱いません。
+macOS/APFSとWindows/NTFSの耐久化・停電耐性は後続試験に残します。
+運用の初期対象はmacOS 15とWindows、Python 3.12/JDK 21です。
+各OSのnative IPC・lock試験と運用適合試験を分け、片方の成功をもう片方の証明にしません。

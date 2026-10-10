@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 class ContractError(ValueError):
@@ -28,6 +28,24 @@ def validate_relative_path(value: str, path: str = "path") -> None:
     _require(bool(value) and not value.startswith("/") and "\\" not in value and ":" not in value
              and all(part not in ("", ".", "..") for part in parts)
              and all(ord(char) >= 32 and ord(char) != 127 for char in value), path, "不正な相対パスです")
+
+
+def absolute_path(value: str, path: str = "path") -> PurePosixPath | PureWindowsPath:
+    """ローカル絶対パスをOSに依存せず検査する。実体や権限の検証は別途必要。"""
+    if re.match(r"^[A-Za-z]:[/\\]", value):
+        tail = value[3:].replace("\\", "/")
+        validate_relative_path(tail, path)
+        for part in tail.split("/"):
+            reserved = part.split(".")[0].upper()
+            _require(not any(char in '<>"|?*' for char in part)
+                     and not part.endswith((" ", "."))
+                     and reserved not in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                     and not re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", reserved), path, "Windowsの予約名・不正文字です")
+        return PureWindowsPath(value)
+    _require(value.startswith("/") and not value.startswith("//") and value != "/",
+             path, "ローカルの明示的な絶対パスが必要です")
+    validate_relative_path(value[1:], path)
+    return PurePosixPath(value)
 
 
 def _validate(value, schema: dict, path: str) -> None:
@@ -54,8 +72,7 @@ def _validate(value, schema: dict, path: str) -> None:
         if schema.get("format") == "relativePath":
             validate_relative_path(value, path)
         if schema.get("format") == "absolutePath":
-            _require(value.startswith("/") and value != "/", path, "macOSの明示的な絶対パスが必要です")
-            validate_relative_path(value[1:], path)
+            absolute_path(value, path)
     elif type(value) is int:
         _require(value >= schema.get("minimum", value) and value <= schema.get("maximum", value), path, "範囲外です")
 
@@ -76,7 +93,13 @@ def validate(kind: str, value: dict) -> None:
         _require(value["reserveBytes"] < value["quotaBytes"], kind, "reserveBytesはquotaBytesより小さくしてください")
         backup = value["backup"]
         _require(backup["separateMediumConfirmedBy"] == value["operator"], kind, "運用者による別媒体の確認が必要です")
-        root, destination = PurePosixPath(value["managementRoot"]), PurePosixPath(backup["destination"])
+        root = absolute_path(value["managementRoot"], "inventory.managementRoot")
+        destination = absolute_path(backup["destination"], "inventory.backup.destination")
+        _require(type(root) is type(destination), kind, "管理rootとバックアップ先のOS形式を揃えてください")
+        # APFSの大小文字・Unicode同名解決も、安全側に重複として扱う。
+        flavor = type(root)
+        root = flavor(unicodedata.normalize("NFC", str(root)).casefold())
+        destination = flavor(unicodedata.normalize("NFC", str(destination)).casefold())
         _require(root != destination and root not in destination.parents and destination not in root.parents, kind, "バックアップ先と管理rootを分離してください")
         ids, ports = [], []
         for instance in value["instances"]:
