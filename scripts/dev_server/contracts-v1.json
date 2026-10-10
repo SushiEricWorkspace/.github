@@ -1,0 +1,107 @@
+{
+  "contractFormat": 1,
+  "definitions": {
+    "version": {"type": "integer", "enum": [1]},
+    "text": {"type": "string", "minLength": 1},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "path": {"type": "string", "minLength": 1, "format": "relativePath"},
+    "paths": {"type": "array", "items": {"ref": "path"}},
+    "true": {"type": "boolean", "enum": [true]},
+    "ports": {"type": "object", "properties": {
+      "minecraft": {"type": "integer", "minimum": 1024, "maximum": 65535},
+      "rcon": {"type": "integer", "minimum": 1024, "maximum": 65535},
+      "management": {"type": "integer", "minimum": 1024, "maximum": 65535}
+    }},
+    "roots": {"type": "object", "properties": {
+      "world": {"ref": "path"}, "config": {"type": "string", "enum": ["config"]}
+    }},
+    "file": {"type": "object", "properties": {
+      "path": {"ref": "path"}, "kind": {"type": "string", "enum": ["regular"]},
+      "size": {"type": "integer", "minimum": 0}, "sha256": {"ref": "hash"}
+    }},
+    "files": {"type": "array", "minItems": 1, "items": {"ref": "file"}},
+    "saveResult": {"type": "object", "properties": {
+      "writer": {"ref": "text"}, "success": {"ref": "true"}, "pendingCount": {"type": "integer", "enum": [0]}
+    }},
+    "cleanStop": {"type": "object", "properties": {
+      "instanceId": {"ref": "id"}, "generation": {"ref": "id"}, "runId": {"ref": "id"}, "nonce": {"ref": "text"},
+      "stopRequested": {"ref": "true"}, "jvmAndChildrenExited": {"ref": "true"},
+      "externalWritersExited": {"ref": "true"}, "backgroundWritersDrained": {"ref": "true"},
+      "saveResults": {"type": "array", "minItems": 1, "items": {"ref": "saveResult"}}
+    }},
+    "source": {"type": "object", "properties": {
+      "repo": {"ref": "text"}, "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+      "dirtyPatchSha256": {"ref": "hash"}, "untrackedInputs": {"type": "array", "items": {"ref": "file"}}
+    }},
+    "tool": {"type": "object", "properties": {
+      "name": {"ref": "text"}, "version": {"ref": "text"}, "sha256": {"ref": "hash"}
+    }}
+  },
+  "contracts": {
+    "inventory": {"type": "object", "properties": {
+      "schemaVersion": {"ref": "version"}, "operator": {"ref": "text"},
+      "managementRoot": {"type": "string", "format": "absolutePath"},
+      "quotaBytes": {"type": "integer", "minimum": 1}, "reserveBytes": {"type": "integer", "minimum": 1},
+      "backup": {"type": "object", "properties": {
+        "destination": {"type": "string", "format": "absolutePath"}, "separateMediumConfirmedBy": {"ref": "text"}
+      }},
+      "instances": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"ref": "instance"}},
+      "gameTestConcurrency": {"type": "integer", "enum": [1, 2]},
+      "networkTestPortRange": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "integer", "minimum": 25700, "maximum": 25799}}
+    }},
+    "instance": {"type": "object", "properties": {
+      "schemaVersion": {"ref": "version"}, "instanceId": {"ref": "id"}, "host": {"type": "string", "enum": ["localhost"]},
+      "minecraftBind": {"type": "string", "enum": ["127.0.0.1", "::1", "lan-explicit"]},
+      "managementBind": {"type": "string", "enum": ["127.0.0.1"]}, "ports": {"ref": "ports"},
+      "queryEnabled": {"type": "boolean", "enum": [false]}, "jdwpEnabled": {"type": "boolean", "enum": [false]}
+    }},
+    "dataLayout": {"type": "object", "properties": {
+      "schemaVersion": {"ref": "version"}, "layoutId": {"type": "string", "enum": ["sushieric-generation-v1"]},
+      "roots": {"ref": "roots"}, "externalRoots": {"type": "array", "maxItems": 0, "items": {"ref": "text"}},
+      "databaseAdapters": {"type": "array", "maxItems": 0, "items": {"ref": "text"}},
+      "rootFiles": {"ref": "paths"}, "excludedPaths": {"ref": "paths"}, "transformVersion": {"ref": "version"}
+    }},
+    "runtime": {"type": "object", "properties": {
+      "schemaVersion": {"ref": "version"}, "artifactId": {"ref": "hash"}, "layoutId": {"ref": "text"},
+      "development": {"ref": "true"}, "javaVersion": {"type": "string", "pattern": "^21\\.[0-9]+\\.[0-9]+.*$"},
+      "commonCoordinate": {"ref": "text"}, "files": {"ref": "files"},
+      "sources": {"type": "array", "minItems": 1, "items": {"ref": "source"}},
+      "tools": {"type": "array", "minItems": 1, "items": {"ref": "tool"}},
+      "launch": {"type": "object", "properties": {
+        "mainClass": {"ref": "text"}, "classpath": {"ref": "paths"}, "jvmArgs": {"type": "array", "items": {"ref": "text"}}
+      }}
+    }},
+    "manifest": {"type": "object", "properties": {
+      "schemaVersion": {"ref": "version"}, "snapshotId": {"ref": "id"}, "generation": {"ref": "id"},
+      "artifactId": {"ref": "hash"}, "layout": {"ref": "dataLayout"}, "transformVersion": {"ref": "version"},
+      "visibility": {"type": "string", "enum": ["private", "shared-template"]},
+      "cleanStop": {"ref": "cleanStop"}, "files": {"ref": "files"}
+    }},
+    "fixture": {"type": "object", "properties": {
+      "schemaVersion": {"ref": "version"}, "name": {"type": "string", "enum": ["smoke-v1", "save-roundtrip-v1"]},
+      "seed": {"type": "integer"}, "generationMode": {"type": "string", "enum": ["fresh-world"]},
+      "testUuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+      "itemDefinition": {"type": "object", "properties": {
+        "id": {"ref": "text"}, "internalId": {"ref": "text"},
+        "vanillaId": {"type": "string", "enum": ["minecraft:stone"]}, "itemType": {"type": "string", "enum": ["OTHER"]},
+        "displayName": {"ref": "text"}, "completed": {"ref": "true"}
+      }},
+      "expected": {"type": "object", "properties": {
+        "vanillaPlayerFile": {"ref": "path"}, "modProfileFile": {"ref": "path"},
+        "itemDefinitionFile": {"ref": "path"}, "inventorySlot": {"type": "integer", "enum": [0]}, "inventoryCount": {"type": "integer", "minimum": 0},
+        "money": {"type": "integer", "minimum": 0}, "oreRevivalSecond": {"type": "integer", "minimum": 1},
+        "dimensionMarkers": {"ref": "paths"}, "unknownRegularFile": {"ref": "path"},
+        "checks": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["A08", "A09", "A20", "A23", "A24"]}}
+      }}
+    }},
+    "validation": {"type": "object", "properties": {
+      "schemaVersion": {"ref": "version"}, "validationId": {"ref": "id"}, "snapshotId": {"ref": "id"},
+      "artifactId": {"ref": "hash"}, "fixture": {"type": "string", "enum": ["smoke-v1", "save-roundtrip-v1"]},
+      "sourceInstanceId": {"ref": "id"}, "restoredInstanceId": {"ref": "id"}, "runId": {"ref": "id"}, "nonce": {"ref": "text"},
+      "cleanStop": {"ref": "cleanStop"},
+      "passedChecks": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["A08", "A09", "A20", "A23", "A24"]}},
+      "reportFiles": {"ref": "files"}
+    }}
+  }
+}

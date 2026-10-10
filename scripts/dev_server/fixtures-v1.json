@@ -1,0 +1,28 @@
+[
+  {
+    "schemaVersion": 1, "name": "smoke-v1", "seed": 52452501, "generationMode": "fresh-world",
+    "testUuid": "00000000-0000-4000-8000-000000000525",
+    "itemDefinition": {"id": "fixture.token", "internalId": "00000000-0000-4000-8000-000000000526", "vanillaId": "minecraft:stone", "itemType": "OTHER", "displayName": "分離環境確認用", "completed": true},
+    "expected": {
+      "vanillaPlayerFile": "world/playerdata/00000000-0000-4000-8000-000000000525.dat",
+      "modProfileFile": "config/SushiEricServerMod/player_data/00000000-0000-4000-8000-000000000525/profile.yml",
+      "itemDefinitionFile": "config/SushiEricServerMod/item_data/stats/fixture/token.yml",
+      "inventorySlot": 0, "inventoryCount": 0, "money": 0, "oreRevivalSecond": 12,
+      "dimensionMarkers": ["world/fixture-marker.txt", "world/DIM-1/fixture-marker.txt", "world/DIM1/fixture-marker.txt", "world/dimensions/fixture/test/fixture-marker.txt"],
+      "unknownRegularFile": "config/SushiEricServerMod/fixture-unknown.txt", "checks": ["A09", "A20", "A23", "A24"]
+    }
+  },
+  {
+    "schemaVersion": 1, "name": "save-roundtrip-v1", "seed": 52452502, "generationMode": "fresh-world",
+    "testUuid": "00000000-0000-4000-8000-000000000525",
+    "itemDefinition": {"id": "fixture.token", "internalId": "00000000-0000-4000-8000-000000000526", "vanillaId": "minecraft:stone", "itemType": "OTHER", "displayName": "分離環境確認用", "completed": true},
+    "expected": {
+      "vanillaPlayerFile": "world/playerdata/00000000-0000-4000-8000-000000000525.dat",
+      "modProfileFile": "config/SushiEricServerMod/player_data/00000000-0000-4000-8000-000000000525/profile.yml",
+      "itemDefinitionFile": "config/SushiEricServerMod/item_data/stats/fixture/token.yml",
+      "inventorySlot": 0, "inventoryCount": 2, "money": 1234, "oreRevivalSecond": 12,
+      "dimensionMarkers": ["world/fixture-marker.txt", "world/DIM-1/fixture-marker.txt", "world/DIM1/fixture-marker.txt", "world/dimensions/fixture/test/fixture-marker.txt"],
+      "unknownRegularFile": "config/SushiEricServerMod/fixture-unknown.txt", "checks": ["A08", "A09", "A20", "A23", "A24"]
+    }
+  }
+]
