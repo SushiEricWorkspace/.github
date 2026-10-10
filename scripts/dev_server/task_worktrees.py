@@ -9,6 +9,8 @@ import sqlite3
 import stat
 import subprocess
 
+from .build_lock import BuildLockError, build_lock
+
 REPOSITORIES = ("Common", "SushiEricServerManager", "SushiEricServerMod",
                 "SushiEricCombatCore", ".github")
 DEVELOPMENT_BRANCHES = {"Common": "develop", "SushiEricServerManager": "develop",
@@ -210,9 +212,22 @@ class TaskWorktrees:
             raise
         return self.list(task_id)
 
+    @contextmanager
+    def build_guard(self, task_id: str):
+        """ビルド中の担当引継ぎ・削除を拒否する。未作成taskの領域は生成しない。"""
+        root = self.target(task_id, "SushiEricServerMod").parent
+        if not root.exists():
+            yield
+            return
+        try:
+            with build_lock(root / ".build.lock"):
+                yield
+        except BuildLockError as error:
+            raise TaskError(str(error)) from error
+
     def handoff(self, task_id: str, old_owner: str, owner: str) -> list[dict]:
         require(bool(owner.strip()) and owner != old_owner, "新しいownerを指定してください")
-        with self.database() as db:
+        with self.build_guard(task_id), self.database() as db:
             db.execute("BEGIN IMMEDIATE")
             for plan in self.owned(db, task_id, old_owner, ("ACTIVE",)):
                 self.verify(task_id, plan)
@@ -220,7 +235,7 @@ class TaskWorktrees:
         return self.list(task_id)
 
     def remove(self, task_id: str, owner: str) -> list[dict]:
-        with self.database() as db:
+        with self.build_guard(task_id), self.database() as db:
             db.execute("BEGIN IMMEDIATE")
             plans = self.owned(db, task_id, owner, ("ACTIVE", "RECOVERY_REQUIRED"))
             targets = []

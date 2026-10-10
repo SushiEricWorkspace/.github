@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from dev_server.task_worktrees import TaskError, TaskWorktrees, git, worktrees, workspace_for
+from dev_server.build_lock import build_lock
 
 
 class TaskWorktreesTest(unittest.TestCase):
@@ -66,6 +67,17 @@ class TaskWorktreesTest(unittest.TestCase):
     def test_create_is_idempotent_for_same_inputs(self):
         first = self.create()
         self.assertEqual(first, self.create())
+
+    def test_build_blocks_own_handoff_and_removal_but_not_other_tasks(self):
+        self.create()
+        self.create("task-b", 101)
+        with build_lock(self.root / "worktrees/task-a/.build.lock"):
+            with self.assertRaises(TaskError):
+                self.manager.handoff("task-a", "codex-a", "claude-b")
+            with self.assertRaises(TaskError):
+                self.manager.remove("task-a", "codex-a")
+            self.manager.handoff("task-b", "codex-a", "claude-b")
+        self.manager.handoff("task-a", "codex-a", "claude-b")
 
     def test_handoff_reuses_tree_and_rejects_old_owner(self):
         self.create()

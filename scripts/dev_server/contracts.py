@@ -98,7 +98,7 @@ def validate(kind: str, value: dict) -> None:
     if kind == "runtime":
         _require(value["layoutId"] == LAYOUT_ID, kind, "未知のdata-layoutです")
         coordinate = value["commonCoordinate"]
-        _require(re.fullmatch(r"io\.github\.sushiericworkspace:sushieric-common-mod-dev:0\.1\.0-dev\.[0-9]{17}", coordinate) is not None, kind, "Commonの完全な開発座標が必要です")
+        _require(re.fullmatch(r"io\.github\.sushiericworkspace:sushieric-common-mod-dev:0\.1\.0-dev\.[0-9]{17}(?:\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?", coordinate) is not None, kind, "Commonの完全な開発座標が必要です")
         files = {entry["path"] for entry in value["files"]}
         _require(bool(value["launch"]["classpath"]) and all(
             entry in files or any(file.startswith(entry + "/") for file in files)
