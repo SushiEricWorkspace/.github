@@ -1,72 +1,29 @@
 ---
 name: worktree
-description: AIエージェント用のgit worktreeを作成・確認・削除する。複数AIを同時運用するときの作業ディレクトリ分離に使う。「worktreeを作って」「作業環境を用意して」「worktreeを消して」と言われたとき、または自分の作業ディレクトリがprimary worktreeで他のAIと衝突しそうなときに使用する。
+description: Issue・タスク単位のgit worktreeを作成・確認・担当引継ぎ・削除する。複数AIの作業分離、またはprimaryでAI作業を始めそうなときに使用する。既存の固定AI用worktreeも保全する。
 ---
 
-# AIエージェント用worktree
+# タスク単位worktree
 
-## 目的
+作業前に対象repoのAGENTS.mdと、原本の[worktreeガイド](../../scripts/dev_server/worktrees-guide.md)を読む。
+task-idは作業を一意にする小文字英数字とハイフン、ownerは同時書込担当のセッション識別子とする。
+既に登録されたタスクへの参加では、同じworktreeのownerを引き継ぐ。
+primary、人間、別ownerの作業ディレクトリを使わない。
 
-複数のAIを同時に動かすとき、同じ作業ディレクトリを共有するとブランチの切り替えと
-作業ツリーが衝突する。エージェントごとにworktreeを分けて独立させる。
+## 手順
 
-## 配置と担当
+1. `scripts/setup-worktrees.py --list`で登録を確認する。既存固定worktreeは`--list-legacy`で読み取れる。
+2. 新規作成ではIssue番号・repo・task-id・ownerを明示する。既定の起点はAGENTS.mdに対応するoriginの最新開発基準であり、前提Issueの依存commitや基準変更があるrepoだけ`--base REPO=REF`を追加する。
+3. 出力されたパス `<workspace>/worktrees/<task-id>/<repo>/`で作業する。既存branch/worktreeの衝突を別パス作成やforceで回避しない。
+4. 引継ぎは旧ownerの作業終了を確認してから`--handoff-from`を使う。未コミット変更があれば中断してユーザーへ相談する。
+5. 削除の許可を確認し、`--remove --task-id ... --owner ...`で登録対象だけを削除する。branchは別途マージ済みであることを確認して削除する。
 
-`<repo>`はリポジトリのディレクトリ名を指す。
+ownerは協調契約でありGit lockやアクセス制御ではない。削除時はdirtyと未知の追跡外データを拒否する。
+`run/`・`.idea/`を複製しない。Minecraftの実行データはソースworktreeの寿命から切り離す。
+途中失敗のRECOVERY_REQUIREDは実体と登録を確認し、自動修復・強制削除しない。
 
-| ディレクトリ | 担当 |
-|---|---|
-| `<repo>/` | 人間・IDE（primary worktree） |
-| `<repo>-claude/` | Claude Code |
-| `<repo>-codex/` | Codex |
+## 移行中の固定worktree
 
-**自分の担当以外のworktreeで作業しない。** primary worktreeは人間が使うため、
-AIから勝手にブランチを切り替えない。
-
-## 使い方
-
-スクリプトは`.github`リポジトリにある。`.github`は各リポジトリと同じ親ディレクトリへ
-cloneしておく。
-
-```bash
-cd <workspace>/.github
-python scripts/setup-worktrees.py            # 全リポジトリで作成
-python scripts/setup-worktrees.py --list     # 一覧
-python scripts/setup-worktrees.py --remove   # 削除
-```
-
-主なオプション。
-
-- `--repos SushiEricServerMod` … 対象リポジトリを限定する
-- `--agents claude` … 対象エージェントを限定する
-- `--base develop` … 起点ブランチを明示する。省略時はoriginの既定ブランチ
-- `--no-copy` … git追跡外ディレクトリ（`run/`など）を複製しない
-- `--install-skill` … このスキルを各リポジトリの`.claude/skills/`へ配置する。
-  `.claude/`はgit管理対象外なので、環境ごとに各自で実行する
-
-## 作成後の作業手順
-
-worktreeはdetached HEADで作られる。同じブランチは1つのworktreeでしか
-チェックアウトできないため、作成時点ではブランチを占有しない。
-
-作業を始めるときは自分のworktreeへ移動し、Issueごとのブランチを作る。
-
-```bash
-cd <workspace>/<repo>-claude
-git fetch origin --prune
-git checkout -b feature/issue-<Issue番号> origin/<開発基準ブランチ>
-```
-
-## 注意点
-
-- **ブランチの排他** … 同じブランチを複数のworktreeでチェックアウトできない。
-  他のworktreeが使用中のブランチへ切り替えようとするとgitが拒否する。
-- **git追跡外ファイル** … `run/`や`.idea/`はworktreeへ引き継がれない。
-  スクリプトは`run/`だけを複製する。`.idea/`はIDE用のため複製しない。
-- **ビルド成果物** … `build/`と`.gradle/`はworktreeごとに独立するため、
-  初回ビルドはフルビルドになる。共有キャッシュの再取得は発生しない。
-- **サーバーの同時起動** … 待ち受けポートとRCONポートをworktreeごとに分ける。
-  同じポートのままでは後から起動した側が`BindException`で失敗する。
-  停止はRCONへ`stop`を送る。強制終了は保存処理が行われない。
-- **削除** … 必ず`--remove`か`git worktree remove`を使う。ディレクトリを直接消すと
-  管理情報が残り`git worktree prune`が必要になる。
+進行中の作業は自分に割り当てられた`<repo>-codex/`または`<repo>-claude/`で完了できる。
+人間や別AIの固定worktreeを移動・削除しない。新規タスクはタスク単位で作成する。
+分離テスト環境の管理CLIは総合導入Issue完了まで必須にしない。

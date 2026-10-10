@@ -66,25 +66,25 @@
 
 ### worktree運用
 
-複数のAIを同時に運用するため、エージェントごとにgit worktreeを分ける。同じ作業ディレクトリを共有するとブランチの切り替えと作業ツリーが衝突するためである。
+作業の分離単位はAI名ではなくタスクとする。同じタスクの担当を交代するときは同じworktreeを引き継ぎ、同時に書き込むownerは一人だけとする。
 
-`<repo>`は対象リポジトリのディレクトリ名を指す。
-
-| ディレクトリ | 担当 |
+| ディレクトリ | 用途 |
 |---|---|
-| `<repo>/` | 人間・IDE（primary worktree） |
-| `<repo>-claude/` | Claude Code |
-| `<repo>-codex/` | Codex |
+| `<workspace>/<repo>/` | 人間・IDE（primary worktree） |
+| `<workspace>/worktrees/<task-id>/<repo>/` | タスク専用worktree |
+| `<workspace>/minecraft-dev/` | ソースとは独立した分離テスト環境（導入中） |
 
-- 自分の担当以外のworktreeで作業しない。primary worktreeは人間が使用するため、AIから勝手にブランチを切り替えない。
-- worktreeの作成・削除は`.github`リポジトリの`scripts/setup-worktrees.py`を使用する。`.github`は各リポジトリと同じ親ディレクトリへcloneしておく。
-- worktreeはdetached HEADで作成される。同じブランチは1つのworktreeでしかチェックアウトできないため、作成時点ではブランチを占有しない。作業開始時に`feature/issue-<Issue番号>`を作成する。
-- 作業ブランチをマージして削除したあとなど、チェックアウトすべき作業ブランチが無い状態では、開発基準ブランチの最新commitでdetached HEADへ戻す。`git checkout --detach origin/main`のように指定する。`develop`を開発基準としているリポジトリでは`origin/develop`を使用する。
-- `main`や`develop`はprimary worktreeが占有しているため、AI用worktreeでこれらのブランチを直接チェックアウトしない。
-- `run/`など、gitの追跡外だが実行に必要なディレクトリはスクリプトが複製する。`.idea/`はIDE用のため複製しない。
-- `build/`や`.gradle/`はworktreeごとに独立するため、初回ビルドはフルビルドになる。
-- worktreeを削除するときは`--remove`または`git worktree remove`を使用する。ディレクトリを直接削除すると管理情報が残り、`git worktree prune`が必要になる。
-- Claude Code用スキルの原本は`.github`が持つ。`--install-skill`で各リポジトリの`.claude/`へ配置するが、`.claude/`はgit管理対象外とし、コミットしない。原本との差異を防ぐため、各自がローカルで配置する。
+- primaryや他ownerのworktreeで作業しない。primaryの移動・checkout変更をAIが行わない。
+- 作成・一覧・担当引継ぎ・削除は`.github/scripts/setup-worktrees.py`を使用する。task-id、Issue番号、対象repo、同時書込ownerを明示し、記録された基準commitから`feature/issue-<番号>`を作成する。使い方は`.github/scripts/dev_server/worktrees-guide.md`を参照する。
+- 基準はrepoごとの最新origin開発ブランチを用いる（Common・ServerManager・CombatCoreはdevelop、ServerMod・.githubはmain）。前提Issueへ依存する場合は、repoごとに依存commitを明示する。現在のprimaryやorigin/HEADのリリースブランチから推測しない。
+- 同一タスクの担当交代はownerを引き継ぐ。別worktreeを追加して同じタスクを二重実行しない。Gitのworktree lockは編集排他ではない。owner記録は同一ユーザー間の協調契約であり、他ownerは直接書き込まない。
+- 既存branch/worktreeを上書きしない。未コミット変更がある作業の引継ぎ・削除は拒否する。途中失敗や登録不一致は既存の実体を残し、勝手に修復・強制削除しない。
+- タスクworktreeへ`run/`や`.idea/`を複製しない。`build/`とプロジェクト`.gradle/`はworktreeごとに独立する。サーバーの永続instance、snapshot、artifactはworktreeの削除対象にしない。
+- 削除はtask-idと現在ownerを明示して行う。worktreeをディレクトリ削除や広範囲のpruneで片付けない。branchは自動削除されないため、マージと削除の許可を確認して別途削除する。
+- 移行中の既存`<repo>-claude/`・`<repo>-codex/`は自動移動・削除しない。進行中の作業は担当の固定worktreeで完了できる。作業branch削除後は最新の`origin/main`または`origin/develop`でdetached HEADへ戻す。新規タスクはタスクworktreeで開始する。
+- 共通ルールの同期先は`scripts/sync-agent-rules.py --repo-root REPO=PATH`で明示する。タスク作業から人間・他AIのAGENTS.mdへ暗黙に同期しない。
+- worktreeスキルの原本は`.github/skills/worktree/SKILL.md`とする。ローカル配置する場合は原本を使用し、`.claude/`等の配置先をコミットしない。
+- 分離テスト環境の管理CLIは総合導入が完了するまで必須にしない。導入中は既存の検証手順を維持し、未実装の管理CLIを前提にサーバー起動や保存の成功を報告しない。
 
 ### コミットメッセージ
 
