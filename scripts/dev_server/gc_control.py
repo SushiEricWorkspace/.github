@@ -209,11 +209,12 @@ class GcControl:
                 require(all(result.get(key) == value for key, value in report.items()),
                         "PROOF_MISMATCH", "GameTestレポートが変わりました")
             elapsed = self.registry.clock() - run["completedAt"]
-            if elapsed > policy["resultsSeconds"]:
+            world_eligible = (result["testsPassed"] and result["runtimeStopped"]) or elapsed > policy["failureWorldSeconds"]
+            if elapsed > policy["resultsSeconds"] and world_eligible:
                 add("run:" + run["runId"], path)
             else:
                 protected.add("artifact:" + run["artifactId"])
-                if (result["testsPassed"] and result["runtimeStopped"]) or elapsed > policy["failureWorldSeconds"]:
+                if world_eligible:
                     if "world" not in run.get("gcRemoved", []):
                         add("world:" + run["runId"], path / "world")
         for path in (self.registry.root / "artifacts").iterdir():

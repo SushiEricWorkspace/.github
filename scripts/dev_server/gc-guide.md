@@ -36,6 +36,7 @@ python3.12 -B scripts/dev-server.py gc --root /absolute/dev-root --operation-id 
 
 pinは`artifact:<hash>`、`snapshot:<id>`、`generation:<instance>/<generation>`、`run:<id>`に対応します。
 保持設定は全項目を正の整数で指定します。active・直前世代などの必須保護は変更できません。
+失敗worldの期限をログ・結果より長く設定した場合、worldを含むrun全体と復元用artifactもworldの期限まで保護します。
 template退役は使用を禁止し、参照保護から外します。templateファイルは削除せず記録を残します。
 世代から参照されるartifactは、その世代を回収した後の新しい計画で候補になります。
 保持期限を過ぎたGameTestのrunと専用artifactは、他の保護参照がなければ同じ計画に出ます。両方を回収する場合は両参照の明示選択が必要です。

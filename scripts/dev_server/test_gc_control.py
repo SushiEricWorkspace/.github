@@ -233,6 +233,12 @@ class GameTestGcTests(unittest.TestCase):
         self.now += 31 * 86400
         self.assertEqual([], self.candidates())
 
+    def test_extended_failure_world_policy_also_protects_parent_run(self):
+        self.completed(failure=True)
+        self.command("gc", {"action": "policy", "policy": dict(DEFAULT_POLICY, failureWorldSeconds=45 * 86400)}, "policy")
+        self.now += 31 * 86400
+        self.assertEqual([], self.candidates())
+
     def test_changed_report_cannot_authorize_world_deletion(self):
         path = self.completed()
         (path / "report.xml").write_text('<testsuite tests="1"><testcase name="changed"/></testsuite>')
