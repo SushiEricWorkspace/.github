@@ -1,12 +1,13 @@
 """全世代を構築してから参照だけを切り替える。旧世代・途中証跡を削除しない。"""
 import json
+import os
 import re
 import secrets
 from pathlib import Path
 
 from .build_inputs import canonical, digest, regular_bytes
 from .contracts import LAYOUT_ID, require_compatible
-from .local_ipc import plain_path, require_private
+from .local_ipc import make_private, plain_path, require_private
 from .registry import RegistryError, fields, identifier, require, ttl
 from .runtime_bundle import verify_bundle, _files
 from .runtime_control import TOKEN, read_json
@@ -193,6 +194,9 @@ class GenerationControl:
                 require(data == b"{}\n", "SETTINGS_UNSUPPORTED", "可搬management設定が不正です")
                 continue
             self._write_tree(staging, name, data)
+            if os.name != "nt" and name.startswith("runtime/") and source.stat().st_mode & 0o100:
+                make_private(staging / name, executable=True)
+                storage.flush(staging / name)
         self._write_tree(staging, "server.properties", "".join(f"{key}={value}\n" for key, value in sorted(values.items())).encode())
         self._write_tree(staging, "config/SushiEricServerMod/management/config.yml", f"port: {declaration['ports']['management']}\n".encode())
         self._write_tree(staging, "eula.txt", b"eula=true\n")
@@ -231,7 +235,10 @@ class GenerationControl:
                 "GENERATION_MISMATCH", "完成世代の全hashが一致しません")
         verify_bundle(path / "runtime")
         for file in _files(path):
-            require_private(path / file["path"])
+            name = file["path"]
+            executable = os.name != "nt" and name.startswith("runtime/") and bool(
+                (self.registry.root / "artifacts" / payload["artifactId"] / name.removeprefix("runtime/")).stat().st_mode & 0o100)
+            require_private(path / name, executable=executable)
             require((path / file["path"]).stat().st_nlink == 1, "UNSUPPORTED_FILE", "世代のhardlink共有は禁止です")
         return path, destination
 

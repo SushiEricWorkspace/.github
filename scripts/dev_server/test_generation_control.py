@@ -1,5 +1,6 @@
 """合成runtimeと実FSで世代隔離・journal障害・復旧の冪等性を確認する。"""
 import json
+import os
 import sys
 import unittest
 from contextlib import contextmanager
@@ -53,6 +54,16 @@ class GenerationTests(unittest.TestCase):
         before = list(self.root.rglob("*"))
         self.command("restore", self.restore, "restore-01", True)
         self.assertEqual(before, list(self.root.rglob("*")))
+
+    @unittest.skipUnless(sys.platform == "darwin", "Unix実行権限のコピー試験")
+    def test_restore_preserves_private_runtime_execution_permission(self):
+        java = self.root / "artifacts" / self.artifact / "jdk/bin/java"
+        java.chmod(0o755)
+        self.command("restore", self.restore, "restore-01")
+        copied = self.new / "runtime/jdk/bin/java"
+        self.assertEqual(0o700, copied.stat().st_mode & 0o777)
+        self.assertTrue(os.access(copied, os.X_OK))
+        self.assertEqual(java.read_bytes(), copied.read_bytes())
 
     def test_reset_unregistered_template_is_rejected_before_changes(self):
         payload = dict(self.restore)
