@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import time
+import traceback
 import uuid
 
 from .build_inputs import canonical, digest
@@ -61,9 +62,13 @@ class GameTestControl:
                                     json.dumps(result), operation_id))
         except BaseException as error:
             code = error.code if isinstance(error, RegistryError) else "GAMETEST_FAILED"
+            failure = {"runId": payload["runId"], "artifactId": payload["artifactId"], "error": code,
+                       "errorType": type(error).__name__, "nativeError": getattr(error, "winerror", None) or getattr(error, "errno", None),
+                       "frames": [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
+                                  for frame in traceback.extract_tb(error.__traceback__)]}
             with self.registry.transaction() as connection:
                 connection.execute("UPDATE runtime_operations SET status='RECOVERY_REQUIRED',response=? WHERE id=?",
-                                   (json.dumps({"runId": payload["runId"], "artifactId": payload["artifactId"], "error": code}), operation_id))
+                                   (json.dumps(failure), operation_id))
             raise RegistryError(code, "GameTestの証跡・予約を保全しました。自動kill・再実行しません") from error
         return self._result(result)
 

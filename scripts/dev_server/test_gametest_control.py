@@ -146,6 +146,19 @@ class GameTestControlTests(RegistryFixture, unittest.TestCase):
         self.assert_code("RECOVERY_REQUIRED", self.run_test)
         self.assert_code("BUSY", lambda: self.run_test(dict(self.payload, runId="new-run"), "new-run"))
 
+    def test_native_failure_keeps_diagnostic_without_exception_message(self):
+        with patch.object(GameTestControl, "_run", side_effect=OSError(299, "secret-input")):
+            self.assert_code("GAMETEST_FAILED", self.run_test)
+        with self.registry.transaction(read_only=True) as connection:
+            row = connection.execute("SELECT status,response FROM runtime_operations WHERE id='run-test'").fetchone()
+        self.assertEqual("RECOVERY_REQUIRED", row["status"])
+        failure = json.loads(row["response"])
+        self.assertEqual("OSError", failure["errorType"])
+        self.assertEqual(299, failure["nativeError"])
+        self.assertTrue(failure["frames"])
+        self.assertNotIn("secret-input", row["response"])
+        self.assert_code("RECOVERY_REQUIRED", self.run_test)
+
     def test_failures_preserve_world_report_and_failed_replay(self):
         for report, exit_code in ((None, 0), ("broken", 0), ('<testsuite><testcase><failure/></testcase></testsuite>', 1),
                                   ('<testsuite><testcase/></testsuite>', 1)):
