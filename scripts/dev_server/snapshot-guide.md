@@ -69,7 +69,7 @@ Windowsの公開APIは[MicrosoftのMoveFileExW仕様](https://learn.microsoft.co
 公開とDB登録の間で失敗しても、未登録snapshotをverifyの成功対象として扱いません。
 欠損・余分なファイル・hash改変・COMPLETE不一致を検出します。
 失敗時は元世代、staging、公開済みデータ、journal、参照予約を保全してRECOVERY_REQUIREDにします。
-復旧・restore・resetは[世代ガイド](generation-guide.md)、candidate・validate・promoteは[テンプレートガイド](template-guide.md)に従います。GCは後続Issueの範囲です。
+復旧・restore・resetは[世代ガイド](generation-guide.md)、candidate・validate・promoteは[テンプレートガイド](template-guide.md)、参照保護と回収は[GCガイド](gc-guide.md)に従います。
 DB手編集や自動削除で進めません。
 
 Registryは形式4です。旧開発用rootを移行・削除せず拒否するため、検証には新しい空rootが必要です。

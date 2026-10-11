@@ -183,7 +183,7 @@ class RegistryTests(RegistryFixture, unittest.TestCase):
             self.assertFalse(dispatch(self.registry, message)["ok"])
         for command in ("start", "stop", "prepare", "restore", "reset", "snapshot", "recover", "gc"):
             response = dispatch(self.registry, new_request(command, {"unknown-secret": "must-not-print"}))
-            self.assertEqual("NOT_IMPLEMENTED" if command == "gc" else "INVALID_INPUT", response["error"]["code"])
+            self.assertEqual("INVALID_INPUT", response["error"]["code"])
             self.assertNotIn("must-not-print", str(response))
 
     def test_inventory_port_tampering_requires_recovery(self):

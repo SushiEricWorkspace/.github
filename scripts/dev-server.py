@@ -52,7 +52,7 @@ def main() -> int:
             supervise(args.root)
             return 0
         else:
-            if args.command in {"prepare", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-close", "gametest"} and operation_id is None:
+            if args.command in {"prepare", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-close", "gametest", "gc"} and operation_id is None:
                 raise RegistryError("INVALID_INPUT", "runtime操作には再送用の--operation-idを明示してください")
             if args.inventory is not None:
                 raise RegistryError("INVALID_INPUT", "--inventoryはinitだけで指定してください")

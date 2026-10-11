@@ -9,6 +9,7 @@ Managerの管理接続と終了証明は[管理writerガイド](writer-guide.md)
 世代の構築・restore/reset・障害復旧は[世代ガイド](generation-guide.md)を参照してください。
 固定fixtureの生成・独立検証・明示昇格は[テンプレートガイド](template-guide.md)を参照してください。
 固定bundleのGameTestと同世代保存往復は[GameTestガイド](gametest-guide.md)を参照してください。
+参照保護・容量検査・明示回収は[GCガイド](gc-guide.md)を参照してください。
 
 [ServerMod #525](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/525)の契約・fixtureを管理します。
 確定設計は[#524](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/524)、
@@ -40,7 +41,7 @@ Minecraftワールド、NBT、独自定義YAML、JARを実生成しません。
 管理CLI `scripts/dev-server.py`の初期化・監督・貸出は実装済みです。
 固定bundleの初回prepare・JVM起動停止・Mod保存/終了証跡照合を実装しています。
 協調Managerの世代固定writerを登録し、正常停止・writer不在を固定したprivate snapshotの作成・検証を行います。
-prepare/restore/resetの世代構築、固定fixtureの検証・明示昇格、recoverを実装しています。GCは後続の範囲です。
+prepare/restore/resetの世代構築、固定fixtureの検証・明示昇格、recover、参照照合付きGCを実装しています。
 管理外の非協調writerや停電耐性を証明せず、総合受入前の運用導入は行いません。
 既存worktreeやrun/への操作は行いません。
 
