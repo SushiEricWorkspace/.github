@@ -260,6 +260,17 @@ class GameTestGcTests(unittest.TestCase):
         self.assertFalse(nested.exists())
         verify_bundle(bundle)
 
+    @unittest.skipUnless(sys.platform == "darwin", "所有者限定root内のUnix通常生成権限")
+    def test_generated_world_permissions_under_private_root(self):
+        path = self.completed()
+        (path / "world").chmod(0o755)
+        (path / "world/marker").chmod(0o644)
+        references = [c["reference"] for c in self.candidates()]
+        self.assertEqual(["world:" + self.payload["runId"]], references)
+        self.command("gc", {"action": "apply", "planId": "plan", "references": references,
+                            "approvedBy": self.inventory["operator"]}, "apply")
+        self.assertFalse((path / "world").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

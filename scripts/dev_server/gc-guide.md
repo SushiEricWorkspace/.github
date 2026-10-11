@@ -17,6 +17,8 @@ python3.12 -B scripts/dev-server.py gc --root /absolute/dev-root --operation-id 
 候補には参照、rootからの相対パス、通常ファイルの合計bytes、ファイル集合のtreeHashを表示します。
 適用直前に参照・期限・全ファイル集合とhashを再照合し、変化があれば`GC_CHANGED`で拒否します。
 他のコピー・昇格・参照操作とGCはsupervisor内で排他し、稼働JVMと記録された子プロセスの不在も確認します。
+管理rootは所有者限定で、Windowsでは子要素のDACLも確認します。macOSの子要素は所有者一致を確認し、所有者限定root内に通常権限で生成されたworldを扱います。
+リンク・reparse point・共有hardlink・特殊ファイルは権限にかかわらず拒否します。
 
 ## 保護対象と保持期限
 

@@ -132,18 +132,28 @@ class GcControl:
 
     def _tree(self, path):
         plain_path(path)
-        require_private(path, directory=True)
+        require_private(self.registry.root, directory=True)
+        if os.name == "nt":
+            require_private(path, directory=True)
+        else:
+            require(path.stat().st_uid == os.getuid(), "OWNER_MISMATCH", "回収対象の所有者が一致しません")
         files = _files(path)
         directories = ["."]
         for directory, names, _ in os.walk(path, followlinks=False):
             for name in names:
                 child = Path(directory) / name
                 plain_path(child)
-                require_private(child, directory=True)
+                if os.name == "nt":
+                    require_private(child, directory=True)
+                else:
+                    require(child.stat().st_uid == os.getuid(), "OWNER_MISMATCH", "回収directoryの所有者が一致しません")
                 directories.append(child.relative_to(path).as_posix())
         for file in files:
             target = path / file["path"]
-            require_private(target)
+            if os.name == "nt":
+                require_private(target)
+            else:
+                require(target.stat().st_uid == os.getuid(), "OWNER_MISMATCH", "回収ファイルの所有者が一致しません")
             require(target.stat().st_nlink == 1, "UNSUPPORTED_FILE", "共有hardlinkは回収できません")
         return {"files": files, "directories": sorted(directories)}
 
