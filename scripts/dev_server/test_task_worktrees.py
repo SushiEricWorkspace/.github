@@ -205,14 +205,19 @@ class TaskWorktreesTest(unittest.TestCase):
 
     def test_symlink_is_never_followed(self):
         self.create()
-        target = self.manager.target("task-a", "SushiEricServerMod") / "build"
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        (path / "build").mkdir()
+        target = path / "build/external"
         try:
             target.symlink_to(self.root / "Common", target_is_directory=True)
         except OSError as error:
             self.skipTest(f"このホストにはsymlink作成権限がありません: {error}")
+        self.assertFalse(git(path, "status", "--porcelain", "--untracked-files=all"))
         with self.assertRaisesRegex(TaskError, "リンク"):
             self.manager.remove("task-a", "codex-a")
-        self.assertTrue((self.root / "Common/source.txt").exists())
+        self.assertEqual("initial\n", (self.root / "Common/source.txt").read_text())
+        self.assertTrue(target.is_symlink())
+        self.assertEqual("ACTIVE", self.manager.list()[0]["state"])
 
     def test_list_does_not_create_workspace_state(self):
         self.assertEqual([], self.manager.list())

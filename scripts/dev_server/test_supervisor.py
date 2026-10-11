@@ -27,6 +27,7 @@ class RegistryFixture:
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "dev"
         self.inventory = contract_documents("smoke-v1")[0]["inventory"]
+        self.inventory["quotaBytes"] = getattr(self, "quota_bytes", self.inventory["quotaBytes"])
         self.inventory["managementRoot"] = str(self.root)
         self.inventory["backup"]["destination"] = str(Path(self.temporary.name) / "synthetic-backup-not-real-medium")
         initialize(self.inventory, operation_id="init-test")
@@ -134,7 +135,7 @@ class RegistryTests(RegistryFixture, unittest.TestCase):
     def test_stale_generation_and_no_old_generation_start(self):
         token = self.acquire()
         self.assert_code("STALE_GENERATION", lambda: self.command("release", dict(token, expectedGeneration="old")))
-        self.assert_code("NOT_IMPLEMENTED", lambda: self.command("start", token))
+        self.assert_code("INVALID_STATE", lambda: self.command("start", dict(token, timeoutSeconds=2)))
         self.assertFalse(self.command("status", {"instanceId": "persistent-01"})["instances"][0]["generationBound"])
 
     def test_release_rejects_writers_children_pending_and_unproven_data(self):
@@ -182,13 +183,19 @@ class RegistryTests(RegistryFixture, unittest.TestCase):
             self.assertFalse(dispatch(self.registry, message)["ok"])
         for command in ("start", "stop", "prepare", "restore", "snapshot", "recover", "gc"):
             response = dispatch(self.registry, new_request(command, {"unknown-secret": "must-not-print"}))
-            self.assertEqual("NOT_IMPLEMENTED", response["error"]["code"])
+            self.assertEqual("INVALID_INPUT" if command in {"prepare", "start", "stop"} else "NOT_IMPLEMENTED", response["error"]["code"])
             self.assertNotIn("must-not-print", str(response))
 
     def test_inventory_port_tampering_requires_recovery(self):
         with self.registry.transaction() as connection:
             connection.execute("UPDATE ports SET port=25888 WHERE port=25665")
         self.assert_code("RECOVERY_REQUIRED", lambda: Registry(self.root))
+
+    def test_old_registry_format_is_preserved_and_rejected(self):
+        marker = self.root / "manager/INITIALIZED"
+        marker.write_text("registry-v1\n", encoding="utf-8")
+        self.assert_code("RECOVERY_REQUIRED", lambda: Registry(self.root))
+        self.assertEqual("registry-v1\n", marker.read_text())
 
     def test_native_security_rejects_broader_permissions(self):
         if os.name == "nt":
@@ -277,7 +284,7 @@ class SupervisorProcessTests(RegistryFixture, unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(lambda _: request(self.root, new_request("acquire", payload)), range(2)))
         self.assertEqual(1, sum(result["ok"] for result in results))
-        self.assertEqual("UNAVAILABLE", next(result["error"]["code"] for result in results if not result["ok"]))
+        self.assertIn(next(result["error"]["code"] for result in results if not result["ok"]), {"UNAVAILABLE", "LOCK_BUSY"})
         cli = subprocess.run([sys.executable, "-B", str(SCRIPT), "status", "--root", str(self.root), "--payload", '{"instanceId":"persistent-01"}'],
                              capture_output=True, text=True, encoding="utf-8", timeout=10)
         self.assertEqual(0, cli.returncode, cli.stdout)
@@ -330,7 +337,7 @@ class SupervisorProcessTests(RegistryFixture, unittest.TestCase):
             request(self.root, new_request("list", {}), timeout=0.1)
         process = self._start()
         response = request(self.root, new_request("start", {}))
-        self.assertEqual("NOT_IMPLEMENTED", response["error"]["code"])
+        self.assertEqual("INVALID_INPUT", response["error"]["code"])
         self.assertIsNone(process.poll())
 
     def test_native_unexpected_death_recovery_and_stale_replay(self):

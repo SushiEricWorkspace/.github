@@ -1,8 +1,10 @@
-"""CLIの寿命に依存しないローカルsupervisor。JVM制御は後続Issueで接続する。"""
+"""CLIの寿命に依存しないローカルsupervisor。枠ごとのruntimeを監督する。"""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import uuid
 
 from .build_lock import BuildLockError, build_lock
@@ -31,12 +33,16 @@ def dispatch(registry: Registry, message: dict) -> dict:
         if type(command) is not str:
             raise RegistryError("INVALID_INPUT", "commandは文字列で指定してください")
         payload = message["payload"]
-        if command in {"acquire", "renew", "release"} and type(payload) is dict and "instanceId" in payload:
+        if command in {"acquire", "release", "prepare", "start", "stop"} and type(payload) is dict and "instanceId" in payload:
             instance = identifier(payload["instanceId"], "instanceId")
             if instance not in {row["instanceId"] for row in registry.inventory["instances"]}:
                 raise RegistryError("NOT_FOUND", "instanceが登録されていません")
             with private_lock(registry.root / "manager" / "locks" / f"instance-{instance}.lock"):
-                result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
+                if command == "prepare":
+                    with private_lock(registry.root / "manager" / "locks" / "deployment.lock"):
+                        result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
+                else:
+                    result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
         else:
             result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
         return {"ok": True, "operationId": operation_id, "result": result}
@@ -57,23 +63,29 @@ def supervise(root: Path) -> None:
         with listener(root) as server:
             boot = registry.begin_supervision()
             print(encode({"ok": True, "result": {"supervisor": "ready", "bootId": boot, "pid": os.getpid()}}).decode(), flush=True)
-            while True:
-                connection = server.accept()
-                if connection is None:
-                    continue
+            stopping = threading.Event()
+
+            def handle(connection):
                 try:
                     if not connection.poll(5):
-                        continue
+                        return
+                    if stopping.is_set():
+                        return
                     message = decode(connection.recv_bytes(MAX_MESSAGE))
                     response = dispatch(registry, message)
                     connection.send_bytes(encode(response))
                     if response.get("ok") and response["result"].get("shutdown"):
-                        return
+                        stopping.set()
                 except (OSError, EOFError, ValueError):
                     # 壊れた接続はRegistry操作へ変換しない。payloadや秘密を出力しない。
                     pass
                 finally:
                     connection.close()
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="dev-server") as workers:
+                while not stopping.is_set():
+                    connection = server.accept(timeout=0.25)
+                    if connection is not None:
+                        workers.submit(handle, connection)
 
 
 def new_request(command: str, payload: dict, *, operation_id: str | None = None, dry_run: bool = False) -> dict:

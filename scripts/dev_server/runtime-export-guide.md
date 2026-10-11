@@ -44,8 +44,12 @@ artifact IDはmanifestから計算するSHA-256です。COMPLETEと全ファイ�
 既存artifactの上書きはしません。失敗した`.staging-*`は診断用に保全し、成功扱いしません。
 bundleのJDKを含めてartifact領域から実行でき、元のworktree、build、Gradleキャッシュを実行時に参照しません。
 Javaの長いclasspathはrun側のargfileへ展開し、OSのコマンド長上限に依存しません。
-`launch_command`は新しいrun-id用ディレクトリへ起動設定だけを展開し、JVMコマンドを返します。
-既存の`.launch`がある実行領域は上書きしません。プロセス開始・正常停止・保存証跡は呼出側が管理します。
+`launch_command`は起動設定だけを展開し、JVMコマンドを返します。
+既定はrun/.launchを新規作成し、`auxiliary`を渡すとrun-id専用の別pathへ出力します。
+cwd/world/configを変えず同世代を再起動できます。既存の補助path・bundleは上書きしません。
+bundleの内部へ実行データを置けませんが、generation/runtimeの配備は許可します。
+管理propertyは全5項目または未指定です。プロセス開始・正常停止・保存証跡は
+[runtime制御](runtime-control-guide.md)の責務です。
 
 ## 検証境界
 

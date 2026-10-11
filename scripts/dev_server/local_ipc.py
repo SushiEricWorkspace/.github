@@ -119,7 +119,7 @@ if os.name == "nt":
                 raise
             return handle
 
-        def accept(self):
+        def accept(self, timeout=None):
             old, self.handle = self.handle, self._create()
             try:
                 try:
@@ -130,7 +130,13 @@ if os.name == "nt":
                         return None
                     raise
                 if overlapped is not None:
-                    _winapi.WaitForMultipleObjects([overlapped.event], False, _winapi.INFINITE)
+                    waited = _winapi.WaitForMultipleObjects([overlapped.event], False,
+                                                          _winapi.INFINITE if timeout is None else int(timeout * 1000))
+                    if waited == _winapi.WAIT_TIMEOUT:
+                        overlapped.cancel()
+                        overlapped.GetOverlappedResult(True)
+                        kernel.CloseHandle(old)
+                        return None
                     _, error = overlapped.GetOverlappedResult(True)
                     if error:
                         raise ctypes.WinError(error)
@@ -220,8 +226,12 @@ class UnixListener:
             self.stream.close()
             raise
 
-    def accept(self):
-        stream, _ = self.stream.accept()
+    def accept(self, timeout=None):
+        self.stream.settimeout(timeout)
+        try:
+            stream, _ = self.stream.accept()
+        except socket.timeout:
+            return None
         try:
             _same_uid(stream)
             return UnixConnection(stream)

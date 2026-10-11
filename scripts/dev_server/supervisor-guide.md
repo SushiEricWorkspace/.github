@@ -7,10 +7,10 @@ Python 3.12を使用し、macOSとWindowsで同じCLI・Registryを使います�
 
 ## 検証境界
 
-この段階ではMinecraft・Managerを起動しません。start/stop/prepare/snapshot/restore/recover/gcは
-`NOT_IMPLEMENTED`です。doctorはIPC到達とRegistry読取を確認するだけで、実ポートのbind、
-保存完了、外部writer終了、FSの停電耐久性を証明しません。
-実データを持つ枠のreleaseも、後続の保存・終了証跡を接続するまで拒否します。
+初回prepare・固定bundleからのstart/stopは[runtime制御ガイド](runtime-control-guide.md)に従います。
+snapshot/restore/recover/gcは`NOT_IMPLEMENTED`です。doctor/statusはRUNNINGの所有識別・Mod証跡・
+実socketを再照合しますが、外部writer終了、snapshot clean、FSの停電耐久性を証明しません。
+実データを持つ枠のreleaseも、外部writer・世代引継ぎの照合を接続するまで拒否します。
 総合受入と運用者の設定が揃うまで既存環境を置き換えず、運用を有効化しません。
 
 ## 初期化
@@ -33,7 +33,8 @@ python3.12 -B scripts/dev-server.py init --root /absolute/minecraft-dev --invent
 Windowsでは`python3.12`を`py -3.12`へ置き換え、`--root`を`C:/...`形式にします。
 初期化を中断してrootへ部分データが残った場合は自動再初期化・削除せず止まります。
 完了済みinitは同じinventoryと同じoperationIdだけが再送可能です。
-schemaVersionは1です。開発中の形式変更に旧データ移行処理は追加しません。
+inventory契約はschemaVersion=1、Registry DBとINITIALIZED markerはversion=2です。
+旧DB/markerは保全して拒否し、移行・再初期化しません。検証には新しい空rootを用意してください。
 
 ## supervisorと要求
 
@@ -83,6 +84,7 @@ supervisor再起動では、空いていた枠も含め全枠を`RECOVERY_REQUIR
 現段階のrecoverは未実装なので、DBを手編集して貸出を強行しません。
 `shutdown`は監督だけを終了して全枠を復旧待ちにする補助操作です。leaseは解放されません。
 Minecraftの停止コマンドではなく、同一rootの監督停止にだけ使います。
+runtime操作進行中は`BUSY`です。監督終了でJVM/childをkillする設定はありません。
 shutdownもoperationIdを記録し、他の変更とのID衝突を拒否します。
 前回の監督を停止した要求の再送は`STALE_SUPERVISOR`となり、再起動した監督を停止しません。
 
@@ -96,7 +98,9 @@ writer/child/pending/参照予約が残る場合もrelease不可です。
 
 - macOS: owner限定dir 0700、socket 0600、接続の両側でpeer UID、flock。
 - Windows: owner SIDだけの保護DACL、`PIPE_REJECT_REMOTE_CLIENTS`、byte-range lock。
-- 両方: singleton OS lockを監督期間中保持し、instance OS lockを取得した後に短いSQLite transactionを開始。
+- 両方: singleton OS lockを監督期間中保持。枠の変更はinstance OS lock、prepareコピーはdeployment OS lockも保持。
+  renewはlease/epoch/世代を検証する短いDB更新だけで、長いruntime操作中も有効期限を更新できます。
+  最大4要求を扱い、監督内のDB transactionだけを直列化します。コピー・OS照合・RCON待機中はDBを保持しません。
 - IPCは64KiB以下のJSON bytesだけ。pickleの復元、秘密を含むpayloadのログ出力は行いません。
   JSONの解析に失敗する深さの入力は、その接続だけを拒否して監督を継続します。
 
@@ -116,6 +120,7 @@ private root外のファイルの権限を、このCLIから変更しません�
 ```bash
 python3.12 -B -m unittest discover -s scripts -p test_supervisor.py -v
 python3.12 -B -m unittest discover -s scripts -p test_contracts.py -v
+python3.12 -B -m unittest discover -s scripts -p 'test_runtime_*.py' -v
 ```
 
 OS自身のIPC・DACL/UID・lock、CLI終了後の監督継続、競合、異常終了後の復旧待ちを確認します。

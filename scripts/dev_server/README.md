@@ -3,6 +3,7 @@
 タスクのソースworktreeを作成・引き継ぎ・削除する場合は[worktreeガイド](worktrees-guide.md)を参照してください。
 固定した開発runtimeを出力する場合は[runtime出力ガイド](runtime-export-guide.md)を参照してください。
 宣言設定・貸出Registry・supervisorを扱う場合は[監督・貸出ガイド](supervisor-guide.md)を参照してください。
+固定bundleの初回prepare・起動停止は[runtime制御ガイド](runtime-control-guide.md)を参照してください。
 
 [ServerMod #525](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/525)の契約・fixtureを管理します。
 確定設計は[#524](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/524)、
@@ -32,7 +33,8 @@ Minecraftワールド、NBT、独自定義YAML、JARを実生成しません。
 
 契約検証はコピー/削除/設定変換/ポート予約/JVM起動を実行しません。
 管理CLI `scripts/dev-server.py`の初期化・監督・貸出は実装済みです。
-JVM起動停止・保存証跡・snapshot/restore/recoverは未接続で、成功扱いせず拒否します。
+固定bundleの初回prepare・JVM起動停止・Mod保存/終了証跡照合を実装しています。
+snapshot/restore/recover/gcと外部writer接続は未実装で、runtime停止証明をsnapshot cleanへ昇格しません。
 既存worktreeやrun/への操作は行いません。
 
 ## テスト結果の扱い
