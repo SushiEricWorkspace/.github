@@ -1,9 +1,7 @@
-"""初回prepareと固定bundleの起動/停止。保存終了証明をsnapshot cleanへ昇格しない。"""
+"""固定bundleの起動/停止。世代構築はGenerationControlで行う。"""
 import json
 import os
 from pathlib import Path
-import re
-import secrets
 import shutil
 import stat
 import time
@@ -68,10 +66,10 @@ class RuntimeControl:
         require(record["version"] == 1 and record["layoutId"] == LAYOUT_ID
                 and record["generationId"] == row["generation"] and record["artifactId"] == row["artifact"],
                 "RECOVERY_REQUIRED", "世代の完成記録が一致しません")
-        plain_path(root / "journal.json")
-        plain_path(root / "staging")
-        require(not (root / "journal.json").exists() and not (root / "staging").exists(),
-                "RECOVERY_REQUIRED", "未完了の世代切替は後続エンジンで照合してください")
+        self.registry.generation.check_active(row, record)
+        staging = root / "staging"
+        require(staging.is_dir(), "RECOVERY_REQUIRED", "世代作業領域が通常directoryではありません")
+        require_private(staging, directory=True)
         return generation
 
     def _row(self, payload):
@@ -120,19 +118,11 @@ class RuntimeControl:
 
     def execute(self, command, payload, *, operation_id, dry_run=False):
         identifier(operation_id, "operationId")
-        additional = {"prepare": {"artifactId", "generationId", "seed", "acceptEula"},
-                      "start": {"timeoutSeconds"}, "stop": {"timeoutSeconds"}}
-        fields(payload, TOKEN | additional[command])
+        require(command in {"start", "stop"}, "INVALID_INPUT", "runtime制御はstart/stopだけです")
+        fields(payload, TOKEN | {"timeoutSeconds"})
         identifier(payload["instanceId"], "instanceId")
-        if command == "prepare":
-            identifier(payload["generationId"], "generationId")
-            require(type(payload["artifactId"]) is str and re.fullmatch("[0-9a-f]{64}", payload["artifactId"]) is not None,
-                    "INVALID_INPUT", "完成artifact IDが必要です")
-            require(type(payload["seed"]) is int and -(2**63) <= payload["seed"] < 2**63
-                    and payload["acceptEula"] is True, "INVALID_INPUT", "固定seedと運用者のEULA同意が必要です")
-        else:
-            ttl(payload["timeoutSeconds"])
-        if command in {"start", "stop"} and not dry_run:
+        ttl(payload["timeoutSeconds"])
+        if not dry_run:
             self.refresh()
         fingerprint = digest(canonical({"command": command, "payload": payload}))
         replay = None
@@ -144,12 +134,11 @@ class RuntimeControl:
             if cached:
                 require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "operationIdに異なる要求を指定できません")
                 row = self.registry._instance(connection, payload["instanceId"])
-                self.registry._token(row, dict(payload, expectedGeneration=payload["generationId"]) if command == "prepare" else payload)
+                self.registry._token(row, payload)
                 require(cached["status"] == "COMPLETED", "RECOVERY_REQUIRED", "未確定の操作は自動再実行しません")
                 response = json.loads(cached["response"])
-                if command != "prepare":
-                    require(row["run_id"] == response["runId"] and row["state"] == ("RUNNING" if command == "start" else "LEASED_STOPPED"),
-                            "STALE_OPERATION", "別runまたは停止後へ古い結果を適用できません")
+                require(row["run_id"] == response["runId"] and row["state"] == ("RUNNING" if command == "start" else "LEASED_STOPPED"),
+                        "STALE_OPERATION", "別runまたは停止後へ古い結果を適用できません")
                 replay = (dict(row), response)
         if replay:
             row, response = replay
@@ -158,37 +147,23 @@ class RuntimeControl:
                 self._running(row)
             return dict(response, replayed=True, dryRun=dry_run)
         row = self._row(payload)
-        generation = None
-        if command == "prepare":
-            require(row["state"] == "LEASED_STOPPED" and row["generation"] is None and not row["pending"],
-                    "EXISTING_DATA", "初回の空枠だけをprepareできます。既存世代は上書きしません")
-            root = self._paths(row["id"])
-            require(not root.exists() or (root.is_dir() and not any(root.iterdir())),
-                    "EXISTING_DATA", "instanceに既存データがあります")
-            bundle = self.registry.root / "artifacts" / payload["artifactId"]
-            manifest = verify_bundle(bundle)
-            require(manifest["artifactId"] == payload["artifactId"], "ARTIFACT_MISMATCH", "指定artifactと実体が一致しません")
-            require(manifest["layoutId"] == LAYOUT_ID, "LAYOUT_MISMATCH", "未対応data-layoutは配備できません")
-            required_bytes = sum(item["size"] for item in manifest["files"]) + (bundle / "runtime.json").stat().st_size
-            self._space(required_bytes)
+        require(row["generation_bound"] and row["generation"] is not None and not row["pending"],
+                "INVALID_STATE", "このleaseへ完成generationが結び付いていません")
+        generation = self._active(row)
+        if command == "start":
+            require(row["state"] in ("READY", "LEASED_STOPPED") and not row["writers"] and not row["children"],
+                    "NOT_STOPPED", "停止・writer/child不在を確認できません")
+            if row["run_id"]:
+                previous = self._load_run(row)
+                require(previous.get("jvmAndChildrenExited") and previous.get("runtimeSaveCompleted"),
+                        "PROOF_REQUIRED", "前runの正常停止・保存終了を確認できません")
+                require(self.process_adapter.identity(previous["identity"]["pid"]) is None,
+                        "PROCESS_MISMATCH", "前runのPIDが存在します。PID再利用も自動許可しません")
+            verify_bundle(generation / "runtime")
+            self._space()
         else:
-            require(row["generation_bound"] and row["generation"] is not None and not row["pending"],
-                    "INVALID_STATE", "このleaseへ完成generationが結び付いていません")
-            generation = self._active(row)
-            if command == "start":
-                require(row["state"] in ("READY", "LEASED_STOPPED") and not row["writers"] and not row["children"],
-                        "NOT_STOPPED", "停止・writer/child不在を確認できません")
-                if row["run_id"]:
-                    previous = self._load_run(row)
-                    require(previous.get("jvmAndChildrenExited") and previous.get("runtimeSaveCompleted"),
-                            "PROOF_REQUIRED", "前runの正常停止・保存終了を確認できません")
-                    require(self.process_adapter.identity(previous["identity"]["pid"]) is None,
-                            "PROCESS_MISMATCH", "前runのPIDが存在します。PID再利用も自動許可しません")
-                verify_bundle(generation / "runtime")
-                self._space()
-            else:
-                require(row["state"] == "RUNNING" and row["run_id"] in self.processes,
-                        "NOT_RUNNING", "監督が所有するRUNNING runだけを停止します")
+            require(row["state"] == "RUNNING" and row["run_id"] in self.processes,
+                    "NOT_RUNNING", "監督が所有するRUNNING runだけを停止します")
         endpoints = instance_endpoints(next(item for item in self.registry.inventory["instances"] if item["instanceId"] == row["id"]))
         if dry_run:
             if command == "stop":
@@ -207,26 +182,20 @@ class RuntimeControl:
             connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
                                (operation_id, fingerprint, command, row["id"], "PENDING", json.dumps(response)))
             connection.execute("UPDATE instances SET state=?,pending=1,runtime_proof=NULL,clean_proof=NULL WHERE id=?",
-                               ({"prepare": "PREPARING", "start": "STARTING", "stop": "STOPPING"}[command], row["id"]))
+                               ({"start": "STARTING", "stop": "STOPPING"}[command], row["id"]))
             connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,?)", (self.registry.clock(), operation_id, command))
             connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)",
-                               (operation_id, "artifact:" + (payload["artifactId"] if command == "prepare" else row["artifact"]),
+                               (operation_id, "artifact:" + row["artifact"],
                                 row["id"], row["lease"], row["epoch"]))
         try:
-            if command == "prepare":
-                result = self._prepare(row, payload, bundle)
-            elif command == "start":
+            if command == "start":
                 result = self._start(row, payload, generation, endpoints, operation_id)
             else:
                 result = self._stop(row, payload, generation)
             with self.registry.transaction() as connection:
                 current = self.registry._instance(connection, row["id"])
-                # prepareはDB世代をまだ変更していないため旧tokenを確認する。
                 self.registry._token(current, payload)
-                if command == "prepare":
-                    connection.execute("UPDATE instances SET generation=?,artifact=?,generation_bound=1,state='READY',pending=0 WHERE id=?",
-                                       (result["generation"], payload["artifactId"], row["id"]))
-                elif command == "start":
+                if command == "start":
                     connection.execute("UPDATE instances SET state='RUNNING',pending=0 WHERE id=?", (row["id"],))
                 else:
                     connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?",
@@ -243,38 +212,6 @@ class RuntimeControl:
             if isinstance(error, RegistryError):
                 raise
             raise RegistryError(code, "runtime操作に失敗しました。保全し、自動kill/再送しません") from None
-
-    def _prepare(self, row, payload, bundle):
-        root = self._paths(row["id"])
-        root.mkdir(exist_ok=True)
-        make_private(root, directory=True)
-        generations = root / "generations"
-        generations.mkdir()
-        make_private(generations, directory=True)
-        generation = generations / payload["generationId"]
-        generation.mkdir()
-        make_private(generation, directory=True)
-        shutil.copytree(bundle, generation / "runtime")
-        verify_bundle(generation / "runtime")
-        management = generation / "config/SushiEricServerMod/management"
-        management.mkdir(parents=True)
-        (management / "config.yml").write_text("port: " + str(next(item for item in self.registry.inventory["instances"] if item["instanceId"] == row["id"])["ports"]["management"]) + "\n", encoding="utf-8")
-        declaration = next(item for item in self.registry.inventory["instances"] if item["instanceId"] == row["id"])
-        properties = {"server-ip": declaration["minecraftBind"], "server-port": declaration["ports"]["minecraft"],
-                      "enable-rcon": "true", "rcon.port": declaration["ports"]["rcon"], "rcon.password": secrets.token_hex(24),
-                      "level-name": "world", "level-seed": payload["seed"], "enable-query": "false", "online-mode": "true"}
-        path = generation / "server.properties"
-        with path.open("x", encoding="utf-8") as handle:
-            handle.write("".join(f"{key}={value}\n" for key, value in properties.items()))
-            handle.flush()
-            os.fsync(handle.fileno())
-        make_private(path)
-        (generation / "eula.txt").write_text("eula=true\n", encoding="utf-8")
-        record = {"version": 1, "generationId": payload["generationId"], "artifactId": payload["artifactId"],
-                  "layoutId": LAYOUT_ID, "seed": payload["seed"]}
-        write_json(generation / "generation.json", record)
-        write_json(root / "active.json", {"version": 1, "generationId": payload["generationId"], "artifactId": payload["artifactId"]})
-        return {"instanceId": row["id"], "generation": payload["generationId"], "prepared": True, "snapshotClean": False}
 
     def _proof(self, run, generation, *, stopped=False):
         proof = read_json(Path(run["proofPath"]))
@@ -293,7 +230,9 @@ class RuntimeControl:
                 and identity["runtimeManifestSha256"] == run["manifestHash"]
                 and Path(identity["runtimeManifest"]).resolve() == (generation / "runtime/runtime.json").resolve(),
                 "PROOF_MISMATCH", "Mod証跡のプロセス・runtime識別が一致しません")
-        expected_roots = {"world": generation / "world", "config": generation / "config",
+        from .snapshot_data import properties
+        world = properties((generation / "server.properties").read_bytes())["level-name"]
+        expected_roots = {"world": generation / world, "config": generation / "config",
                           "modConfig": generation / "config/SushiEricServerMod"}
         roots = proof["startup"]["roots"]
         require(roots.keys() == expected_roots.keys(), "ROOT_MISMATCH", "保存root集合が一致しません")

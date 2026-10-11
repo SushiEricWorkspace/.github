@@ -112,6 +112,10 @@ class FakeAdapter:
             self.identity_fault(result)
         return result
 
+    def recorded_members(self, creation, nonce):
+        process = next(item for item in self.created if item.pid == creation["pid"])
+        return process.members()
+
     def sockets(self, pid):
         process = next(item for item in self.created if item.pid == pid)
         result = deepcopy(list(process.endpoints.values()))
@@ -191,7 +195,9 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.assertEqual(2, len(list((generation.parents[1] / "diagnostics").iterdir())))
         self.stop("stop-02")
         self.assertTrue(self.state()["runtime_proof"])
-        self.assert_code("PROOF_REQUIRED", lambda: self.command("release", self.token, "release-prepared"))
+        self.assertTrue(self.command("release", self.token, "release-prepared")["released"])
+        self.token = self.acquire(operation="acquire-next-owner")
+        self.assert_code("INVALID_STATE", lambda: self.start("start-next-owner"))
 
     def test_prepare_preserves_existing_data_and_requires_empty_slot(self):
         root = self.root / "instances/persistent-01"
@@ -221,14 +227,14 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.assertEqual([0, 0, 0, 0], before)
 
     def test_prepare_partial_failure_is_fenced_and_never_overwritten(self):
-        with patch("dev_server.runtime_control.shutil.copytree", side_effect=OSError("secret-path")):
-            self.assert_code("RUNTIME_FAILED", self.prepare)
+        with patch.object(self.registry.generation, "_write_tree", side_effect=OSError("secret-path")):
+            self.assert_code("GENERATION_FAILED", self.prepare)
         self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
-        self.assertTrue((self.root / "instances/persistent-01/generations/generation-01").exists())
+        self.assertTrue((self.root / "instances/persistent-01/staging/prepare-01").exists())
         self.assert_code("RECOVERY_REQUIRED", self.prepare)
         self.assert_code("UNAVAILABLE", lambda: self.acquire(operation="reacquire"))
         with self.registry.transaction(read_only=True) as connection:
-            self.assertEqual(1, connection.execute("SELECT count(*) FROM reservations").fetchone()[0])
+            self.assertEqual(2, connection.execute("SELECT count(*) FROM reservations").fetchone()[0])
 
     def test_lease_epoch_generation_and_operation_payload_fences(self):
         self.prepare()
@@ -526,13 +532,13 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
 
     def test_long_operation_has_no_db_lock_and_can_renew_and_read_other_slot(self):
         entered, proceed = threading.Event(), threading.Event()
-        original = self.registry.runtime._prepare
-        def prepare(row, payload, bundle):
+        original = self.registry.generation._build
+        def prepare(request, bundle, manifest, staging):
             entered.set()
             if not proceed.wait(3):
                 raise AssertionError("試験同期期限超過")
-            return original(row, payload, bundle)
-        with patch.object(self.registry.runtime, "_prepare", side_effect=prepare), ThreadPoolExecutor(max_workers=1) as workers:
+            return original(request, bundle, manifest, staging)
+        with patch.object(self.registry.generation, "_build", side_effect=prepare), ThreadPoolExecutor(max_workers=1) as workers:
             pending = workers.submit(dispatch, self.registry, new_request("prepare", self.prepare_payload, operation_id="prepare-01"))
             self.assertTrue(entered.wait(2))
             try:

@@ -183,7 +183,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue((self.root / "manager/operations/snapshot-snapshot-create-01/prepared.json").is_file())
 
     def test_fsync_failure_prevents_publish(self):
-        with patch("dev_server.snapshot_control.os.fsync", side_effect=OSError("flush-failed")):
+        with patch("dev_server.storage.os.fsync", side_effect=OSError("flush-failed")):
             self.assert_code("SNAPSHOT_FAILED", self.create)
         self.assertFalse(self.destination.exists())
 

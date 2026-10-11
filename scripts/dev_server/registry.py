@@ -185,6 +185,8 @@ class Registry:
         self.writer = WriterControl(self)
         from .snapshot_control import SnapshotControl
         self.snapshot = SnapshotControl(self)
+        from .generation_control import GenerationControl
+        self.generation = GenerationControl(self)
 
     @contextmanager
     def transaction(self, *, read_only: bool = False):
@@ -236,11 +238,14 @@ class Registry:
         require(not any(row[field] for field in ("writers", "children", "pending")), "BUSY", "writer・child・未完了操作が残っています")
         require(not connection.execute("SELECT 1 FROM reservations WHERE instance=?", (row["id"],)).fetchone(),
                 "BUSY", "参照予約が残っています")
-        # 外部writer/世代引継ぎの照合は#531/#533で接続する。runtime証明だけでは解放しない。
         path = self.root / "instances" / row["id"]
         plain_path(path)
-        require(row["generation"] is None and (not path.exists() or (path.is_dir() and not any(path.iterdir()))),
-                "PROOF_REQUIRED", "外部writer・世代引継ぎ照合前は実データ枠を解放できません")
+        if row["generation"] is None:
+            require(not path.exists() or (path.is_dir() and not any(path.iterdir())), "PROOF_REQUIRED", "空枠に既存データがあります")
+        else:
+            require(row["generation_bound"] and row["runtime_proof"]
+                    and self.writer.summary(connection, row)["externalWritersVerified"],
+                    "PROOF_REQUIRED", "正常停止・writer終了の証跡が必要です")
 
     def _cached_valid(self, connection, command, payload, result):
         if command == "shutdown":
@@ -261,9 +266,11 @@ class Registry:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
         if command == "snapshot":
             return self.snapshot.execute(payload, operation_id=operation_id, dry_run=dry_run)
+        if command in {"prepare", "restore", "reset", "recover"}:
+            return self.generation.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"writer-open", "writer-io", "writer-close"}:
             return self.writer.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
-        if command in {"prepare", "start", "stop"}:
+        if command in {"start", "stop"}:
             return self.runtime.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"list", "status", "doctor"} and not dry_run:
             self.runtime.refresh()
@@ -275,6 +282,13 @@ class Registry:
                     "release": {"instanceId", "leaseId", "epoch", "expectedGeneration"},
                     "list": set(), "status": {"instanceId"}, "doctor": set(), "shutdown": set()}
         fields(payload, required[command])
+        if command == "release":
+            with self.transaction(read_only=True) as connection:
+                releasing = dict(self._instance(connection, payload["instanceId"]))
+            if releasing["lease"] is not None and releasing["generation"] is not None:
+                releasing = self.generation._row(payload)
+                self.runtime._active_generation(releasing)
+                self.generation._stopped(releasing)
         fingerprint = hashlib.sha256(json.dumps({"command": command, "payload": payload}, sort_keys=True).encode()).hexdigest()
         with self.transaction(read_only=command not in mutations or dry_run) as connection:
             if command in {"list", "status", "doctor"}:
@@ -290,7 +304,7 @@ class Registry:
                                             and not any(row[key] for key in ("writers", "children", "pending")),
                            **self.writer.summary(connection, row)} for row in rows]
                 return {"instances": result, "supervisor": "reachable", "ports": "inventory-and-runtime-reservations",
-                        "unimplemented": ["restore", "recover", "gc"]}
+                        "unimplemented": ["gc"]}
             cached = connection.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
             require(not connection.execute("SELECT 1 FROM reference_operations WHERE id=?", (operation_id,)).fetchone(),
                     "OPERATION_CONFLICT", "同じoperationIdが参照予約で使用されています")

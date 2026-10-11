@@ -28,7 +28,8 @@ class NativeProcessTests(unittest.TestCase):
             recorded = []
             with (root / "console.log").open("xb") as log:
                 process = runtime_process.OwnedProcess()
-                process.start(arguments, root, log, os.urandom(16).hex(),
+                nonce = os.urandom(16).hex()
+                process.start(arguments, root, log, nonce,
                               lambda: recorded.append(runtime_process.identity(process.pid)))
                 try:
                     deadline = time.monotonic() + 8
@@ -47,6 +48,8 @@ class NativeProcessTests(unittest.TestCase):
                     self.assertEqual(runtime_process.command_hash([*arguments[:3], "child", str(root), executable]),
                                      child_identity["commandHash"])
                     self.assertIn(child["pid"], process.members())
+                    creation = {"pid": process.pid, "ownerGroup": process.group}
+                    self.assertIn(child["pid"], runtime_process.recorded_members(creation, nonce))
                     self.assertEqual(
                         {("tcp", "127.0.0.1", parent["tcp"]), ("udp", "127.0.0.1", parent["udp"])},
                         {(item["protocol"], item["address"], item["port"]) for item in runtime_process.sockets(process.pid)})
@@ -60,6 +63,7 @@ class NativeProcessTests(unittest.TestCase):
                     self.assertIsNone(runtime_process.identity(process.pid))
                     self.assertIn(child["pid"], process.members())
                     self.assertIsNotNone(runtime_process.identity(child["pid"]))
+                    self.assertIn(child["pid"], runtime_process.recorded_members(creation, nonce))
                 finally:
                     (root / "parent-exit").touch(exist_ok=True)
                     (root / "child-exit").touch(exist_ok=True)
@@ -69,6 +73,7 @@ class NativeProcessTests(unittest.TestCase):
                             self.fail("自己生成の親子が期限内に自己終了しません。強制停止しません")
                         time.sleep(0.03)
                     process.close()
+                    self.assertEqual([], runtime_process.recorded_members(creation, nonce))
 
     def test_proof_time_uses_integer_milliseconds(self):
         self.assertEqual(1001, runtime_process.proof_start_millis("1970-01-01T00:00:01.001999Z"))

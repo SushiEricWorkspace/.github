@@ -1,71 +1,15 @@
 """正常停止と全writer終了を固定してから、不変のprivate snapshotを公開する。"""
-import ctypes
 import json
-import os
 from pathlib import Path
-import sys
 
 from .build_inputs import canonical, digest, regular_bytes
 from .contracts import validate
-from .local_ipc import make_private, plain_path, require_private
+from .local_ipc import plain_path, require_private
 from .registry import RegistryError, fields, identifier, require
 from .runtime_bundle import verify_bundle, _files
 from .runtime_control import TOKEN
 from .snapshot_data import collect, entry, transform
-
-
-def sync_directory(path: Path) -> None:
-    """macOSは親directoryをfsyncする。Windowsの公開はwrite-through renameで行う。"""
-    plain_path(path)
-    if os.name != "nt":
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-
-def move(source: Path, destination: Path) -> None:
-    """同一FSの未使用destinationへ公開する。既存データを置換しない。"""
-    plain_path(source)
-    plain_path(destination)
-    require(not destination.exists() and source.stat().st_dev == destination.parent.stat().st_dev,
-            "EXISTING_DATA", "公開先が既存または別FSです")
-    if os.name == "nt":
-        from ctypes import wintypes
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
-        kernel.MoveFileExW.restype = wintypes.BOOL
-        if not kernel.MoveFileExW(str(source), str(destination), 8):
-            raise ctypes.WinError(ctypes.get_last_error())
-    else:
-        source.rename(destination)
-        sync_directory(destination.parent)
-        if source.parent != destination.parent:
-            sync_directory(source.parent)
-
-
-def write(path: Path, data: bytes) -> None:
-    """新規ファイルをflushしてから公開する。途中ファイルは障害証跡として残す。"""
-    plain_path(path)
-    temporary = path.with_name(path.name + ".writing")
-    plain_path(temporary)
-    with temporary.open("xb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-        if sys.platform == "darwin":
-            import fcntl
-            fcntl.fcntl(handle.fileno(), fcntl.F_FULLFSYNC)
-    make_private(temporary)
-    move(temporary, path)
-
-
-def mkdir(path: Path) -> None:
-    plain_path(path)
-    path.mkdir()
-    make_private(path, directory=True)
-    sync_directory(path.parent)
+from .storage import mkdir, move, write
 
 
 def verify_snapshot(path: Path) -> dict:
@@ -105,8 +49,13 @@ class SnapshotControl:
             require(not connection.execute("SELECT 1 FROM writer_sessions WHERE instance=? AND pending!=0", (row["id"],)).fetchone()
                     and not connection.execute("SELECT 1 FROM endpoint_reservations WHERE instance=?", (row["id"],)).fetchone(),
                     "PROOF_REQUIRED", "writer操作または待受予約が残っています")
+        generation = self.registry.runtime._active_generation(row)
+        run, saved = self.stopped(row, generation)
+        return row, generation, run, saved
+
+    def stopped(self, row, generation):
+        """停止済みrunの正本と保存証跡を照合する。lease・状態・writerは呼出側で検査する。"""
         runtime = self.registry.runtime
-        generation = runtime._active_generation(row)
         run = runtime._load_run(row)
         proof = json.loads(row["runtime_proof"])
         expected_proof = runtime._paths(row["id"]) / "diagnostics" / row["run_id"] / "proof.json"
@@ -123,7 +72,7 @@ class SnapshotControl:
         require(runtime.process_adapter.identity(run["identity"]["pid"]) is None,
                 "PROCESS_MISMATCH", "記録PIDが存在します。再利用を推測しません")
         saved = runtime._proof(run, generation, stopped=True)
-        return row, generation, run, saved
+        return run, saved
 
     def _registered(self, snapshot_id):
         with self.registry.transaction(read_only=True) as connection:
@@ -175,6 +124,9 @@ class SnapshotControl:
         self.registry.runtime._space(sum(item["size"] for item in sources))
         if dry_run:
             return {"dryRun": True, "wouldExecute": "snapshot-create", "snapshotId": snapshot_id, "files": len(sources)}
+        requested = {"operationId": operation_id, "fingerprint": fingerprint, "instanceId": row["id"],
+                     "generation": row["generation"], "runId": row["run_id"], "snapshotId": snapshot_id,
+                     "leaseId": row["lease"], "epoch": row["epoch"]}
         with self.registry.transaction() as connection:
             current = self.registry._instance(connection, row["id"])
             self.registry._token(current, payload)
@@ -183,15 +135,14 @@ class SnapshotControl:
             for table in ("operations", "runtime_operations", "writer_operations", "reference_operations", "snapshot_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが登録中に使用されました")
-            connection.execute("INSERT INTO snapshot_operations VALUES (?,?,?,?,?)", (operation_id, fingerprint, row["id"], "PENDING", "{}"))
+            connection.execute("INSERT INTO snapshot_operations VALUES (?,?,?,?,?)", (operation_id, fingerprint, row["id"], "PENDING", json.dumps(requested)))
             connection.execute("UPDATE instances SET state='SNAPSHOTTING',pending=1,clean_proof=NULL WHERE id=?", (row["id"],))
             for reference in ("artifact:" + row["artifact"], "generation:" + row["generation"], "snapshot:" + snapshot_id):
                 connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)", (operation_id, reference, row["id"], row["lease"], row["epoch"]))
             connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,?)", (self.registry.clock(), operation_id, "snapshot-create"))
         try:
             mkdir(journal)
-            write(journal / "requested.json", canonical({"operationId": operation_id, "fingerprint": fingerprint,
-                  "instanceId": row["id"], "generation": row["generation"], "runId": row["run_id"], "snapshotId": snapshot_id}))
+            write(journal / "requested.json", canonical(requested))
             mkdir(staging)
             mkdir(staging / "data")
             copied = []

@@ -162,13 +162,16 @@ class WriterControlTests(unittest.TestCase):
                     control._running(row)
             finally:
                 path.write_bytes(original)
-        for path in (root / "journal.json", root / "staging"):
-            path.write_text("unfinished")
-            try:
-                with self.assertRaises(RegistryError):
-                    control._running(row)
-            finally:
-                path.unlink()
+        committed = self.registry.root / "manager/operations/generation-prepare-01/committed.json"
+        original = committed.read_bytes()
+        record = json.loads(original)
+        record["instanceId"] = "different-instance"
+        committed.write_text(json.dumps(record))
+        try:
+            with self.assertRaises(RegistryError):
+                control._running(row)
+        finally:
+            committed.write_bytes(original)
         for key in ("pid", "startId", "startMillis", "bootId", "cwd", "executable", "commandHash", "owner"):
             original = process.identity[key]
             process.identity[key] = original + 1 if type(original) is int else "mismatch"

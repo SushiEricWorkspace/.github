@@ -354,6 +354,29 @@ else:
             self.process.wait(timeout=0)
 
 
+def recorded_members(creation: dict, nonce: str) -> list[int]:
+    """記録済み所有groupの生存PIDを読む。groupの引継ぎ・終了は行わない。"""
+    supported_os()
+    require(type(creation.get("pid")) is int and creation["pid"] > 0,
+            "PROCESS_UNVERIFIED", "生成PIDの記録がありません")
+    probe = OwnedProcess()
+    if os.name == "nt":
+        expected = "Local\\sushieric-runtime-" + nonce
+        require(creation.get("ownerGroup") == expected, "PROCESS_MISMATCH", "所有job識別が一致しません")
+        function(kernel, "OpenJobObjectW", [w.DWORD, w.BOOL, w.LPCWSTR], w.HANDLE)
+        probe.job = kernel.OpenJobObjectW(4, False, expected)
+        if not probe.job:
+            require(ctypes.get_last_error() == 2, "PROCESS_UNVERIFIED", "所有jobを照合できません")
+            return []
+        try:
+            return probe.members()
+        finally:
+            kernel.CloseHandle(probe.job)
+    require(creation.get("ownerGroup") == creation["pid"], "PROCESS_MISMATCH", "所有group識別が一致しません")
+    probe.pid = creation["pid"]
+    return probe.members()
+
+
 def require_identity(expected: dict, actual: dict | None) -> None:
     """PIDだけで所有を推定せず、native開始識別・boot・cwd・実行元・起動commandを照合する。"""
     require(actual is not None and expected == actual, "PROCESS_MISMATCH", "プロセス所有識別が一致しません")
