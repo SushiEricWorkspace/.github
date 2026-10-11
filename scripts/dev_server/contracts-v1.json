@@ -84,7 +84,7 @@
       "testUuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
       "itemDefinition": {"type": "object", "properties": {
         "id": {"ref": "text"}, "internalId": {"ref": "text"},
-        "vanillaId": {"type": "string", "enum": ["minecraft:stone"]}, "itemType": {"type": "string", "enum": ["OTHER"]},
+        "vanillaId": {"type": "string", "enum": ["stone"]}, "itemType": {"type": "string", "enum": ["OTHER"]},
         "displayName": {"ref": "text"}, "completed": {"ref": "true"}
       }},
       "expected": {"type": "object", "properties": {

@@ -74,7 +74,7 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual("generation-01", self.state()["generation"])
         self.assertFalse(self.new.exists())
 
-    def test_reset_immutable_reference_uses_same_generation_engine(self):
+    def test_reset_unregistered_reference_is_not_operator_approval(self):
         manifest = self.registry.snapshot._registered("snapshot-01")
         template = {"schemaVersion": 1, "templateId": "smoke-v1", "snapshotId": "snapshot-01",
                     "manifestHash": digest(canonical(manifest)), "artifactId": self.artifact, "validationId": "synthetic-validation"}
@@ -82,9 +82,9 @@ class GenerationTests(unittest.TestCase):
         payload = dict(self.restore)
         del payload["snapshotId"]
         payload["templateId"] = "smoke-v1"
-        self.command("reset", payload, "reset-01")
-        self.assertEqual("generation-02", self.state()["generation"])
-        self.assertEqual((self.new / "world/level.dat").read_bytes(), (self.generation / "world/level.dat").read_bytes())
+        self.assert_code("INVALID_INPUT", lambda: self.command("reset", payload, "reset-01"))
+        self.assertEqual("generation-01", self.state()["generation"])
+        self.assertFalse(self.new.exists())
 
     def test_expiry_during_copy_is_fenced_and_explicit_recovery_renews(self):
         original = self.registry.generation._build

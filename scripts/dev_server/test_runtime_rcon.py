@@ -6,7 +6,7 @@ import time
 import unittest
 
 from .registry import RegistryError
-from .runtime_rcon import stop
+from .runtime_rcon import command, stop
 
 
 class RconTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class RconTests(unittest.TestCase):
                 pending.result(timeout=3)
         self.assertEqual([3], seen)
 
-    def exchange(self, mode):
+    def exchange(self, mode, text="stop"):
         seen, checks = [], []
         with socket.socket() as server, ThreadPoolExecutor(max_workers=1) as workers:
             server.bind(("127.0.0.1", 0))
@@ -69,8 +69,8 @@ class RconTests(unittest.TestCase):
                         request, kind = struct.unpack("<ii", body[:8])
                         seen.append((kind, body[8:-2].decode()))
                         return request
-                    def send(request, kind):
-                        body = struct.pack("<ii", request, kind) + b"\0\0"
+                    def send(request, kind, reply=b""):
+                        body = struct.pack("<ii", request, kind) + reply + b"\0\0"
                         packet = struct.pack("<i", len(body)) + body
                         client.sendall(packet[:3])
                         client.sendall(packet[3:])
@@ -82,12 +82,15 @@ class RconTests(unittest.TestCase):
                     send(-1 if mode == "denied" else request, 2)
                     request = receive()
                     if request is not None:
-                        send(request + 1 if mode == "wrong-id" else request, 0)
+                        send(request + 1 if mode == "wrong-id" else request, 0, "fixture確認済み".encode())
 
             pending = workers.submit(serve)
             try:
-                stop("127.0.0.1", server.getsockname()[1], "fixture-secret", 2,
-                     verify=lambda: checks.append(True))
+                if text == "stop":
+                    stop("127.0.0.1", server.getsockname()[1], "fixture-secret", 2, verify=lambda: checks.append(True))
+                else:
+                    self.assertEqual("fixture確認済み", command("127.0.0.1", server.getsockname()[1], "fixture-secret", 2,
+                                      text, verify=lambda: checks.append(True)))
             finally:
                 pending.result(timeout=3)
         return seen, checks
@@ -95,6 +98,11 @@ class RconTests(unittest.TestCase):
     def test_fragmented_success_checks_ownership_before_secret_and_stop(self):
         seen, checks = self.exchange("success")
         self.assertEqual([(3, "fixture-secret"), (2, "stop")], seen)
+        self.assertEqual(2, len(checks))
+
+    def test_fixture_command_returns_utf8_and_checks_owner(self):
+        seen, checks = self.exchange("success", "se managedfixture verify smoke-v1")
+        self.assertEqual((2, "se managedfixture verify smoke-v1"), seen[-1])
         self.assertEqual(2, len(checks))
 
     def test_authentication_wrong_response_and_oversized_fail(self):

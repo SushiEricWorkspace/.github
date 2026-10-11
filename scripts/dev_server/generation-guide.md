@@ -17,8 +17,8 @@
 
 prepareは初回の空枠だけです。restoreは登録済みsnapshot全体を復元します。
 resetは`templates/<templateId>.json`が指す不変snapshotへ戻します。空worldの再生成ではありません。
-テンプレートの登録・昇格は#534の範囲です。未登録templateや異なる参照hashは拒否します。
-参照契約はschemaVersion=1、templateId、snapshotId、manifestHash、artifactId、validationIdです。
+テンプレートの登録・昇格は[テンプレートガイド](template-guide.md)に従います。未登録templateや異なる参照hashは拒否します。
+参照契約はschemaVersion=1、templateId、snapshotId、manifestHash、artifactId、validationId、operationIdです。
 現在の互換性契約は同一artifact・同一layoutだけです。別artifactは複製枠での互換性validationが接続されるまで拒否します。
 acceptEulaは運用者が同意した場合だけtrueにします。
 
@@ -89,4 +89,4 @@ python3.12 -B scripts/dev_server/verify_generation.py --repo /absolute/task/.git
 世代完成記録にoperationIdと全ファイル集合、COMMITTED journalの照合を追加しています。
 この記録がない旧開発用管理rootの世代はstartできません。互換処理は追加していません。
 既存rootを削除・再初期化せず保全し、新しい使い捨てrootで生成し直してください。
-テンプレート昇格・GC・実運用導入は本機能の完了とは別です。
+GC・実運用導入は本機能の完了とは別です。

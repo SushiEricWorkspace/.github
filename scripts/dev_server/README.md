@@ -7,6 +7,7 @@
 Managerの管理接続と終了証明は[管理writerガイド](writer-guide.md)を参照してください。
 正常停止した全データの保存・完全性検証は[snapshotガイド](snapshot-guide.md)を参照してください。
 世代の構築・restore/reset・障害復旧は[世代ガイド](generation-guide.md)を参照してください。
+固定fixtureの生成・独立検証・明示昇格は[テンプレートガイド](template-guide.md)を参照してください。
 
 [ServerMod #525](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/525)の契約・fixtureを管理します。
 確定設計は[#524](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/524)、
@@ -31,14 +32,14 @@ runtime/manifest/validationのhash・nonceは形式検査だけでは証跡に�
 `fixtures.py`は架空hash・nonce・ファイル内容から検証文書を作るだけで、
 Minecraftワールド、NBT、独自定義YAML、JARを実生成しません。
 `settings_expectations`も入力・可搬結果・復元先注入の固定期待値であり、実際の変換器ではありません。
-実fixtureは後続harnessが現在のCommon/Minecraft APIで生成します。
+実fixtureは管理bundle専用の`se managedfixture`が現在のCommon/Minecraft APIで生成・再読込します。
 合成文書をruntime登録・snapshot公開・昇格の実証跡に使用しないでください。
 
 契約検証はコピー/削除/設定変換/ポート予約/JVM起動を実行しません。
 管理CLI `scripts/dev-server.py`の初期化・監督・貸出は実装済みです。
 固定bundleの初回prepare・JVM起動停止・Mod保存/終了証跡照合を実装しています。
 協調Managerの世代固定writerを登録し、正常停止・writer不在を固定したprivate snapshotの作成・検証を行います。
-prepare/restore/resetの世代構築とrecoverを実装しています。テンプレート登録・GCは後続の範囲です。
+prepare/restore/resetの世代構築、固定fixtureの検証・明示昇格、recoverを実装しています。GCは後続の範囲です。
 管理外の非協調writerや停電耐性を証明せず、総合受入前の運用導入は行いません。
 既存worktreeやrun/への操作は行いません。
 

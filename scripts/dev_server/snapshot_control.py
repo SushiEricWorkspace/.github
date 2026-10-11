@@ -10,6 +10,7 @@ from .runtime_bundle import verify_bundle, _files
 from .runtime_control import TOKEN
 from .snapshot_data import collect, entry, transform
 from .storage import mkdir, move, write
+from .template_data import shared_data
 
 
 def verify_snapshot(path: Path) -> dict:
@@ -86,10 +87,14 @@ class SnapshotControl:
 
     def execute(self, payload, *, operation_id, dry_run=False):
         identifier(operation_id, "operationId")
-        require(type(payload) is dict and payload.get("action") in {"create", "verify"},
-                "INVALID_INPUT", "snapshotはcreateまたはverifyを指定してください")
-        create = payload["action"] == "create"
-        fields(payload, {"action", "snapshotId"} | (TOKEN if create else set()))
+        if type(payload) is dict and payload.get("action") in {"validate", "promote"}:
+            from .template_control import TemplateControl
+            return TemplateControl(self.registry).execute(payload, operation_id=operation_id, dry_run=dry_run)
+        require(type(payload) is dict and payload.get("action") in {"create", "candidate", "verify"},
+                "INVALID_INPUT", "snapshotはcreate・candidate・verify・validate・promoteを指定してください")
+        candidate = payload["action"] == "candidate"
+        create = payload["action"] != "verify"
+        fields(payload, {"action", "snapshotId"} | (TOKEN if create else set()) | ({"sourceSnapshotId"} if candidate else set()))
         snapshot_id = identifier(payload["snapshotId"], "snapshotId")
         if not create:
             manifest = self._registered(snapshot_id)
@@ -104,6 +109,18 @@ class SnapshotControl:
                 require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "operationIdに異なる要求を指定できません")
                 require(cached["status"] == "COMPLETED", "RECOVERY_REQUIRED", "snapshotの未完了journalを保全してください")
         row, generation, run, saved = self._clean(payload)
+        source_manifest = None
+        source_root = generation
+        if candidate:
+            source_id = identifier(payload["sourceSnapshotId"], "sourceSnapshotId")
+            source_manifest = self._registered(source_id)
+            require(source_manifest["visibility"] == "private"
+                    and source_manifest["cleanStop"]["instanceId"] == row["id"]
+                    and source_manifest["cleanStop"]["runId"] == row["run_id"]
+                    and source_manifest["generation"] == row["generation"]
+                    and source_manifest["artifactId"] == row["artifact"],
+                    "PROOF_MISMATCH", "同じ枠・世代・正常停止runのprivate snapshotが必要です")
+            source_root = self.registry.root / "snapshots" / source_id / "data"
         if cached:
             manifest = self._registered(snapshot_id)
             require(manifest["cleanStop"]["runId"] == row["run_id"], "STALE_OPERATION", "別runへ古い結果を適用できません")
@@ -114,7 +131,7 @@ class SnapshotControl:
         for path in (destination, staging, journal):
             plain_path(path)
             require(not path.exists(), "EXISTING_DATA", "snapshot・作業領域・journalを上書きしません")
-        layout, sources = collect(generation)
+        layout, sources = (source_manifest["layout"], source_manifest["files"]) if candidate else collect(generation)
         artifact = verify_bundle(generation / "runtime")
         require(artifact["artifactId"] == row["artifact"]
                 and digest(regular_bytes(generation / "runtime/runtime.json")) == run["manifestHash"],
@@ -127,6 +144,8 @@ class SnapshotControl:
         requested = {"operationId": operation_id, "fingerprint": fingerprint, "instanceId": row["id"],
                      "generation": row["generation"], "runId": row["run_id"], "snapshotId": snapshot_id,
                      "leaseId": row["lease"], "epoch": row["epoch"]}
+        if candidate:
+            requested.update(action="candidate", sourceSnapshotId=source_id, sourceHash=digest(canonical(source_manifest)))
         with self.registry.transaction() as connection:
             current = self.registry._instance(connection, row["id"])
             self.registry._token(current, payload)
@@ -137,7 +156,10 @@ class SnapshotControl:
                         "OPERATION_CONFLICT", "operationIdが登録中に使用されました")
             connection.execute("INSERT INTO snapshot_operations VALUES (?,?,?,?,?)", (operation_id, fingerprint, row["id"], "PENDING", json.dumps(requested)))
             connection.execute("UPDATE instances SET state='SNAPSHOTTING',pending=1,clean_proof=NULL WHERE id=?", (row["id"],))
-            for reference in ("artifact:" + row["artifact"], "generation:" + row["generation"], "snapshot:" + snapshot_id):
+            references = {"artifact:" + row["artifact"], "generation:" + row["generation"], "snapshot:" + snapshot_id}
+            if candidate:
+                references.add("snapshot:" + source_id)
+            for reference in sorted(references):
                 connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)", (operation_id, reference, row["id"], row["lease"], row["epoch"]))
             connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,?)", (self.registry.clock(), operation_id, "snapshot-create"))
         try:
@@ -148,9 +170,9 @@ class SnapshotControl:
             copied = []
             for item in sources:
                 self._clean(payload, copying=True)
-                data = regular_bytes(generation / item["path"])
+                data = regular_bytes(source_root / item["path"])
                 require(entry(item["path"], data) == item, "SOURCE_CHANGED", "コピー中に元データが変更されました")
-                data = transform(item["path"], data)
+                data = shared_data(item["path"], data) if candidate else transform(item["path"], data)
                 target = staging / "data" / item["path"]
                 missing = []
                 parent = target.parent
@@ -161,7 +183,11 @@ class SnapshotControl:
                     mkdir(parent)
                 write(target, data)
                 copied.append(entry(item["path"], data))
-            current_layout, current_sources = collect(generation)
+            if candidate:
+                require(self._registered(source_id) == source_manifest, "SOURCE_CHANGED", "元snapshotが変更されました")
+                current_layout, current_sources = source_manifest["layout"], source_manifest["files"]
+            else:
+                current_layout, current_sources = collect(generation)
             require((current_layout, current_sources) == (layout, sources), "SOURCE_CHANGED", "元データの集合がコピー中に変更されました")
             self._clean(payload, copying=True)
             require(verify_bundle(generation / "runtime") == artifact
@@ -172,7 +198,7 @@ class SnapshotControl:
                      "backgroundWritersDrained": True, "saveResults": [
                          {"writer": key, "success": value, "pendingCount": 0} for key, value in sorted(saved["saves"]["results"].items())]}
             manifest = {"schemaVersion": 1, "snapshotId": snapshot_id, "generation": row["generation"], "artifactId": row["artifact"],
-                        "layout": layout, "transformVersion": 1, "visibility": "private", "cleanStop": clean, "files": copied}
+                        "layout": layout, "transformVersion": 1, "visibility": "shared-template" if candidate else "private", "cleanStop": clean, "files": copied}
             validate("manifest", manifest)
             manifest_hash = digest(canonical(manifest))
             write(staging / "manifest.json", canonical(manifest))
