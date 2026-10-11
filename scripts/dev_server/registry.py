@@ -156,6 +156,8 @@ class Registry:
         self.root = root
         self.clock = clock
         self.db_lock = threading.RLock()
+        self.resource_users = 0
+        self.gc_active = False
         if os.name == "nt":
             from .windows_security import require_local_volume
             require_local_volume(root)
@@ -189,6 +191,27 @@ class Registry:
         self.generation = GenerationControl(self)
         from .gametest_control import GameTestControl
         self.gametest = GameTestControl(self)
+        from .gc_control import GcControl
+        self.gc = GcControl(self)
+
+    @contextmanager
+    def resource_use(self, *, exclusive=False):
+        """参照を使用する操作とGCを調停する。通常操作同士は並列実行できる。"""
+        with self.db_lock:
+            require(not self.gc_active and (not exclusive or self.resource_users == 0),
+                    "BUSY", "参照を使用する操作またはGCが進行中です")
+            if exclusive:
+                self.gc_active = True
+            else:
+                self.resource_users += 1
+        try:
+            yield
+        finally:
+            with self.db_lock:
+                if exclusive:
+                    self.gc_active = False
+                else:
+                    self.resource_users -= 1
 
     @contextmanager
     def transaction(self, *, read_only: bool = False):
@@ -267,6 +290,16 @@ class Registry:
 
     def execute(self, command: str, payload: dict, *, operation_id: str, dry_run: bool = False) -> dict:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
+        with self.resource_use(exclusive=command == "gc"):
+            if command == "gc":
+                return self.gc.execute(payload, operation_id=operation_id, dry_run=dry_run)
+            if command not in {"stop", "list", "status", "doctor", "shutdown", "renew", "writer-close"}:
+                with self.transaction(read_only=True) as connection:
+                    require(not connection.execute("SELECT 1 FROM runtime_operations WHERE command='gc-apply' AND status!='COMPLETED'").fetchone(),
+                            "RECOVERY_REQUIRED", "GCの途中証跡を照合するまで新しい参照操作を開始できません")
+            return self._execute(command, payload, operation_id=operation_id, dry_run=dry_run)
+
+    def _execute(self, command, payload, *, operation_id, dry_run):
         if command == "gametest":
             return self.gametest.execute(payload, operation_id=operation_id, dry_run=dry_run)
         if command == "snapshot":
@@ -309,7 +342,7 @@ class Registry:
                                             and not any(row[key] for key in ("writers", "children", "pending")),
                            **self.writer.summary(connection, row)} for row in rows]
                 return {"instances": result, "supervisor": "reachable", "ports": "inventory-and-runtime-reservations",
-                        "unimplemented": ["gc"]}
+                        "unimplemented": []}
             cached = connection.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
             require(not connection.execute("SELECT 1 FROM reference_operations WHERE id=?", (operation_id,)).fetchone(),
                     "OPERATION_CONFLICT", "同じoperationIdが参照予約で使用されています")
@@ -370,11 +403,17 @@ class Registry:
 
     def reserve_references(self, payload: dict, operation_id: str, references: list[str]) -> None:
         """後続の長時間操作が参照を保護する入口。取得後にDB外で処理する。"""
+        with self.resource_use():
+            return self._reserve_references(payload, operation_id, references)
+
+    def _reserve_references(self, payload, operation_id, references):
         identifier(operation_id, "operationId")
         fields(payload, {"instanceId", "leaseId", "epoch", "expectedGeneration"})
         require(bool(references) and all(type(ref) is str and re.fullmatch(r"[a-z0-9-]+:[a-z0-9-]+", ref) for ref in references),
                 "INVALID_INPUT", "参照はkind:idの形式で指定してください")
         with self.transaction() as connection:
+            require(not connection.execute("SELECT 1 FROM runtime_operations WHERE command='gc-apply' AND status!='COMPLETED'").fetchone(),
+                    "RECOVERY_REQUIRED", "途中GCがあるため新しい参照予約を開始できません")
             row = self._instance(connection, payload["instanceId"])
             self._token(row, payload)
             expected = set(references)

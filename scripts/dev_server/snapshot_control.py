@@ -138,7 +138,7 @@ class SnapshotControl:
                 "ARTIFACT_MISMATCH", "停止したruntimeが変更されています")
         require(verify_bundle(self.registry.root / "artifacts" / row["artifact"]) == artifact,
                 "ARTIFACT_MISMATCH", "保存するartifact参照先が一致しません")
-        self.registry.runtime._space(sum(item["size"] for item in sources))
+        self.registry.runtime._space(sum(item["size"] for item in sources) + 65536)
         if dry_run:
             return {"dryRun": True, "wouldExecute": "snapshot-create", "snapshotId": snapshot_id, "files": len(sources)}
         requested = {"operationId": operation_id, "fingerprint": fingerprint, "instanceId": row["id"],
@@ -173,6 +173,7 @@ class SnapshotControl:
                 data = regular_bytes(source_root / item["path"])
                 require(entry(item["path"], data) == item, "SOURCE_CHANGED", "コピー中に元データが変更されました")
                 data = shared_data(item["path"], data) if candidate else transform(item["path"], data)
+                self.registry.runtime.copy_space(len(data))
                 target = staging / "data" / item["path"]
                 missing = []
                 parent = target.parent

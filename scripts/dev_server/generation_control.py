@@ -205,6 +205,7 @@ class GenerationControl:
         self._marker(self._journal(request["operationId"]), "prepared", {"recordHash": digest(canonical(record))})
 
     def _write_tree(self, root, name, data):
+        self.registry.runtime.copy_space(len(data))
         path = root / name
         missing = []
         parent = path.parent

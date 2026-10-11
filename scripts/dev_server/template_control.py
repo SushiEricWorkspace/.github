@@ -131,6 +131,9 @@ class TemplateControl:
         return document
 
     def registered(self, template_id):
+        with self.registry.transaction(read_only=True) as connection:
+            retired = connection.execute("SELECT value FROM meta WHERE key='gcRetiredTemplates'").fetchone()
+            require(not retired or template_id not in json.loads(retired[0]), "TEMPLATE_RETIRED", "このテンプレートは明示的に廃止されています")
         path = self.registry.root / "templates" / (template_id + ".json")
         require(path.exists(), "NOT_FOUND", "登録テンプレートがありません")
         require_private(path)

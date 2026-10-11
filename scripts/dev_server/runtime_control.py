@@ -105,6 +105,11 @@ class RuntimeControl:
                 and shutil.disk_usage(self.registry.root).free >= required_bytes + margin,
                 "NO_SPACE", "runtime配備と起動余裕を確保できません。自動削除しません")
 
+    def copy_space(self, size):
+        """コピー中の物理空き減少を各書込前に検査する。削除で空きを作らない。"""
+        require(shutil.disk_usage(self.registry.root).free >= size + self.registry.inventory["reserveBytes"],
+                "NO_SPACE", "コピー中に物理空き容量が減少しました。旧データを保持します")
+
     def _record(self, run):
         with self.registry.transaction() as connection:
             connection.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?)",
