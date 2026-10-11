@@ -47,7 +47,7 @@ XML欠損や壊れたXMLを合格にしません。`runtimeStopped`は別に、M
 GameTestの正常終了を、永続データの正常保存、snapshot clean、template昇格の根拠へ流用しません。
 
 成功worldは結果保全後のGC候補、失敗worldは7日、ログと結果は30日の保持期限をRegistryへ記録します。
-GCの候補提示・参照再照合・実削除は#536で接続し、ここではworldを自動削除しません。
+GCの候補提示・参照再照合・実削除は[GCガイド](gc-guide.md)に従い、GameTest終了時にworldを自動削除しません。
 未確定の実行は期限だけで回収しません。
 
 完了した実行を同じownerでpinする場合は、gametestへ次のpayloadを指定します。解除はpinned=falseです。

@@ -84,7 +84,19 @@
 - 移行中の既存`<repo>-claude/`・`<repo>-codex/`は自動移動・削除しない。進行中の作業は担当の固定worktreeで完了できる。作業branch削除後は最新の`origin/main`または`origin/develop`でdetached HEADへ戻す。新規タスクはタスクworktreeで開始する。
 - 共通ルールの同期先は`scripts/sync-agent-rules.py --repo-root REPO=PATH`で明示する。タスク作業から人間・他AIのAGENTS.mdへ暗黙に同期しない。
 - worktreeスキルの原本は`.github/skills/worktree/SKILL.md`とする。ローカル配置する場合は原本を使用し、`.claude/`等の配置先をコミットしない。
-- 分離テスト環境の管理CLIは総合導入が完了するまで必須にしない。導入中は既存の検証手順を維持し、未実装の管理CLIを前提にサーバー起動や保存の成功を報告しない。
+- 分離テスト環境はホスト・管理rootごとの総合受入と運用者承認後に有効化する。未承認のrootやOSへ運用許可を流用せず、受入前は許可された使い捨て試験だけを行う。既存環境を自動移行しない。
+
+### 分離テスト環境の実行
+
+- 管理対象rootは`.github/scripts/dev-server.py`で操作する。初期化前にoperator、絶対root、二永続枠のport、GameTest同時数、quota/reserve、別物理媒体のbackup先を明示して承認を得る。測定値と未確認項目は`scripts/dev_server/acceptance-guide.md`に従って残す。
+- ソースworktreeではtest/buildと固定runtime出力だけを行う。管理対象への起動はacquireで取得したlease/epoch/世代を付けてprepareまたはrestore/reset後にstartし、GameTestは固定bundleからgametestで実行する。直接runServer、手動JVM、管理外SFTP・ファイル編集で管理rootへ書き込まない。非管理の人間用runは明示的な移行依頼まで維持する。
+- 同じtaskのGradle生成は管理ビルドスクリプトのOS lockで直列化し、Common等の成果物はtask専用発行先と完全座標・hashで固定する。完成bundleの実行時にworktree/buildへ戻らず、bundleの作成OSを越えて流用しない。
+- 人間による実機確認は起動するroot・枠・portと確認事項の許可を得る。管理対象はstartがrunServer相当の開発profileを起動する。待受なしの自動GameTestと、クライアント・JavaFXの実機確認を区別する。
+- 停止は管理CLIのstopを使い、識別済みRCON、保存結果、writer drain、JVM/child終了を照合する。タイムアウト・IPC切断・結果不明は保全して診断し、新しいoperationIdで再試行、自動kill、期限切れだけの再貸出しを行わない。RCONが使えなくても強制終了は別の明示許可を要する。
+- snapshot/restoreは正常停止・協調Manager writer終了・世代一致を確認してから行う。旧世代・失敗データ・予約・journalを削除して成功扱いにせず、recoverは同じ要求と証跡を照合する明示操作で行う。DBを手編集して保留を解除しない。
+- worktreeの担当交代と永続枠の貸出は別に扱う。release後のデータを新ownerがそのまま起動せず、明示restore/resetで新しい世代を用意する。worktree削除からsnapshot・artifact・実行データを独立させる。
+- templateのpromoteは用途・元タスク・別枠validationとhashを提示して人間の運用者から明示承認を得る。実機確認やPR/mergeの許可だけから昇格許可を推定しない。既存版を上書きしない。
+- run-id、artifact/seed、停止・保存証跡、JUnit XML・ログ、OS/FSとskipを保全する。秘密や認証設定を含む原本はGitへ追加しない。GCは候補と参照再照合を行う明示操作だけとし、容量不足時の自動削除を行わない。
 
 ### コミットメッセージ
 

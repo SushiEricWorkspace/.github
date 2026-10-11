@@ -23,7 +23,7 @@ Modが実際にCombatCoreへ依存していない状態ではCoreをModの依存
 - consumerには`-PcommonDevelopmentRepository=PATH -PcommonDevelopmentCoordinate=GROUP:MODULE:VERSION`を渡します。CommonのMod用・Editor用成果物を取り違える指定と正式版指定の併用は拒否します。
 - Modの`describeDevRuntime`はLoomの実際のJavaExecからmain class、全classpath、JVM/プログラム引数、起動設定を取得します。配布jarから起動方法を推測しません。
 - Modの`exportDevRuntime`は取得したレシピをbundleへ変換します。手動呼出にはビルド前に取得した`runtimeSourceLock`、`runtimeArtifactStore`、`runtimePython`を明示します。標準のexporterは兄弟の`.github/scripts/export-dev-runtime.py`です。
-- JVMやManagement APIを起動する通常サーバーの管理は行いません。GameTest/実機実行の管理は後続ハーネスの責務です。
+- exporterはJVMを起動しません。GameTest/実機実行は固定bundleを使う管理CLIの責務です。[runtime制御](runtime-control-guide.md)と[GameTest](gametest-guide.md)を参照してください。
 
 ## 固定する入力と出力
 
