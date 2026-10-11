@@ -13,6 +13,7 @@ from .runtime_bundle import verify_bundle, _files
 from .runtime_control import TOKEN, read_json
 from .snapshot_control import verify_snapshot
 from .snapshot_data import entry, properties, collect, transform
+from .template_data import shared_data
 from . import storage
 
 
@@ -69,14 +70,8 @@ class GenerationControl:
         snapshot_id = payload.get("snapshotId")
         if command == "reset":
             template_id = identifier(payload["templateId"], "templateId")
-            path = self.registry.root / "templates" / (template_id + ".json")
-            require(path.exists(), "NOT_FOUND", "登録テンプレートがありません。登録・昇格は別操作です")
-            require_private(path)
-            template = read_json(path)
-            fields(template, {"schemaVersion", "templateId", "snapshotId", "manifestHash", "artifactId", "validationId"})
-            require(template["schemaVersion"] == 1 and template["templateId"] == template_id,
-                    "TEMPLATE_MISMATCH", "登録テンプレートが一致しません")
-            identifier(template["validationId"], "validationId")
+            from .template_control import TemplateControl
+            template = TemplateControl(self.registry).registered(template_id)
             snapshot_id = identifier(template["snapshotId"], "snapshotId")
         snapshot_id = identifier(snapshot_id, "snapshotId")
         manifest = self.registry.snapshot._registered(snapshot_id)
@@ -419,6 +414,9 @@ class GenerationControl:
         return result
 
     def _snapshot_recovery(self, row, operation, action, *, dry_run):
+        if (self.registry.root / "manager/operations" / ("template-" + operation)).exists():
+            from .template_control import TemplateControl
+            return TemplateControl(self.registry).recover(row, operation, action, dry_run=dry_run)
         journal = self.registry.root / "manager/operations" / ("snapshot-" + operation)
         if (journal / "requested.json").exists():
             request = read_json(journal / "requested.json")
@@ -427,6 +425,7 @@ class GenerationControl:
             with self.registry.transaction(read_only=True) as connection:
                 pending = connection.execute("SELECT * FROM snapshot_operations WHERE id=?", (operation,)).fetchone()
                 request = json.loads(pending["response"])
+                require(request.get("action") not in {"validate", "promote"}, "RECOVERY_REQUIRED", "途中の検証・昇格を保全してください")
         require(request["operationId"] == operation and request["instanceId"] == row["id"]
                 and request["generation"] == row["generation"] and request["runId"] == row["run_id"]
                 and request["leaseId"] == row["lease"] and request["epoch"] == row["epoch"], "JOURNAL_MISMATCH", "snapshot対象が一致しません")
@@ -438,8 +437,16 @@ class GenerationControl:
             require(manifest["cleanStop"]["runId"] == row["run_id"] and manifest["artifactId"] == row["artifact"]
                     and read_json(journal / "prepared.json") == {"manifestHash": digest(canonical(manifest))}, "JOURNAL_MISMATCH", "公開snapshotが一致しません")
             generation = self.registry.runtime._active_generation(row)
-            layout, sources = collect(generation)
-            require(layout == manifest["layout"] and [entry(file["path"], transform(file["path"], regular_bytes(generation / file["path"]))) for file in sources] == manifest["files"],
+            if request.get("action") == "candidate":
+                original = self.registry.snapshot._registered(request["sourceSnapshotId"])
+                require(digest(canonical(original)) == request["sourceHash"], "SOURCE_CHANGED", "候補の元snapshotが変更されました")
+                layout, sources = original["layout"], original["files"]
+                generation = self.registry.root / "snapshots" / request["sourceSnapshotId"] / "data"
+                normalize = shared_data
+            else:
+                layout, sources = collect(generation)
+                normalize = transform
+            require(layout == manifest["layout"] and [entry(file["path"], normalize(file["path"], regular_bytes(generation / file["path"]))) for file in sources] == manifest["files"],
                     "SOURCE_CHANGED", "停止世代とsnapshotが一致しません")
             result = {"snapshotId": manifest["snapshotId"], "artifactId": manifest["artifactId"], "manifestHash": digest(canonical(manifest)), "created": True, "verified": True}
         else:
