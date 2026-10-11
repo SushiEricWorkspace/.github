@@ -53,8 +53,11 @@ class PortTests(unittest.TestCase):
             value = ep(port=external.getsockname()[1])
             with self.assertRaises(OSError), prebind({"minecraft": value}):
                 pass
-            with socket.create_connection(external.getsockname(), timeout=1):
+            with socket.create_connection(external.getsockname(), timeout=1) as client:
                 accepted, _ = external.accept()
+                client.shutdown(socket.SHUT_WR)
+                accepted.settimeout(1)
+                self.assertEqual(b"", accepted.recv(1))
                 accepted.close()
         with prebind({"minecraft": value}):
             pass

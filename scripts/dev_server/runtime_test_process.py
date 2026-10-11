@@ -19,7 +19,7 @@ def main():
     (root / ("child.json" if child else "parent.json")).write_text(
         json.dumps({"pid": os.getpid(), "tcp": tcp.getsockname()[1], "udp": udp.getsockname()[1]}))
     if not child:
-        subprocess.Popen([sys.executable, "-B", __file__, "child", str(root)], stdin=subprocess.DEVNULL)
+        subprocess.Popen([sys.argv[3], "-B", __file__, "child", str(root), sys.argv[3]], stdin=subprocess.DEVNULL)
     deadline = time.monotonic() + 15
     while not (root / ("child-exit" if child else "parent-exit")).exists() and time.monotonic() < deadline:
         time.sleep(0.02)

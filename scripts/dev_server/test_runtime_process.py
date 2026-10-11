@@ -18,10 +18,13 @@ from .registry import RegistryError
 
 @unittest.skipUnless(sys.platform in ("win32", "darwin"), "Windows/macOSのnative試験")
 class NativeProcessTests(unittest.TestCase):
+    maxDiff = None
+
     def test_native_identity_sockets_and_child_survives_parent(self):
         with tempfile.TemporaryDirectory(prefix="runtime-native-") as directory:
             root = Path(directory).resolve()
-            arguments = [sys.executable, "-B", str(Path(__file__).with_name("runtime_test_process.py")), "parent", str(root)]
+            executable = runtime_process.identity(os.getpid())["executable"]
+            arguments = [executable, "-B", str(Path(__file__).with_name("runtime_test_process.py")), "parent", str(root), executable]
             recorded = []
             with (root / "console.log").open("xb") as log:
                 process = runtime_process.OwnedProcess()
@@ -35,9 +38,14 @@ class NativeProcessTests(unittest.TestCase):
                     parent = json.loads((root / "parent.json").read_text())
                     child = json.loads((root / "child.json").read_text())
                     actual = runtime_process.identity(process.pid)
+                    self.assertEqual(recorded[0], actual, "作成直後とfixture起動後のnative識別差分")
                     runtime_process.require_identity(recorded[0], actual)
                     self.assertEqual(str(root), actual["cwd"])
                     self.assertEqual(runtime_process.command_hash(arguments), actual["commandHash"])
+                    child_identity = runtime_process.identity(child["pid"])
+                    self.assertEqual(executable, child_identity["executable"])
+                    self.assertEqual(runtime_process.command_hash([*arguments[:3], "child", str(root), executable]),
+                                     child_identity["commandHash"])
                     self.assertIn(child["pid"], process.members())
                     self.assertEqual(
                         {("tcp", "127.0.0.1", parent["tcp"]), ("udp", "127.0.0.1", parent["udp"])},
