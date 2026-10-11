@@ -183,7 +183,7 @@ class RegistryTests(RegistryFixture, unittest.TestCase):
             self.assertFalse(dispatch(self.registry, message)["ok"])
         for command in ("start", "stop", "prepare", "restore", "snapshot", "recover", "gc"):
             response = dispatch(self.registry, new_request(command, {"unknown-secret": "must-not-print"}))
-            self.assertEqual("INVALID_INPUT" if command in {"prepare", "start", "stop"} else "NOT_IMPLEMENTED", response["error"]["code"])
+            self.assertEqual("INVALID_INPUT" if command in {"prepare", "start", "stop", "snapshot"} else "NOT_IMPLEMENTED", response["error"]["code"])
             self.assertNotIn("must-not-print", str(response))
 
     def test_inventory_port_tampering_requires_recovery(self):
@@ -378,6 +378,15 @@ class SupervisorProcessTests(RegistryFixture, unittest.TestCase):
         self.assertNotEqual(0, cli.returncode)
         self.assertEqual("INVALID_INPUT", json.loads(cli.stdout)["error"]["code"])
         self.assertNotIn("unknown-secret-argument", cli.stdout + cli.stderr)
+
+    def test_native_cli_json_is_utf8_even_with_legacy_console_encoding(self):
+        environment = dict(os.environ, PYTHONUTF8="0", PYTHONIOENCODING="cp932")
+        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "unknown-argument"],
+                                capture_output=True, env=environment, timeout=10)
+        self.assertEqual(2, result.returncode)
+        document = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual("INVALID_INPUT", document["error"]["code"])
+        self.assertIn("CLI引数", document["error"]["message"])
 
     def test_native_cli_stdin_large_body_limit_and_exclusive_input(self):
         self._start()

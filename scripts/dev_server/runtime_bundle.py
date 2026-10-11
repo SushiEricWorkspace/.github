@@ -30,7 +30,9 @@ def _directory(path: Path):
 
 def _files(root: Path) -> list[dict]:
     entries = []
-    for directory, dirs, names in os.walk(root, followlinks=False):
+    def fail(error):
+        raise error
+    for directory, dirs, names in os.walk(root, followlinks=False, onerror=fail):
         _directory(Path(directory))
         for name in dirs:
             _directory(Path(directory) / name)

@@ -80,7 +80,7 @@ class WriterControl:
         fingerprint = digest(canonical({"command": command, "payload": payload}))
         read = command == "writer-io" and payload["request"]["action"] in {"read", "list", "server-read"}
         with self.registry.transaction(read_only=True) as connection:
-            for table in ("operations", "runtime_operations", "reference_operations"):
+            for table in ("operations", "runtime_operations", "reference_operations", "snapshot_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが他の操作で使用されています")
             cached = connection.execute("SELECT * FROM writer_operations WHERE id=?", (operation_id,)).fetchone()
@@ -125,7 +125,7 @@ class WriterControl:
         if command == "writer-io":
             self._preflight(row, payload["request"])
         with self.registry.transaction() as connection:
-            for table in ("operations", "runtime_operations", "reference_operations", "writer_operations"):
+            for table in ("operations", "runtime_operations", "reference_operations", "writer_operations", "snapshot_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが登録中に他の操作で使用されました")
             if command == "writer-open":

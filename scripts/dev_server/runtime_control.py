@@ -137,7 +137,7 @@ class RuntimeControl:
         fingerprint = digest(canonical({"command": command, "payload": payload}))
         replay = None
         with self.registry.transaction(read_only=True) as connection:
-            for table in ("operations", "reference_operations", "writer_operations"):
+            for table in ("operations", "reference_operations", "writer_operations", "snapshot_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが他の操作で使用されています")
             cached = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (operation_id,)).fetchone()
@@ -195,7 +195,7 @@ class RuntimeControl:
                 self._running(row)
             return {"dryRun": True, "wouldExecute": command, "instanceId": row["id"]}
         with self.registry.transaction() as connection:
-            for table in ("operations", "reference_operations", "writer_operations"):
+            for table in ("operations", "reference_operations", "writer_operations", "snapshot_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが他の操作で使用されています")
             current = self.registry._instance(connection, row["id"])
