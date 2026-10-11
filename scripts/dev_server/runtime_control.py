@@ -215,6 +215,7 @@ class RuntimeControl:
 
     def _proof(self, run, generation, *, stopped=False):
         proof = read_json(Path(run["proofPath"]))
+        require(proof.get("saveScope", "run") == "run", "PROOF_MISMATCH", "GameTestの終了証跡を永続データの正常保存へ流用できません")
         require(proof.get("schemaVersion") == 1 and proof.get("instanceId") == run["instanceId"]
                 and proof.get("generationId") == run["generationId"] and proof.get("startNonce") == run["nonce"],
                 "PROOF_MISMATCH", "Mod証跡のrun識別が一致しません")
@@ -347,13 +348,20 @@ class RuntimeControl:
         run["stopAcknowledged"] = True
         self._record(run)
 
-    def _wait_exit(self, run, process, timeout):
+    def _wait_exit(self, run, process, timeout, *, verify=None):
         deadline = time.monotonic() + timeout
-        while process.poll() is None or process.members():
+        while True:
+            running = process.poll() is None
+            members = process.members()
+            if verify is not None:
+                verify(set(members) | ({process.pid} if running else set()))
+            if not running and not members:
+                break
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "JVM/child終了期限を超過しました。自動killしません")
             time.sleep(0.1)
         run["exitCode"] = process.poll()
         run["jvmAndChildrenExited"] = True
+        run["exitedAt"] = self.registry.clock()
         self._record(run)
         with self.registry.transaction() as connection:
             connection.execute("DELETE FROM endpoint_reservations WHERE run=?", (run["runId"],))

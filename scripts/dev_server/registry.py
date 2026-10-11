@@ -187,6 +187,8 @@ class Registry:
         self.snapshot = SnapshotControl(self)
         from .generation_control import GenerationControl
         self.generation = GenerationControl(self)
+        from .gametest_control import GameTestControl
+        self.gametest = GameTestControl(self)
 
     @contextmanager
     def transaction(self, *, read_only: bool = False):
@@ -216,6 +218,7 @@ class Registry:
         with self.transaction() as connection:
             if connection.execute("SELECT 1 FROM meta WHERE key='supervisorBoot'").fetchone():
                 connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED'")
+                connection.execute("UPDATE runtime_operations SET status='RECOVERY_REQUIRED' WHERE command='gametest' AND status='PENDING'")
             connection.execute("INSERT OR REPLACE INTO meta VALUES ('supervisorBoot',?)", (boot,))
         return boot
 
@@ -264,6 +267,8 @@ class Registry:
 
     def execute(self, command: str, payload: dict, *, operation_id: str, dry_run: bool = False) -> dict:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
+        if command == "gametest":
+            return self.gametest.execute(payload, operation_id=operation_id, dry_run=dry_run)
         if command == "snapshot":
             return self.snapshot.execute(payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"prepare", "restore", "reset", "recover"}:
@@ -322,6 +327,8 @@ class Registry:
                     return dict(result, shutdown=not dry_run, replayed=True, dryRun=dry_run)
                 return dict(result, replayed=True, dryRun=dry_run)
             if command == "shutdown":
+                require(not connection.execute("SELECT 1 FROM runtime_operations WHERE command='gametest' AND status IN ('PENDING','RECOVERY_REQUIRED')").fetchone(),
+                        "BUSY", "GameTestの実行または所有確認が未完了のため監督を停止できません")
                 require(not connection.execute("SELECT 1 FROM instances WHERE pending != 0 AND state != 'RECOVERY_REQUIRED'").fetchone(),
                         "BUSY", "進行中runtime操作があるため監督を終了できません")
                 boot = connection.execute("SELECT value FROM meta WHERE key='supervisorBoot'").fetchone()

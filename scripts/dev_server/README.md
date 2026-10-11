@@ -8,6 +8,7 @@ Managerの管理接続と終了証明は[管理writerガイド](writer-guide.md)
 正常停止した全データの保存・完全性検証は[snapshotガイド](snapshot-guide.md)を参照してください。
 世代の構築・restore/reset・障害復旧は[世代ガイド](generation-guide.md)を参照してください。
 固定fixtureの生成・独立検証・明示昇格は[テンプレートガイド](template-guide.md)を参照してください。
+固定bundleのGameTestと同世代保存往復は[GameTestガイド](gametest-guide.md)を参照してください。
 
 [ServerMod #525](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/525)の契約・fixtureを管理します。
 確定設計は[#524](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/524)、
