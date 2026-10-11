@@ -159,6 +159,39 @@ class GameTestControlTests(RegistryFixture, unittest.TestCase):
         self.assertNotIn("secret-input", row["response"])
         self.assert_code("RECOVERY_REQUIRED", self.run_test)
 
+    def test_exit_during_identity_read_requires_owned_process_exit(self):
+        for fault in (PermissionError(5, "process exiting"), None):
+            with self.subTest(fault=fault):
+                calls = 0
+                original = self.adapter.identity
+                def identity(pid):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return original(pid)
+                    if fault is not None:
+                        raise fault
+                    return None
+                run_id = "exit-" + str(int(fault is None))
+                with patch.object(self.adapter, "identity", side_effect=identity):
+                    result = self.run_test(dict(self.payload, runId=run_id), run_id)
+                self.assertTrue(result["runtimeStopped"])
+                self.assertTrue(self.adapter.closed)
+
+    def test_identity_read_failure_while_alive_is_held(self):
+        original = self.adapter.identity
+        calls = 0
+        def identity(pid):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return original(pid)
+            raise PermissionError(5, "still alive")
+        with patch.object(self.adapter, "identity", side_effect=identity), patch.object(Process, "poll", return_value=None):
+            self.assert_code("GAMETEST_FAILED", self.run_test)
+        self.assertFalse(self.adapter.closed)
+        self.assert_code("RECOVERY_REQUIRED", self.run_test)
+
     def test_failures_preserve_world_report_and_failed_replay(self):
         for report, exit_code in ((None, 0), ("broken", 0), ('<testsuite><testcase><failure/></testcase></testsuite>', 1),
                                   ('<testsuite><testcase/></testsuite>', 1)):

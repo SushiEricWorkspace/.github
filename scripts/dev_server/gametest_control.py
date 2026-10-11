@@ -209,7 +209,15 @@ class GameTestControl:
                 runtime._record(run)
             deadline = time.monotonic() + payload["timeoutSeconds"]
             while process.poll() is None:
-                runtime_process.require_identity(run["identity"], adapter.identity(process.pid))
+                try:
+                    actual = adapter.identity(process.pid)
+                except OSError:
+                    if process.poll() is None:
+                        raise
+                    break
+                if actual is None and process.poll() is not None:
+                    break
+                runtime_process.require_identity(run["identity"], actual)
                 check_listeners(set(process.members()) | {process.pid})
                 require(time.monotonic() < deadline, "GAMETEST_TIMEOUT", "GameTestの期限を超過しました。自動killしません")
                 time.sleep(0.1)
