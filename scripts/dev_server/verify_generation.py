@@ -181,9 +181,10 @@ def main():
     record('scoreboard-restored', {'reply': score})
     for dimension in ('minecraft:overworld', 'minecraft:the_nether', 'minecraft:the_end'):
         rcon(f'execute in {dimension} run forceload add 0 0', restored_run, restored)
-        verified_block = rcon(f'execute in {dimension} if block 0 100 0 minecraft:gold_block run say generation-restored', restored_run, restored)
-        assert 'generation-restored' in verified_block
+        time.sleep(2)
+        verified_block = rcon(f'execute in {dimension} if block 0 100 0 minecraft:gold_block', restored_run, restored)
         record('restored-block', {'dimension': dimension, 'reply': verified_block})
+        assert 'Test passed' in verified_block
     record('restore-stopped', call('stop', dict(token, timeoutSeconds=180), 'stop-restored-533'))
     record('release', call('release', token, 'release-533'))
     record('restore-verified', {'allSourceHashes': True, 'allVanillaDimensions': True, 'scoreboard17': True, 'independentCopy': True, 'oldGenerationRetained': generation.exists()})
