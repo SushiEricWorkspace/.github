@@ -179,6 +179,7 @@ class GameTestControlTests(RegistryFixture, unittest.TestCase):
                 self.assertTrue(self.adapter.closed)
 
     def test_identity_read_failure_while_alive_is_held(self):
+        self.adapter.fault = lambda proof: proof.update(phase="RUNNING")
         original = self.adapter.identity
         calls = 0
         def identity(pid):
@@ -191,6 +192,24 @@ class GameTestControlTests(RegistryFixture, unittest.TestCase):
             self.assert_code("GAMETEST_FAILED", self.run_test)
         self.assertFalse(self.adapter.closed)
         self.assert_code("RECOVERY_REQUIRED", self.run_test)
+
+    def test_identity_unavailable_during_shutdown_waits_for_exit(self):
+        original = self.adapter.identity
+        calls = 0
+        def identity(pid):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return original(pid)
+            raise PermissionError(5, "process exiting")
+        with patch.object(self.adapter, "identity", side_effect=identity), \
+                patch.object(Process, "poll", side_effect=[None, None, None, None, 0, 0, 0]):
+            result = self.run_test()
+        self.assertTrue(result["runtimeStopped"])
+        self.assertTrue(self.adapter.closed)
+        with self.registry.transaction(read_only=True) as connection:
+            document = connection.execute("SELECT record FROM runs WHERE id=?", (self.payload["runId"],)).fetchone()[0]
+        self.assertEqual("PermissionError", json.loads(document)["identityReadFailure"]["errorType"])
 
     def test_failures_preserve_world_report_and_failed_replay(self):
         for report, exit_code in ((None, 0), ("broken", 0), ('<testsuite><testcase><failure/></testcase></testsuite>', 1),

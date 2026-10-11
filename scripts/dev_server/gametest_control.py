@@ -211,10 +211,18 @@ class GameTestControl:
             while process.poll() is None:
                 try:
                     actual = adapter.identity(process.pid)
-                except OSError:
-                    if process.poll() is None:
+                except OSError as error:
+                    if process.poll() is not None:
+                        break
+                    if self._proof(run, bundle)["phase"] not in ("STOPPING", "STOPPED"):
                         raise
-                    break
+                    run["identityReadFailure"] = {"errorType": type(error).__name__,
+                                                  "nativeError": getattr(error, "winerror", None) or getattr(error, "errno", None)}
+                    check_listeners(set(process.members()) | {process.pid})
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.1)
+                    continue
                 if actual is None and process.poll() is not None:
                     break
                 runtime_process.require_identity(run["identity"], actual)
