@@ -379,6 +379,22 @@ class SupervisorProcessTests(RegistryFixture, unittest.TestCase):
         self.assertEqual("INVALID_INPUT", json.loads(cli.stdout)["error"]["code"])
         self.assertNotIn("unknown-secret-argument", cli.stdout + cli.stderr)
 
+    def test_native_cli_stdin_large_body_limit_and_exclusive_input(self):
+        self._start()
+        secret = "fixture-not-a-real-secret-" * 1700
+        payload = json.dumps({"instanceId": "persistent-01", "unknown": secret})
+        self.assertGreater(len(payload), 32768)
+        command = [sys.executable, "-B", str(SCRIPT), "status", "--root", str(self.root), "--operation-id", "stdin-test", "--payload-stdin"]
+        result = subprocess.run(command, input=payload, capture_output=True, text=True, encoding="utf-8", timeout=10)
+        # 32KiB超を引数へ載せず監督の項目検査まで届く。秘密をエラーへ転載しない。
+        self.assertEqual("INVALID_INPUT", json.loads(result.stdout)["error"]["code"])
+        self.assertEqual("stdin-test", json.loads(result.stdout)["operationId"])
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        oversized = subprocess.run(command, input=" " * 65537, capture_output=True, text=True, encoding="utf-8", timeout=10)
+        self.assertEqual("INVALID_INPUT", json.loads(oversized.stdout)["error"]["code"])
+        mixed = subprocess.run(command + ["--payload", '{"instanceId":"persistent-01"}'], input="{}", capture_output=True, text=True, encoding="utf-8", timeout=10)
+        self.assertEqual("INVALID_INPUT", json.loads(mixed.stdout)["error"]["code"])
+
 
 if __name__ == "__main__":
     unittest.main()

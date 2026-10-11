@@ -49,20 +49,29 @@ class RuntimeControl:
         return root
 
     def _active(self, row):
+        generation = self._active_generation(row)
+        for path in generation.rglob("*"):
+            plain_path(path)
+        return generation
+
+    def _active_generation(self, row):
+        """常用照合は世代の正本とpath chainに限定し、無関係な保存treeを列挙しない。"""
         root = self._paths(row["id"])
+        require_private(root / "active.json")
         active = read_json(root / "active.json")
         require(active == {"version": 1, "generationId": row["generation"], "artifactId": row["artifact"]},
                 "RECOVERY_REQUIRED", "activeとRegistryが一致しません")
         generation = root / "generations" / row["generation"]
         require_private(generation, directory=True)
+        require_private(generation / "generation.json")
         record = read_json(generation / "generation.json")
         require(record["version"] == 1 and record["layoutId"] == LAYOUT_ID
                 and record["generationId"] == row["generation"] and record["artifactId"] == row["artifact"],
                 "RECOVERY_REQUIRED", "世代の完成記録が一致しません")
+        plain_path(root / "journal.json")
+        plain_path(root / "staging")
         require(not (root / "journal.json").exists() and not (root / "staging").exists(),
                 "RECOVERY_REQUIRED", "未完了の世代切替は後続エンジンで照合してください")
-        for path in generation.rglob("*"):
-            plain_path(path)
         return generation
 
     def _row(self, payload):
@@ -73,17 +82,26 @@ class RuntimeControl:
 
     def _space(self, required_bytes=0):
         used_bytes = 0
-        for path in self.registry.root.rglob("*"):
-            if os.name != "nt" and path == self.registry.root / "manager/supervisor.sock":
-                require_private(path.parent, directory=True)
-                info = path.lstat()
-                require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid()
-                        and stat.S_IMODE(info.st_mode) == 0o600,
-                        "IPC_UNVERIFIED", "管理socketの実体・所有権が一致しません")
-                continue
-            plain_path(path)
-            if path.is_file():
-                used_bytes += path.stat().st_size
+        plain_path(self.registry.root)
+        directories = [self.registry.root]
+        while directories:
+            directory = directories.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    info = path.lstat()
+                    if os.name != "nt" and path == self.registry.root / "manager/supervisor.sock":
+                        require_private(directory, directory=True)
+                        require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid()
+                                and stat.S_IMODE(info.st_mode) == 0o600,
+                                "IPC_UNVERIFIED", "管理socketの実体・所有権が一致しません")
+                        continue
+                    if getattr(info, "st_file_attributes", 0) & 0x400 or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                        raise OSError("管理パスは通常ファイル・ディレクトリに限定します")
+                    if stat.S_ISDIR(info.st_mode):
+                        directories.append(path)
+                    else:
+                        used_bytes += info.st_size
         margin = self.registry.inventory["reserveBytes"]
         require(used_bytes + required_bytes + margin <= self.registry.inventory["quotaBytes"]
                 and shutil.disk_usage(self.registry.root).free >= required_bytes + margin,
@@ -119,7 +137,7 @@ class RuntimeControl:
         fingerprint = digest(canonical({"command": command, "payload": payload}))
         replay = None
         with self.registry.transaction(read_only=True) as connection:
-            for table in ("operations", "reference_operations"):
+            for table in ("operations", "reference_operations", "writer_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが他の操作で使用されています")
             cached = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (operation_id,)).fetchone()
@@ -136,6 +154,7 @@ class RuntimeControl:
         if replay:
             row, response = replay
             if command == "start":
+                self._active(row)
                 self._running(row)
             return dict(response, replayed=True, dryRun=dry_run)
         row = self._row(payload)
@@ -176,12 +195,14 @@ class RuntimeControl:
                 self._running(row)
             return {"dryRun": True, "wouldExecute": command, "instanceId": row["id"]}
         with self.registry.transaction() as connection:
-            for table in ("operations", "reference_operations"):
+            for table in ("operations", "reference_operations", "writer_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが他の操作で使用されています")
             current = self.registry._instance(connection, row["id"])
             self.registry._token(current, payload)
             require(current["state"] == row["state"] and not current["pending"], "BUSY", "枠の状態が変更されました")
+            require(not connection.execute("SELECT 1 FROM writer_sessions WHERE instance=? AND pending!=0", (row["id"],)).fetchone(),
+                    "WRITER_PENDING", "writer保存の完了が不明なため停止・再起動を開始できません")
             response = {"instanceId": row["id"], "pending": True}
             connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
                                (operation_id, fingerprint, command, row["id"], "PENDING", json.dumps(response)))
@@ -263,6 +284,8 @@ class RuntimeControl:
         require(proof.get("requiresSupervisorProcessExit") is True and proof.get("requiresExternalWriterDrain") is True,
                 "PROOF_MISMATCH", "Mod証跡の責務境界が一致しません")
         identity = proof["identity"]
+        plain_path(Path(identity["cwd"]))
+        plain_path(Path(identity["runtimeManifest"]))
         require(identity["pid"] == run["identity"]["pid"]
                 and runtime_process.proof_start_millis(identity["processStartedAt"]) == run["identity"]["startMillis"]
                 and Path(identity["cwd"]).resolve() == generation.resolve()
@@ -422,7 +445,7 @@ class RuntimeControl:
         process = self.processes.get(row["run_id"])
         require(process is not None and process.poll() is None, "PROCESS_MISMATCH", "JVMが監督下で稼働していません")
         runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
-        generation = self._active(row)
+        generation = self._active_generation(row)
         proof = self._proof(run, generation)
         require_listeners(run["endpoints"], proof["startup"]["listeners"], self.process_adapter.sockets(process.pid))
 

@@ -33,7 +33,7 @@ def dispatch(registry: Registry, message: dict) -> dict:
         if type(command) is not str:
             raise RegistryError("INVALID_INPUT", "commandは文字列で指定してください")
         payload = message["payload"]
-        if command in {"acquire", "release", "prepare", "start", "stop"} and type(payload) is dict and "instanceId" in payload:
+        if command in {"acquire", "release", "prepare", "start", "stop", "writer-open", "writer-io", "writer-close"} and type(payload) is dict and "instanceId" in payload:
             instance = identifier(payload["instanceId"], "instanceId")
             if instance not in {row["instanceId"] for row in registry.inventory["instances"]}:
                 raise RegistryError("NOT_FOUND", "instanceが登録されていません")
@@ -47,7 +47,10 @@ def dispatch(registry: Registry, message: dict) -> dict:
             result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
         return {"ok": True, "operationId": operation_id, "result": result}
     except RegistryError as error:
-        return {"ok": False, "operationId": operation_id, "error": {"code": error.code, "message": str(error)}}
+        detail = {"code": error.code, "message": str(error)}
+        if error.rejected_before_effect:
+            detail["rejectedBeforeEffect"] = True
+        return {"ok": False, "operationId": operation_id, "error": detail}
     except BuildLockError:
         return {"ok": False, "operationId": operation_id, "error": {"code": "LOCK_BUSY", "message": "資源のOS lockが使用中です"}}
     except sqlite3.Error:

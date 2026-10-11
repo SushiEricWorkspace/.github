@@ -98,7 +98,7 @@ start失敗の後始末も自身の識別とRCON所有を確認できた場合�
 監督再起動では全枠を保留し、復旧エンジンが接続されるまで二重起動しません。
 
 runtimeStopProof=trueでもsnapshotCleanは常にfalseです。
-外部DB/Manager/管理外プロセスのwriter終了は#531、世代引継ぎ・復旧は#533で確認します。
+協調Managerのwriter終了は[管理writerガイド](writer-guide.md)、世代引継ぎ・復旧は#533の責務です。
 同一ユーザーの非協調的な直接編集や、Job/group外の管理外writerをこのadapterの終了証明へ含めません。
 snapshot/restore/gc、実データ枠のreleaseはこの証明だけで許可しません。
 
