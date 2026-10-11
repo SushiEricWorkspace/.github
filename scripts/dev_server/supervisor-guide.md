@@ -8,7 +8,7 @@ Python 3.12を使用し、macOSとWindowsで同じCLI・Registryを使います�
 ## 検証境界
 
 初回prepare・固定bundleからのstart/stopは[runtime制御ガイド](runtime-control-guide.md)に従います。
-snapshotの作成・検証は[snapshotガイド](snapshot-guide.md)、restore/reset/recoverは[世代ガイド](generation-guide.md)に従います。GCは未実装です。doctor/statusはRUNNINGの所有識別・Mod証跡・
+snapshotの作成・検証は[snapshotガイド](snapshot-guide.md)、restore/reset/recoverは[世代ガイド](generation-guide.md)、参照保護付き回収は[GCガイド](gc-guide.md)に従います。doctor/statusはRUNNINGの所有識別・Mod証跡・
 実socketを再照合します。協調Managerのwriterは[管理writerガイド](writer-guide.md)で登録・終了を照合しますが、
 管理外の非協調writerやFSの停電耐久性を証明しません。
 実データ枠のreleaseは正常停止・writer終了・世代一致を照合してから行い、データは残してleaseから切り離します。
@@ -80,7 +80,7 @@ renewでは`ttlSeconds`を追加します。新ownerの`generationBound`はfalse
 別payloadは`OPERATION_CONFLICT`です。解放後の旧acquire、次の貸出後の旧releaseなど、
 現在のlease/epoch/世代と矛盾する再送は拒否します。結果不明時に新IDで再試行しません。
 
-CLI終了・期限切れでleaseを自動回収しません。期限切れのrenew/releaseも拒否し、後続recoverの確認が必要です。
+CLI終了・期限切れでleaseを自動回収しません。期限切れのrenew/releaseも拒否し、recoverの確認が必要です。
 supervisor再起動では、空いていた枠も含め全枠を`RECOVERY_REQUIRED`へ移します。
 recoverで停止証跡・journal・実体を照合します。DB手編集で貸出を強行しません。
 `shutdown`は監督だけを終了して全枠を復旧待ちにする補助操作です。leaseは解放されません。
@@ -91,9 +91,9 @@ shutdownもoperationIdを記録し、他の変更とのID衝突を拒否しま�
 
 AVAILABLEのacquireのみ、停止した空枠または正常停止・writer終了を検証したデータ枠のreleaseを許可します。
 writer/child/pending/参照予約が残る場合もrelease不可です。
-参照予約は`Registry.reserve_references`/`finish_reservation`を後続エンジンから呼び、
+参照予約は`Registry.reserve_references`/`finish_reservation`を各制御エンジンから呼び、
 参照集合を整列して短いtransactionで記録します。コピー中にDB transactionを保持しません。
-このAPIはまだGCや保存器へ接続されていません。
+snapshot・世代操作・GCは参照予約と操作排他を照合します。
 
 ## OS adapter
 

@@ -10,6 +10,9 @@ Managerの管理接続と終了証明は[管理writerガイド](writer-guide.md)
 固定fixtureの生成・独立検証・明示昇格は[テンプレートガイド](template-guide.md)を参照してください。
 固定bundleのGameTestと同世代保存往復は[GameTestガイド](gametest-guide.md)を参照してください。
 参照保護・容量検査・明示回収は[GCガイド](gc-guide.md)を参照してください。
+正常停止後の別媒体コピーと実保存値の復元訓練は[バックアップガイド](backup-guide.md)を参照してください。
+導入前の条件・OS別証跡の整理は[総合受入ガイド](acceptance-guide.md)を参照してください。
+Windowsの停止試験rootによる容量・三枠同時メモリ計測は[計測ガイド](capacity-guide.md)を参照してください。
 
 [ServerMod #525](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/525)の契約・fixtureを管理します。
 確定設計は[#524](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/524)、
@@ -27,7 +30,7 @@ python3.12 -B -m unittest discover -s scripts -p test_contracts.py -v
 definitions/contractsをrefで参照し、objectのpropertiesは全て必須・未知項目禁止です。
 型、enum、minimum/maximum、minLength、pattern、minItems/maxItems、items、パスformatを
 `contracts.py`で検査し、項目間制約も同じモジュールへ集約します。
-instanceは静的割当の契約です。lease/state/epoch等のRegistry契約はsupervisor実装時に追加します。
+instanceは静的割当の契約です。lease/state/epoch等はRegistryとsupervisorが管理します。
 runtime/manifest/validationのhash・nonceは形式検査だけでは証跡になりません。
 
 `fixtures-v1.json`は固定seed/UUIDと必要な最小定義・期待値です。
@@ -48,7 +51,7 @@ prepare/restore/resetの世代構築、固定fixtureの検証・明示昇格、r
 ## テスト結果の扱い
 
 契約テストで確認するのはA08/A09/A20/A23/A24に対する入力/期待値・拒否条件です。
-実NBTの保存往復、設定解析・秘密除去/注入、実FSのリンクや差替え、別媒体、ポート占有、
-macOS/APFSとWindows/NTFSの耐久化・停電耐性は後続試験に残します。
+実NBTの保存往復、設定変換、実FS、別媒体、ポート占有の結果は[受入記録](acceptance-results.md)と各検証証跡で区別します。
+契約テストの成功だけでこれらの実試験や停電耐性を証明しません。
 運用の初期対象はmacOS 15とWindows、Python 3.12/JDK 21です。
 各OSのnative IPC・lock試験と運用適合試験を分け、片方の成功をもう片方の証明にしません。

@@ -61,12 +61,25 @@ def main():
     parser.add_argument("--minecraft-base-port", type=int, default=26085)
     parser.add_argument("--rcon-base-port", type=int, default=26095)
     parser.add_argument("--management-base-port", type=int, default=26100)
+    parser.add_argument("--backup-destination", type=Path, help="新しい別媒体保存先で停止rootのコピー・復元を確認する。昇格はしない")
     args = parser.parse_args()
     assert args.game_test_runs == 0 or args.restart_only, "GameTest併走はrestart-onlyの試験に限定します"
+    assert args.backup_destination is None or not args.restart_only, "別媒体試験はsnapshot作成が必要です"
     for path in (args.root, args.bundle, args.evidence):
         plain_path(path)
         assert path.is_absolute(), "絶対パスを指定してください"
     assert not args.root.exists() and not args.evidence.exists(), "既存環境・証跡は上書きしません"
+    from dev_server.backup_verification import validate_trial_paths
+    outputs = [args.root, args.evidence]
+    if args.backup_destination is not None:
+        outputs.extend([args.backup_destination, args.root.with_name(args.root.name + "-before-backup-restore")])
+    validate_trial_paths(args.bundle, outputs)
+    if args.backup_destination is not None:
+        plain_path(args.backup_destination)
+        assert args.backup_destination.is_absolute() and not args.backup_destination.exists()
+        assert args.backup_destination.parent.is_dir()
+        assert args.root.parent.stat().st_dev != args.backup_destination.parent.stat().st_dev, "別volumeの保存先が必要です。物理媒体の確認は運用者が別途行います"
+        assert not args.root.with_name(args.root.name + "-before-backup-restore").exists()
     bundle = verify_bundle(args.bundle)
     args.evidence.mkdir(parents=True)
     make_private(args.evidence, directory=True)
@@ -118,6 +131,8 @@ def main():
     inventory.update(operator=args.approved_by, managementRoot=str(args.root), quotaBytes=32 * 1024**3, reserveBytes=1024**3)
     inventory["gameTestConcurrency"] = 2 if args.game_test_runs else 1
     inventory["backup"] = {"destination": str(args.evidence / "synthetic-backup-not-real-medium"), "separateMediumConfirmedBy": args.approved_by}
+    if args.backup_destination is not None:
+        inventory["backup"]["destination"] = str(args.backup_destination)
     for index, declaration in enumerate(inventory["instances"]):
         declaration["ports"] = {"minecraft": args.minecraft_base_port + index, "rcon": args.rcon_base_port + index,
                                 "management": args.management_base_port + index}
@@ -203,6 +218,64 @@ def main():
                 pool = None
             private_id, candidate_id, validation_id = name + "-private", name + "-candidate", name + "-validation"
             call("snapshot", dict(source, action="create", snapshotId=private_id), name + "-private")
+            if args.backup_destination is not None:
+                from dev_server.backup_verification import copy_verified_tree
+                from dev_server import storage
+                call("shutdown", {}, "backup-supervisor-shutdown")
+                process.wait(timeout=30)
+                assert process.returncode == 0
+                for declaration in inventory["instances"]:
+                    with prebind(instance_endpoints(declaration)):
+                        pass
+                started = time.monotonic()
+                backup = copy_verified_tree(args.root, args.backup_destination)
+                record("separate-volume-backup", dict(backup, seconds=time.monotonic() - started,
+                       destination=str(args.backup_destination), supervisorExited=True))
+                preserved = args.root.with_name(args.root.name + "-before-backup-restore")
+                storage.move(args.root, preserved)
+                started = time.monotonic()
+                restored_copy = copy_verified_tree(args.backup_destination, args.root)
+                assert backup == restored_copy
+                record("offline-root-restored", dict(restored_copy, seconds=time.monotonic() - started,
+                       preservedSource=str(preserved)))
+                with (args.evidence / "restored-supervisor.log").open("xb") as log:
+                    process = subprocess.Popen([sys.executable, "-B", str(args.repo / "scripts/dev-server.py"), "supervise", "--root", str(args.root)],
+                                               stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                record("restored-supervisor", {"pid": process.pid})
+                deadline = time.monotonic() + 30
+                while True:
+                    assert process.poll() is None, "復元supervisorが終了しました"
+                    try:
+                        call("doctor", {}, "restored-doctor")
+                        break
+                    except OSError:
+                        assert time.monotonic() < deadline
+                        time.sleep(0.2)
+                for token in (source, other):
+                    record("backup-recover-" + token["instanceId"], call("recover",
+                           dict(token, action="resume", targetOperationId=None, ttlSeconds=7200), "backup-recover-" + token["instanceId"]))
+                call("snapshot", {"action": "verify", "snapshotId": private_id}, "backup-snapshot-verify")
+                started = time.monotonic()
+                call("restore", dict(other, artifactId=bundle["artifactId"], generationId=name + "-backup-restored", snapshotId=private_id, acceptEula=True), "backup-restore-other")
+                other["expectedGeneration"] = name + "-backup-restored"
+                record("backup-snapshot-restored", {"seconds": time.monotonic() - started})
+                started = time.monotonic()
+                other_start = call("start", dict(other, timeoutSeconds=240), "backup-start-other")
+                record("backup-restored-start", dict(other_start, seconds=time.monotonic() - started))
+                reply = rcon(other, "se managedfixture verify " + name)
+                assert "fixture verified: " + name in reply, reply
+                other_stop = call("stop", dict(other, timeoutSeconds=180), "backup-stop-other")
+                record("backup-restored-api", {"reply": reply, "stop": other_stop})
+                diagnostics = args.root / "instances" / other["instanceId"] / "diagnostics"
+                verified = json.loads((diagnostics / other_start["runId"] / f"fixture-{name}-verify.json").read_text())
+                assert verified["instanceId"] == other["instanceId"] and verified["generationId"] == other["expectedGeneration"]
+                assert verified["nonce"] == other_stop["nonce"] and other_stop["runtimeStopped"] is True and other_stop["modSaveCompleted"] is True
+                record("separate-medium-roundtrip-verified", {"fixture": verified, "backupHash": backup["treeHash"],
+                       "backupPreserved": True, "originalRootPreserved": True, "productionEnabled": False})
+                call("release", source, "backup-release-source")
+                call("release", other, "backup-release-other")
+                continue
             call("snapshot", dict(source, action="candidate", snapshotId=candidate_id, sourceSnapshotId=private_id), name + "-candidate")
             private = verify_snapshot(args.root / "snapshots" / private_id)
             candidate = verify_snapshot(args.root / "snapshots" / candidate_id)

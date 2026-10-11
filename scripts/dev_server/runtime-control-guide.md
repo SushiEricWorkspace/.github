@@ -50,8 +50,7 @@ generationをcwdとして、診断用instances/<instanceId>/diagnostics/<runId>/
 nonce、proofPath、instance/generation、runtime manifestの全管理propertyを追加します。
 JAVA_TOOL_OPTIONS、JDK_JAVA_OPTIONS、_JAVA_OPTIONS、CLASSPATHによる暗黙入力は拒否します。
 
-固定TCP候補はMinecraft 25665/25666、RCON 25675/25676、Management 25680/25681です。
-inventoryの宣言値を使い、255xxの既存環境を停止しません。通信試験用範囲25700〜25799もinventoryで明示し、
+各枠の固定TCP portはinventoryの承認済み宣言値を使い、競合する既存環境を停止しません。通信試験用範囲もinventoryで明示し、
 runtime_ports.network_endpointsで範囲を制限します。GameTest通信起動ハーネスは後続の責務です。
 予約はhost/protocol/address/port/v6Onlyを区別し、IPv4/IPv6 wildcardとdual-stackの重なりを拒否します。
 Managementは127.0.0.1固定、Minecraft/RCONは明示loopbackです。lan-explicitは具体アドレス契約が未接続なので拒否します。
@@ -95,12 +94,12 @@ API bind失敗、nonce/root/hash/socket不一致、保存Boolean=false/例外、
 非正常exit、期限超過ではRECOVERY_REQUIREDとし、データ・診断・未完了操作の参照を保全します。
 start失敗の後始末も自身の識別とRCON所有を確認できた場合の正常stopだけです。
 他プロセス停止、stdin fallback、自動kill、期限切れleaseの自動再貸出しはありません。
-監督再起動では全枠を保留し、復旧エンジンが接続されるまで二重起動しません。
+監督再起動では全枠を保留し、recoverによる照合が完了するまで二重起動しません。
 
 runtimeStopProof=trueだけではsnapshotCleanはtrueになりません。[snapshotガイド](snapshot-guide.md)の全検証が別途必要です。
 協調Managerのwriter終了は[管理writerガイド](writer-guide.md)、世代引継ぎ・復旧は[世代ガイド](generation-guide.md)に従います。
 同一ユーザーの非協調的な直接編集や、Job/group外の管理外writerをこのadapterの終了証明へ含めません。
-snapshot/restore、実データ枠のreleaseには外部writer終了と世代照合も必要です。GCは未実装です。
+snapshot/restore、実データ枠のreleaseには外部writer終了と世代照合も必要です。回収は[GCガイド](gc-guide.md)に従います。
 
 ## 検証
 

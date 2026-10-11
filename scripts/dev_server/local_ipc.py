@@ -134,10 +134,12 @@ if os.name == "nt":
                                                           _winapi.INFINITE if timeout is None else int(timeout * 1000))
                     if waited == _winapi.WAIT_TIMEOUT:
                         overlapped.cancel()
-                        overlapped.GetOverlappedResult(True)
-                        kernel.CloseHandle(old)
-                        return None
-                    _, error = overlapped.GetOverlappedResult(True)
+                        _, error = overlapped.GetOverlappedResult(True)
+                        if error == _winapi.ERROR_OPERATION_ABORTED:
+                            kernel.CloseHandle(old)
+                            return None
+                    else:
+                        _, error = overlapped.GetOverlappedResult(True)
                     if error:
                         raise ctypes.WinError(error)
                 return PipeConnection(old)
