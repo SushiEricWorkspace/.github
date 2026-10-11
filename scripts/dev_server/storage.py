@@ -37,10 +37,10 @@ def move(source: Path, destination: Path, *, replace=False) -> None:
     plain_path(destination)
     require(source.stat().st_dev == destination.parent.stat().st_dev, "DIFFERENT_FS", "同一FSでの公開が必要です")
     if replace:
-        require_private(source)
-        require_private(destination)
         require(source.is_file() and destination.is_file() and source.stat().st_nlink == destination.stat().st_nlink == 1,
                 "UNSUPPORTED_FILE", "独立した通常参照ファイルだけを置換できます")
+        require_private(source)
+        require_private(destination)
     else:
         require(not destination.exists(), "EXISTING_DATA", "公開先を上書きしません")
     if os.name == "nt":
