@@ -9,7 +9,8 @@ Python 3.12を使用し、macOSとWindowsで同じCLI・Registryを使います�
 
 初回prepare・固定bundleからのstart/stopは[runtime制御ガイド](runtime-control-guide.md)に従います。
 snapshot/restore/recover/gcは`NOT_IMPLEMENTED`です。doctor/statusはRUNNINGの所有識別・Mod証跡・
-実socketを再照合しますが、外部writer終了、snapshot clean、FSの停電耐久性を証明しません。
+実socketを再照合します。協調Managerのwriterは[管理writerガイド](writer-guide.md)で登録・終了を照合しますが、
+管理外writer、snapshot clean、FSの停電耐久性を証明しません。
 実データを持つ枠のreleaseも、外部writer・世代引継ぎの照合を接続するまで拒否します。
 総合受入と運用者の設定が揃うまで既存環境を置き換えず、運用を有効化しません。
 
@@ -33,7 +34,7 @@ python3.12 -B scripts/dev-server.py init --root /absolute/minecraft-dev --invent
 Windowsでは`python3.12`を`py -3.12`へ置き換え、`--root`を`C:/...`形式にします。
 初期化を中断してrootへ部分データが残った場合は自動再初期化・削除せず止まります。
 完了済みinitは同じinventoryと同じoperationIdだけが再送可能です。
-inventory契約はschemaVersion=1、Registry DBとINITIALIZED markerはversion=2です。
+inventory契約はschemaVersion=1、Registry DBとINITIALIZED markerはversion=3です。
 旧DB/markerは保全して拒否し、移行・再初期化しません。検証には新しい空rootを用意してください。
 
 ## supervisorと要求

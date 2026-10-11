@@ -284,7 +284,7 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         info = SimpleNamespace(st_mode=0o140600, st_uid=17)
         def lstat(path):
             return info if path == ipc else original(path)
-        with patch("dev_server.runtime_control.os", SimpleNamespace(name="posix", getuid=lambda: 17)), \
+        with patch("dev_server.runtime_control.os", SimpleNamespace(name="posix", getuid=lambda: 17, scandir=os.scandir)), \
                 patch.object(Path, "lstat", lstat):
             control._space()
             for mode, owner in ((0o140666, 17), (0o140600, 18), (0o120600, 17), (0o100600, 17)):
