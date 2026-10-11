@@ -6,9 +6,9 @@ import os
 from pathlib import Path
 import subprocess
 import uuid
-import xml.etree.ElementTree as ET
 
 from dev_server.contracts import ContractError
+from dev_server.gametest_report import read_report
 from dev_server.runtime_bundle import _directory, launch_command, verify_bundle
 
 
@@ -38,11 +38,11 @@ def main():
         result = subprocess.run(command, cwd=run, stdout=output, stderr=subprocess.STDOUT)
     if result.returncode != 0:
         raise ContractError(f"GameTest: JVMが失敗しました。log={run / 'console.log'}")
-    report = ET.parse(run / "report.xml").getroot()
-    cases = list(report.iter("testcase"))
-    if not cases or list(report.iter("failure")) or list(report.iter("error")) or list(report.iter("skipped")):
+    report = read_report(run / "report.xml")
+    if not report["testsPassed"]:
         raise ContractError(f"GameTest: 未実施/失敗があります。report={run / 'report.xml'}")
-    print(json.dumps({"artifactId": manifest["artifactId"], "run": str(run), "passed": len(cases)}))
+    print(json.dumps({"artifactId": manifest["artifactId"], "run": str(run), "passed": report["tests"],
+                      "reportSha256": report["reportSha256"]}))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -21,6 +22,33 @@ from dev_server.snapshot_control import verify_snapshot
 from dev_server.supervisor import new_request
 
 
+def verify_restart(created, verified, first_stop, second_stop):
+    """同世代の別nonceで現行APIが再読込した値・ファイルと、両runの正常停止を照合する。"""
+    from dev_server.registry import require
+    require(created["action"] == "create" and verified["action"] == "verify"
+            and created["nonce"] != verified["nonce"], "PROOF_MISMATCH", "別起動のfixture証跡が必要です")
+    for key in ("schemaVersion", "fixture", "seed", "instanceId", "generationId", "oreRevivalSecond",
+                "inventoryCount", "money", "internalId", "files"):
+        require(created[key] == verified[key], "ROUNDTRIP_MISMATCH", "再起動後のfixtureが一致しません: " + key)
+    for fixture, stopped in ((created, first_stop), (verified, second_stop)):
+        require(stopped["nonce"] == fixture["nonce"] and stopped["instanceId"] == fixture["instanceId"]
+                and stopped["generation"] == fixture["generationId"] and stopped["runtimeStopped"] is True
+                and stopped["modSaveCompleted"] is True and stopped["stopRequested"] is True
+                and stopped["stopAcknowledged"] is True and stopped["jvmAndChildrenExited"] is True
+                and stopped["exitCode"] == 0, "SAVE_FAILED", "fixtureの正常停止証跡が一致しません")
+
+
+def verify_overlap(runs):
+    """実OS開始時刻と監督の終了確認時刻から、3つの所有JVMの実際の併走を照合する。"""
+    from dev_server.registry import require
+    require(len(runs) == 3 and all(run["jvmAndChildrenExited"] is True for run in runs),
+            "PROOF_MISMATCH", "永続枠と2つのGameTestの終了記録が必要です")
+    started = max(run["identity"]["startMillis"] / 1000 for run in runs)
+    exited = min(run["exitedAt"] for run in runs)
+    require(started < exited, "CONCURRENCY_NOT_OBSERVED", "3つのJVMの併走を確認できませんでした")
+    return {"overlapStartedAt": started, "overlapEndedAt": exited}
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ("repo", "root", "bundle", "evidence"):
@@ -28,7 +56,13 @@ def main():
     parser.add_argument("--approved-by", required=True)
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--fixture", choices=[value["name"] for value in FIXTURES], required=True)
+    parser.add_argument("--restart-only", action="store_true", help="snapshot昇格をせず同世代の停止・再起動を検証する")
+    parser.add_argument("--game-test-runs", type=int, choices=(0, 2), default=0, help="restart-onlyで固定bundleのGameTestを2実行併走させる")
+    parser.add_argument("--minecraft-base-port", type=int, default=26085)
+    parser.add_argument("--rcon-base-port", type=int, default=26095)
+    parser.add_argument("--management-base-port", type=int, default=26100)
     args = parser.parse_args()
+    assert args.game_test_runs == 0 or args.restart_only, "GameTest併走はrestart-onlyの試験に限定します"
     for path in (args.root, args.bundle, args.evidence):
         plain_path(path)
         assert path.is_absolute(), "絶対パスを指定してください"
@@ -37,6 +71,7 @@ def main():
     args.evidence.mkdir(parents=True)
     make_private(args.evidence, directory=True)
     report = {"testOnly": True, "backupConfirmedForProduction": False, "steps": []}
+    pool = None
 
     def record(step, value):
         report["steps"].append({"step": step, "result": value})
@@ -65,18 +100,27 @@ def main():
         from dev_server.snapshot_data import properties
         settings = properties((generation / "server.properties").read_bytes())
         endpoint = run["endpoints"]["rcon"]
-        assert endpoint["address"] == "127.0.0.1" and endpoint["port"] in {26095, 26096}
+        declared = next(value for value in registry.inventory["instances"] if value["instanceId"] == row["id"])
+        assert endpoint == instance_endpoints(declared)["rcon"]
         return rcon_command(endpoint["address"], endpoint["port"], settings["rcon.password"], 30, text, verify=verify)
 
     def acquire(instance, operation):
         lease = call("acquire", {"instanceId": instance, "owner": args.task_id, "ttlSeconds": 7200}, operation)
         return {"instanceId": instance, "leaseId": lease["leaseId"], "epoch": lease["epoch"], "expectedGeneration": lease["generation"]}
 
+    def runs(ids):
+        registry = Registry(args.root)
+        with registry.transaction(read_only=True) as connection:
+            values = [connection.execute("SELECT record FROM runs WHERE id=?", (run_id,)).fetchone() for run_id in ids]
+        return [json.loads(value[0]) if value is not None else None for value in values]
+
     inventory = contract_documents("smoke-v1")[0]["inventory"]
     inventory.update(operator=args.approved_by, managementRoot=str(args.root), quotaBytes=32 * 1024**3, reserveBytes=1024**3)
+    inventory["gameTestConcurrency"] = 2 if args.game_test_runs else 1
     inventory["backup"] = {"destination": str(args.evidence / "synthetic-backup-not-real-medium"), "separateMediumConfirmedBy": args.approved_by}
     for index, declaration in enumerate(inventory["instances"]):
-        declaration["ports"] = {"minecraft": 26085 + index, "rcon": 26095 + index, "management": 26100 + index}
+        declaration["ports"] = {"minecraft": args.minecraft_base_port + index, "rcon": args.rcon_base_port + index,
+                                "management": args.management_base_port + index}
         with prebind(instance_endpoints(declaration)):
             pass
     initialize(inventory, operation_id="init-534")
@@ -105,11 +149,58 @@ def main():
             source_generation = name + "-source"
             call("prepare", dict(source, artifactId=bundle["artifactId"], generationId=source_generation, seed=spec["seed"], acceptEula=True), name + "-prepare")
             source["expectedGeneration"] = source_generation
-            record(name + "-start", call("start", dict(source, timeoutSeconds=240), name + "-start"))
+            first_start = call("start", dict(source, timeoutSeconds=240), name + "-start")
+            record(name + "-start", first_start)
+            pool = ThreadPoolExecutor(max_workers=2) if args.game_test_runs else None
+            game_tests = [pool.submit(call, "gametest", {"runId": f"gametest-{index}", "owner": args.task_id,
+                          "artifactId": bundle["artifactId"], "timeoutSeconds": 240, "acceptEula": True}, f"gametest-{index}")
+                          for index in range(args.game_test_runs)]
+            if game_tests:
+                deadline = time.monotonic() + 240
+                while True:
+                    records = runs([f"gametest-{index}" for index in range(args.game_test_runs)])
+                    if all(value is not None and value["identity"] is not None for value in records):
+                        for value in records:
+                            runtime_process.require_identity(value["identity"], runtime_process.identity(value["identity"]["pid"]))
+                        record("gametest-jvms-running", {"runIds": [value["runId"] for value in records]})
+                        break
+                    assert not any(future.done() for future in game_tests), "併走前にGameTestが終了・失敗しました"
+                    assert time.monotonic() < deadline, "GameTestの併走開始期限を超過しました"
+                    time.sleep(0.1)
             reply = rcon(source, "se managedfixture create " + name)
             assert "fixture verified: " + name in reply, reply
             record(name + "-create-api", {"reply": reply})
-            record(name + "-source-stop", call("stop", dict(source, timeoutSeconds=180), name + "-source-stop"))
+            first_stop = call("stop", dict(source, timeoutSeconds=180), name + "-source-stop")
+            record(name + "-source-stop", first_stop)
+            if args.restart_only:
+                second_start = call("start", dict(source, timeoutSeconds=240), name + "-restart")
+                record(name + "-restart", second_start)
+                reply = rcon(source, "se managedfixture verify " + name)
+                assert "fixture verified: " + name in reply, reply
+                second_stop = call("stop", dict(source, timeoutSeconds=180), name + "-restart-stop")
+                record(name + "-restart-stop", second_stop)
+                diagnostics = args.root / "instances" / source["instanceId"] / "diagnostics"
+                created = json.loads((diagnostics / first_start["runId"] / f"fixture-{name}-create.json").read_text())
+                verified = json.loads((diagnostics / second_start["runId"] / f"fixture-{name}-verify.json").read_text())
+                verify_restart(created, verified, first_stop, second_stop)
+                record(name + "-restart-verified", {"api": True, "sameGeneration": True, "separateNonce": True,
+                       "fixture": created, "firstStop": first_stop, "secondStop": second_stop})
+                try:
+                    for index, future in enumerate(game_tests):
+                        record(f"gametest-{index}", future.result())
+                finally:
+                    if pool is not None:
+                        pool.shutdown(wait=True)
+                        pool = None
+                if game_tests:
+                    overlap = verify_overlap(runs([first_start["runId"], "gametest-0", "gametest-1"]))
+                    record("three-jvms-overlapped", overlap)
+                call("release", source, name + "-release-source")
+                call("release", other, name + "-release-other")
+                continue
+            if pool is not None:
+                pool.shutdown(wait=True)
+                pool = None
             private_id, candidate_id, validation_id = name + "-private", name + "-candidate", name + "-validation"
             call("snapshot", dict(source, action="create", snapshotId=private_id), name + "-private")
             call("snapshot", dict(source, action="candidate", snapshotId=candidate_id, sourceSnapshotId=private_id), name + "-candidate")
@@ -143,6 +234,9 @@ def main():
     except BaseException as error:
         record("failure-preserved", {"type": type(error).__name__, "message": str(error), "automaticKillOrRetry": False})
         raise
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
 
 
 if __name__ == "__main__":
