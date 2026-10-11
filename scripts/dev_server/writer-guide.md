@@ -2,7 +2,7 @@
 
 RUNNINGの固定世代へManagerを接続し、停止・保存・切断の境界を扱うガイドです。
 貸出は[監督・貸出](supervisor-guide.md)、JVM保存・終了は[runtime制御](runtime-control-guide.md)を参照してください。
-snapshot/restore/recoverは実装せず、この接続だけでsnapshot cleanを証明しません。
+この接続だけでsnapshot cleanを証明しません。正常停止したデータの保存は[snapshotガイド](snapshot-guide.md)に従います。
 
 ## 接続と識別
 
@@ -68,9 +68,9 @@ read-only socketもpeer Closeを確認し、drained/disconnectedが揃ったと�
 supervisor再起動時には枠をRECOVERY_REQUIREDにし、復旧機能が接続されるまで保留します。
 
 statusのwriters/writerSessionsは登録正本です。runtimeStopProofとwriter不在の両方が揃ったときだけcleanEligibleを返します。
-これは次の検証へ進める候補判定でありsnapshotCleanは常にfalseです。
+これはsnapshot作成へ進める候補判定です。snapshotCleanはsnapshot作成の全検証が成功した後だけtrueになります。
 同一OSユーザーの非協調的な直接編集、登録外writer、FS停電耐久性の証明は含みません。
-Registry DB/INITIALIZEDはversion=3です。旧開発DBは拒否・保全し、移行や既存rootの上書きは行いません。
+Registry DB/INITIALIZEDはversion=4です。旧開発DBは拒否・保全し、移行や既存rootの上書きは行いません。
 試験には新しい空rootを用意してください。
 
 ## 自動検証

@@ -73,6 +73,10 @@ CREATE TABLE writer_sessions(
 CREATE TABLE writer_operations(
  id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, session TEXT NOT NULL, command TEXT NOT NULL,
  status TEXT NOT NULL, response TEXT NOT NULL);
+CREATE TABLE snapshot_operations(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+ instance TEXT NOT NULL, status TEXT NOT NULL, response TEXT NOT NULL);
+CREATE TABLE snapshots(id TEXT PRIMARY KEY, artifact TEXT NOT NULL, manifest_hash TEXT NOT NULL,
+ operation TEXT NOT NULL UNIQUE, created REAL NOT NULL);
 """
 
 
@@ -129,7 +133,7 @@ def initialize(inventory: dict, *, operation_id: str, dry_run: bool = False) -> 
         connection.execute("PRAGMA synchronous=FULL")
         connection.executescript(SCHEMA)
         with connection:
-            connection.execute("INSERT INTO meta VALUES ('schemaVersion','3')")
+            connection.execute("INSERT INTO meta VALUES ('schemaVersion','4')")
             connection.execute("INSERT INTO meta VALUES ('initOperation',?)", (operation_id,))
             digest = hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
             connection.execute("INSERT INTO meta VALUES ('inventoryHash',?)", (digest,))
@@ -141,7 +145,7 @@ def initialize(inventory: dict, *, operation_id: str, dry_run: bool = False) -> 
         connection.close()
     make_private(database)
     marker = root / "manager" / "INITIALIZED"
-    marker.write_text("registry-v3\n", encoding="utf-8")
+    marker.write_text("registry-v4\n", encoding="utf-8")
     make_private(marker)
     return {"initialized": True, "instances": [row["instanceId"] for row in inventory["instances"]]}
 
@@ -159,7 +163,7 @@ class Registry:
             require_private(directory, directory=True)
         for name in ("inventory.json", "registry.sqlite", "INITIALIZED"):
             require_private(root / "manager" / name)
-        require((root / "manager" / "INITIALIZED").read_text(encoding="utf-8") == "registry-v3\n",
+        require((root / "manager" / "INITIALIZED").read_text(encoding="utf-8") == "registry-v4\n",
                 "RECOVERY_REQUIRED", "初期化が完了していません")
         self.inventory = json.loads((root / "manager" / "inventory.json").read_text(encoding="utf-8"))
         validate("inventory", self.inventory)
@@ -167,7 +171,7 @@ class Registry:
         with self.transaction(read_only=True) as connection:
             meta = dict(connection.execute("SELECT key,value FROM meta"))
             digest = hashlib.sha256(json.dumps(self.inventory, sort_keys=True).encode()).hexdigest()
-            require(meta.get("schemaVersion") == "3" and meta.get("inventoryHash") == digest,
+            require(meta.get("schemaVersion") == "4" and meta.get("inventoryHash") == digest,
                     "RECOVERY_REQUIRED", "Registryとinventoryが一致しません")
             actual_ids = {row[0] for row in connection.execute("SELECT id FROM instances")}
             declared_ids = {row["instanceId"] for row in self.inventory["instances"]}
@@ -179,6 +183,8 @@ class Registry:
         self.runtime = RuntimeControl(self)
         from .writer_control import WriterControl
         self.writer = WriterControl(self)
+        from .snapshot_control import SnapshotControl
+        self.snapshot = SnapshotControl(self)
 
     @contextmanager
     def transaction(self, *, read_only: bool = False):
@@ -253,6 +259,8 @@ class Registry:
 
     def execute(self, command: str, payload: dict, *, operation_id: str, dry_run: bool = False) -> dict:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
+        if command == "snapshot":
+            return self.snapshot.execute(payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"writer-open", "writer-io", "writer-close"}:
             return self.writer.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"prepare", "start", "stop"}:
@@ -277,10 +285,12 @@ class Registry:
                 result = [{"instanceId": row["id"], "state": row["state"], "generation": row["generation"],
                            "epoch": row["epoch"], "owner": row["owner"], "leaseExpired": bool(row["lease"] and row["expires"] <= self.clock()),
                            "generationBound": bool(row["generation_bound"]),
-                           "runtimeStopProof": bool(row["runtime_proof"]), "snapshotClean": False,
+                           "runtimeStopProof": bool(row["runtime_proof"]),
+                           "snapshotClean": bool(row["clean_proof"]) and row["state"] == "LEASED_STOPPED"
+                                            and not any(row[key] for key in ("writers", "children", "pending")),
                            **self.writer.summary(connection, row)} for row in rows]
                 return {"instances": result, "supervisor": "reachable", "ports": "inventory-and-runtime-reservations",
-                        "unimplemented": ["snapshot", "restore", "recover", "gc"]}
+                        "unimplemented": ["restore", "recover", "gc"]}
             cached = connection.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
             require(not connection.execute("SELECT 1 FROM reference_operations WHERE id=?", (operation_id,)).fetchone(),
                     "OPERATION_CONFLICT", "同じoperationIdが参照予約で使用されています")
@@ -288,6 +298,8 @@ class Registry:
                     "OPERATION_CONFLICT", "同じoperationIdがruntime操作で使用されています")
             require(not connection.execute("SELECT 1 FROM writer_operations WHERE id=?", (operation_id,)).fetchone(),
                     "OPERATION_CONFLICT", "同じoperationIdがwriter操作で使用されています")
+            require(not connection.execute("SELECT 1 FROM snapshot_operations WHERE id=?", (operation_id,)).fetchone(),
+                    "OPERATION_CONFLICT", "同じoperationIdがsnapshot操作で使用されています")
             if cached:
                 require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "同じoperationIdに異なるpayloadを指定できません")
                 result = json.loads(cached["response"])
@@ -352,6 +364,8 @@ class Registry:
                     "OPERATION_CONFLICT", "同じoperationIdがruntime操作で使用されています")
             require(not connection.execute("SELECT 1 FROM writer_operations WHERE id=?", (operation_id,)).fetchone(),
                     "OPERATION_CONFLICT", "同じoperationIdがwriter操作で使用されています")
+            require(not connection.execute("SELECT 1 FROM snapshot_operations WHERE id=?", (operation_id,)).fetchone(),
+                    "OPERATION_CONFLICT", "同じoperationIdがsnapshot操作で使用されています")
             recorded = connection.execute("SELECT * FROM reference_operations WHERE id=?", (operation_id,)).fetchone()
             if recorded:
                 require(recorded["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "参照予約のoperationIdが別の入力で使用されています")
