@@ -32,23 +32,23 @@ def plain_path(path: Path) -> None:
             raise OSError("管理パスは通常ファイル・ディレクトリに限定します")
 
 
-def make_private(path: Path, *, directory: bool = False) -> None:
+def make_private(path: Path, *, directory: bool = False, executable: bool = False) -> None:
     if os.name == "nt":
         from .windows_security import make_private as protect
         protect(path, directory=directory)
     else:
-        path.chmod(0o700 if directory else 0o600)
-        require_private(path, directory=directory)
+        path.chmod(0o700 if directory or executable else 0o600)
+        require_private(path, directory=directory, executable=executable)
 
 
-def require_private(path: Path, *, directory: bool = False) -> None:
+def require_private(path: Path, *, directory: bool = False, executable: bool = False) -> None:
     plain_path(path)
     if os.name == "nt":
         from .windows_security import require_private as check
         check(path=path)
     else:
         info = path.lstat()
-        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != (0o700 if directory else 0o600):
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != (0o700 if directory or executable else 0o600):
             raise PermissionError("管理資源は所有者限定の権限にしてください")
 
 

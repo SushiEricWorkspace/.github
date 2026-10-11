@@ -6,6 +6,7 @@
 固定bundleの初回prepare・起動停止は[runtime制御ガイド](runtime-control-guide.md)を参照してください。
 Managerの管理接続と終了証明は[管理writerガイド](writer-guide.md)を参照してください。
 正常停止した全データの保存・完全性検証は[snapshotガイド](snapshot-guide.md)を参照してください。
+世代の構築・restore/reset・障害復旧は[世代ガイド](generation-guide.md)を参照してください。
 
 [ServerMod #525](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/525)の契約・fixtureを管理します。
 確定設計は[#524](https://github.com/SushiEricWorkspace/SushiEricServerMod/issues/524)、
@@ -37,7 +38,8 @@ Minecraftワールド、NBT、独自定義YAML、JARを実生成しません。
 管理CLI `scripts/dev-server.py`の初期化・監督・貸出は実装済みです。
 固定bundleの初回prepare・JVM起動停止・Mod保存/終了証跡照合を実装しています。
 協調Managerの世代固定writerを登録し、正常停止・writer不在を固定したprivate snapshotの作成・検証を行います。
-restore/recover/gcは未実装です。管理外の非協調writerや停電耐性を証明せず、総合受入前の運用導入は行いません。
+prepare/restore/resetの世代構築とrecoverを実装しています。テンプレート登録・GCは後続の範囲です。
+管理外の非協調writerや停電耐性を証明せず、総合受入前の運用導入は行いません。
 既存worktreeやrun/への操作は行いません。
 
 ## テスト結果の扱い

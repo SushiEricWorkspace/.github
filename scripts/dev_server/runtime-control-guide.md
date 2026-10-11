@@ -2,7 +2,7 @@
 
 初回prepareから、固定したLoom開発bundleの起動・RCON正常停止までを扱います。
 [監督・貸出](supervisor-guide.md)、[runtime出力](runtime-export-guide.md)を先に確認してください。
-snapshot・外部writer・世代置換/復旧エンジンは扱いません。
+snapshot・外部writerは別ガイド、世代構築/置換/復旧は[世代ガイド](generation-guide.md)を参照してください。
 
 ## 入力と初回prepare
 
@@ -38,10 +38,10 @@ IPC期限はそれらと検証・コピー時間を含む長さにしてくだ�
 dry-runは条件照合だけで、DB、世代、予約、補助ファイル、プロセス、socketを作成しません。
 dry-runの成功は実行時の空きport保証ではありません。
 
-初回prepareはgenerations/<generationId>/にruntime/、config/、server.properties、eula.txt、
-generation.jsonを新規作成し、active.jsonとDBへ同じ世代/固定artifactを記録します。
+初回prepareも共通世代エンジンでstagingへruntime/、config/、server.properties、eula.txt、
+generation.jsonを構築し、全hash照合後にactive.jsonとDBへ同じ世代/固定artifactを記録します。
 途中失敗は部分データと参照予約を保全してRECOVERY_REQUIREDへ移します。
-初回の記録は世代置換journalの代替ではなく、既存世代へのprepare/restore/resetは後続#533まで拒否します。
+既存世代へのprepareは拒否します。restore/resetとjournal復旧は[世代ガイド](generation-guide.md)に従います。
 
 ## 起動照合と予約
 
@@ -98,9 +98,9 @@ start失敗の後始末も自身の識別とRCON所有を確認できた場合�
 監督再起動では全枠を保留し、復旧エンジンが接続されるまで二重起動しません。
 
 runtimeStopProof=trueだけではsnapshotCleanはtrueになりません。[snapshotガイド](snapshot-guide.md)の全検証が別途必要です。
-協調Managerのwriter終了は[管理writerガイド](writer-guide.md)、世代引継ぎ・復旧は#533の責務です。
+協調Managerのwriter終了は[管理writerガイド](writer-guide.md)、世代引継ぎ・復旧は[世代ガイド](generation-guide.md)に従います。
 同一ユーザーの非協調的な直接編集や、Job/group外の管理外writerをこのadapterの終了証明へ含めません。
-snapshot/restore/gc、実データ枠のreleaseはこの証明だけで許可しません。
+snapshot/restore、実データ枠のreleaseには外部writer終了と世代照合も必要です。GCは未実装です。
 
 ## 検証
 

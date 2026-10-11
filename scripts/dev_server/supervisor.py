@@ -33,12 +33,12 @@ def dispatch(registry: Registry, message: dict) -> dict:
         if type(command) is not str:
             raise RegistryError("INVALID_INPUT", "commandは文字列で指定してください")
         payload = message["payload"]
-        if command in {"acquire", "release", "prepare", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-close"} and type(payload) is dict and "instanceId" in payload:
+        if command in {"acquire", "release", "prepare", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-close"} and type(payload) is dict and "instanceId" in payload:
             instance = identifier(payload["instanceId"], "instanceId")
             if instance not in {row["instanceId"] for row in registry.inventory["instances"]}:
                 raise RegistryError("NOT_FOUND", "instanceが登録されていません")
             with private_lock(registry.root / "manager" / "locks" / f"instance-{instance}.lock"):
-                if command == "prepare" or command == "snapshot":
+                if command in {"prepare", "restore", "reset", "recover", "snapshot"}:
                     with private_lock(registry.root / "manager" / "locks" / "deployment.lock"):
                         result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
                 else:

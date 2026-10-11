@@ -8,10 +8,10 @@ Python 3.12を使用し、macOSとWindowsで同じCLI・Registryを使います�
 ## 検証境界
 
 初回prepare・固定bundleからのstart/stopは[runtime制御ガイド](runtime-control-guide.md)に従います。
-snapshotの作成・検証は[snapshotガイド](snapshot-guide.md)に従います。restore/recover/gcは`NOT_IMPLEMENTED`です。doctor/statusはRUNNINGの所有識別・Mod証跡・
+snapshotの作成・検証は[snapshotガイド](snapshot-guide.md)、restore/reset/recoverは[世代ガイド](generation-guide.md)に従います。GCは未実装です。doctor/statusはRUNNINGの所有識別・Mod証跡・
 実socketを再照合します。協調Managerのwriterは[管理writerガイド](writer-guide.md)で登録・終了を照合しますが、
 管理外の非協調writerやFSの停電耐久性を証明しません。
-実データを持つ枠のreleaseも、外部writer・世代引継ぎの照合を接続するまで拒否します。
+実データ枠のreleaseは正常停止・writer終了・世代一致を照合してから行い、データは残してleaseから切り離します。
 総合受入と運用者の設定が揃うまで既存環境を置き換えず、運用を有効化しません。
 
 ## 初期化
@@ -82,14 +82,14 @@ renewでは`ttlSeconds`を追加します。新ownerの`generationBound`はfalse
 
 CLI終了・期限切れでleaseを自動回収しません。期限切れのrenew/releaseも拒否し、後続recoverの確認が必要です。
 supervisor再起動では、空いていた枠も含め全枠を`RECOVERY_REQUIRED`へ移します。
-現段階のrecoverは未実装なので、DBを手編集して貸出を強行しません。
+recoverで停止証跡・journal・実体を照合します。DB手編集で貸出を強行しません。
 `shutdown`は監督だけを終了して全枠を復旧待ちにする補助操作です。leaseは解放されません。
 Minecraftの停止コマンドではなく、同一rootの監督停止にだけ使います。
 runtime操作進行中は`BUSY`です。監督終了でJVM/childをkillする設定はありません。
 shutdownもoperationIdを記録し、他の変更とのID衝突を拒否します。
 前回の監督を停止した要求の再送は`STALE_SUPERVISOR`となり、再起動した監督を停止しません。
 
-AVAILABLEのacquireのみ、停止した空枠のreleaseのみを許可します。
+AVAILABLEのacquireのみ、停止した空枠または正常停止・writer終了を検証したデータ枠のreleaseを許可します。
 writer/child/pending/参照予約が残る場合もrelease不可です。
 参照予約は`Registry.reserve_references`/`finish_reservation`を後続エンジンから呼び、
 参照集合を整列して短いtransactionで記録します。コピー中にDB transactionを保持しません。
@@ -99,7 +99,7 @@ writer/child/pending/参照予約が残る場合もrelease不可です。
 
 - macOS: owner限定dir 0700、socket 0600、接続の両側でpeer UID、flock。
 - Windows: owner SIDだけの保護DACL、`PIPE_REJECT_REMOTE_CLIENTS`、byte-range lock。
-- 両方: singleton OS lockを監督期間中保持。枠の変更はinstance OS lock、prepareコピーはdeployment OS lockも保持。
+- 両方: singleton OS lockを監督期間中保持。枠の変更はinstance OS lock、世代コピー・snapshot・復旧はdeployment OS lockも保持。
   renewはlease/epoch/世代を検証する短いDB更新だけで、長いruntime操作中も有効期限を更新できます。
   最大4要求を扱い、監督内のDB transactionだけを直列化します。コピー・OS照合・RCON待機中はDBを保持しません。
 - IPCは64KiB以下のJSON bytesだけ。pickleの復元、秘密を含むpayloadのログ出力は行いません。
