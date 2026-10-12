@@ -80,7 +80,9 @@
 - 同一タスクの担当交代はownerを引き継ぐ。別worktreeを追加して同じタスクを二重実行しない。Gitのworktree lockは編集排他ではない。owner記録は同一ユーザー間の協調契約であり、他ownerは直接書き込まない。
 - 既存branch/worktreeを上書きしない。未コミット変更がある作業の引継ぎ・削除は拒否する。途中失敗や登録不一致は既存の実体を残し、勝手に修復・強制削除しない。
 - タスクworktreeへ`run/`や`.idea/`を複製しない。`build/`とプロジェクト`.gradle/`はworktreeごとに独立する。サーバーの永続instance、snapshot、artifactはworktreeの削除対象にしない。
-- 削除はtask-idと現在ownerを明示して行う。worktreeをディレクトリ削除や広範囲のpruneで片付けない。branchは自動削除されないため、マージと削除の許可を確認して別途削除する。
+- 削除はtask-idと現在ownerを明示して行う。worktreeをディレクトリ削除、force、広範囲のpruneで片付けない。worktree削除だけの指示からbranch削除の許可は推定しない。
+- 特定branchの作業専用に作成したworktreeは、対象branchの削除を指示された場合、保持する明示指示がなければ一緒に削除する。branch削除指示は対応する専用worktreeの削除許可を含むため、同じ許可を改めて求めない。Git一覧と管理記録でrepo、branch、専用worktree、task-id、ownerを照合し、worktreeを管理手順で先に削除してからbranchを削除する。primary、共有・固定AI用、他branch用のworktreeは対象に含めない。複数repoのtaskでは指示対象外のworktreeをまとめて削除しない。
+- 未コミット変更、保全が必要な追跡外・ignoredデータ、他ownerの作業継続、登録不一致、削除失敗がある場合はworktreeとbranchを保全し、原因と残り作業を報告する。未許可のプロセス終了や独断の登録修復で回避しない。
 - 移行中の既存`<repo>-claude/`・`<repo>-codex/`は自動移動・削除しない。進行中の作業は担当の固定worktreeで完了できる。作業branch削除後は最新の`origin/main`または`origin/develop`でdetached HEADへ戻す。新規タスクはタスクworktreeで開始する。
 - 共通ルールの同期先は`scripts/sync-agent-rules.py --repo-root REPO=PATH`で明示する。タスク作業から人間・他AIのAGENTS.mdへ暗黙に同期しない。
 - worktreeスキルの原本は`.github/skills/worktree/SKILL.md`とする。ローカル配置する場合は原本を使用し、`.claude/`等の配置先をコミットしない。

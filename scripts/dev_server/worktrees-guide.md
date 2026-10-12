@@ -38,7 +38,12 @@ python3.12 -B scripts/setup-worktrees.py --remove --task-id issue-123-a --owner 
 ignoredデータは再生成可能な`build/`・`.gradle/`内の通常ファイルだけ削除対象にできます。
 `run/`などその他のignoredデータがあれば止まります。必要なデータを別途保全してから再実行してください。
 サーバー実行データの`minecraft-dev/`、artifact、snapshot、instanceは操作しません。
-branchや登録履歴は残ります。マージ後のbranch削除は別操作です。
+worktree削除だけの指示ではbranchや登録履歴は残ります。
+特定branch専用のworktreeは、branch削除を指示された場合、保持指示がなければ一緒に削除します。
+Git一覧と管理記録で対象を照合し、worktreeを先に管理手順で削除してからbranchを削除してください。
+primary、共有・固定AI用、他branch用のworktreeは対象外です。
+`--remove`はtask内の全repoを対象にするため、一部repoだけのbranch削除指示で他repoを巻き込まないでください。
+未コミット変更、保全データ、他ownerの作業継続、登録不一致、削除失敗があればworktreeとbranchを保全し、原因と残り作業を報告します。
 
 途中失敗は`RECOVERY_REQUIRED`となり、部分的に作成したworktreeも保全します。
 登録済みの実体が検証できる場合のみ、ownerを明示した削除を再実行できます。
