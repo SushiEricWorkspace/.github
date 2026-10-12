@@ -86,6 +86,10 @@ recoverで停止証跡・journal・実体を照合します。DB手編集で貸�
 `shutdown`は監督だけを終了して全枠を復旧待ちにする補助操作です。leaseは解放されません。
 Minecraftの停止コマンドではなく、同一rootの監督停止にだけ使います。
 runtime操作進行中は`BUSY`です。監督終了でJVM/childをkillする設定はありません。
+人間用入口にはshutdown-idleを用意します。payloadはexpectedBootIdだけを指定し、
+全枠AVAILABLE・貸出/writer/child/pending不在、進行中の要求/GC不在をRegistry内で照合します。
+停止確定後は新しい要求を拒否します。人間用入口は生成した監督のnative所有識別も照合します。
+
 shutdownもoperationIdを記録し、他の変更とのID衝突を拒否します。
 前回の監督を停止した要求の再送は`STALE_SUPERVISOR`となり、再起動した監督を停止しません。
 
