@@ -158,6 +158,7 @@ class Registry:
         self.db_lock = threading.RLock()
         self.resource_users = 0
         self.gc_active = False
+        self.stopping = False
         if os.name == "nt":
             from .windows_security import require_local_volume
             require_local_volume(root)
@@ -195,9 +196,10 @@ class Registry:
         self.gc = GcControl(self)
 
     @contextmanager
-    def resource_use(self, *, exclusive=False):
+    def resource_use(self, *, exclusive=False, allow_stopping=False):
         """参照を使用する操作とGCを調停する。通常操作同士は並列実行できる。"""
         with self.db_lock:
+            require(not self.stopping or allow_stopping, "BUSY", "監督停止中は新しい操作を開始できません")
             require(not self.gc_active and (not exclusive or self.resource_users == 0),
                     "BUSY", "参照を使用する操作またはGCが進行中です")
             if exclusive:
@@ -274,7 +276,7 @@ class Registry:
                     "PROOF_REQUIRED", "正常停止・writer終了の証跡が必要です")
 
     def _cached_valid(self, connection, command, payload, result):
-        if command == "shutdown":
+        if command in {"shutdown", "shutdown-idle"}:
             boot = connection.execute("SELECT value FROM meta WHERE key='supervisorBoot'").fetchone()
             require(boot is not None and boot[0] == result["bootId"],
                     "STALE_SUPERVISOR", "前の監督に対する停止要求を再適用できません")
@@ -290,14 +292,17 @@ class Registry:
 
     def execute(self, command: str, payload: dict, *, operation_id: str, dry_run: bool = False) -> dict:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
-        with self.resource_use(exclusive=command == "gc"):
+        with self.resource_use(exclusive=command in {"gc", "shutdown-idle"}, allow_stopping=command == "shutdown-idle"):
             if command == "gc":
                 return self.gc.execute(payload, operation_id=operation_id, dry_run=dry_run)
-            if command not in {"stop", "list", "status", "doctor", "shutdown", "renew", "writer-close"}:
+            if command not in {"stop", "list", "status", "doctor", "shutdown", "shutdown-idle", "renew", "writer-close"}:
                 with self.transaction(read_only=True) as connection:
                     require(not connection.execute("SELECT 1 FROM runtime_operations WHERE command='gc-apply' AND status!='COMPLETED'").fetchone(),
                             "RECOVERY_REQUIRED", "GCの途中証跡を照合するまで新しい参照操作を開始できません")
-            return self._execute(command, payload, operation_id=operation_id, dry_run=dry_run)
+            result = self._execute(command, payload, operation_id=operation_id, dry_run=dry_run)
+            if command == "shutdown-idle" and result.get("shutdown") and not dry_run:
+                self.stopping = True
+            return result
 
     def _execute(self, command, payload, *, operation_id, dry_run):
         if command == "gametest":
@@ -312,13 +317,13 @@ class Registry:
             return self.runtime.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"list", "status", "doctor"} and not dry_run:
             self.runtime.refresh()
-        mutations = {"acquire", "renew", "release", "shutdown"}
+        mutations = {"acquire", "renew", "release", "shutdown", "shutdown-idle"}
         require(command in mutations | {"list", "status", "doctor", "lease-check"}, "NOT_IMPLEMENTED", "この操作は未実装です")
         identifier(operation_id, "operationId")
         required = {"acquire": {"instanceId", "owner", "ttlSeconds"},
                     "renew": {"instanceId", "leaseId", "epoch", "expectedGeneration", "ttlSeconds"},
                     "release": {"instanceId", "leaseId", "epoch", "expectedGeneration"},
-                    "list": set(), "status": {"instanceId"}, "doctor": set(), "shutdown": set(),
+                    "list": set(), "status": {"instanceId"}, "doctor": set(), "shutdown": set(), "shutdown-idle": {"expectedBootId"},
                     "lease-check": {"instanceId", "leaseId", "epoch", "expectedGeneration", "owner"}}
         fields(payload, required[command])
         if command == "lease-check":
@@ -372,16 +377,20 @@ class Registry:
                 require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "同じoperationIdに異なるpayloadを指定できません")
                 result = json.loads(cached["response"])
                 self._cached_valid(connection, command, payload, result)
-                if command == "shutdown":
+                if command in {"shutdown", "shutdown-idle"}:
                     return dict(result, shutdown=not dry_run, replayed=True, dryRun=dry_run)
                 return dict(result, replayed=True, dryRun=dry_run)
-            if command == "shutdown":
+            if command in {"shutdown", "shutdown-idle"}:
                 require(not connection.execute("SELECT 1 FROM runtime_operations WHERE command='gametest' AND status IN ('PENDING','RECOVERY_REQUIRED')").fetchone(),
                         "BUSY", "GameTestの実行または所有確認が未完了のため監督を停止できません")
                 require(not connection.execute("SELECT 1 FROM instances WHERE pending != 0 AND state != 'RECOVERY_REQUIRED'").fetchone(),
                         "BUSY", "進行中runtime操作があるため監督を終了できません")
                 boot = connection.execute("SELECT value FROM meta WHERE key='supervisorBoot'").fetchone()
                 require(boot is not None, "INVALID_STATE", "監督の起動識別がありません")
+                if command == "shutdown-idle":
+                    require(payload["expectedBootId"] == boot[0], "STALE_SUPERVISOR", "所有した監督の起動識別が一致しません")
+                    require(not connection.execute("SELECT 1 FROM instances WHERE lease IS NOT NULL OR writers != 0 OR children != 0 OR pending != 0 OR state != 'AVAILABLE'").fetchone(),
+                            "BUSY", "他枠の貸出・writer・未完了操作または復旧待ちがあり監督を停止できません")
                 if dry_run:
                     return {"dryRun": True, "wouldExecute": command}
                 result = {"shutdown": True, "bootId": boot[0]}

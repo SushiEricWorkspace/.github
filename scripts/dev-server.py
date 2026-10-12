@@ -22,7 +22,7 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 def main() -> int:
     parser = JsonArgumentParser(description="分離テスト環境の管理（macOS/Windows、Python 3.12）")
-    parser.add_argument("command", choices=("init", "supervise", "ssh-broker", "doctor", "list", "status", "lease-check", "acquire", "renew", "release", "shutdown",
+    parser.add_argument("command", choices=("init", "supervise", "ssh-broker", "doctor", "list", "status", "lease-check", "acquire", "renew", "release", "shutdown", "shutdown-idle",
                                            "prepare", "start", "stop", "snapshot", "restore", "reset", "recover", "gc",
                                            "writer-open", "writer-io", "writer-check", "writer-close", "gametest"))
     parser.add_argument("--root", type=Path, required=True)

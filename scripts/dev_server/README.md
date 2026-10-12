@@ -4,6 +4,7 @@
 固定した開発runtimeを出力する場合は[runtime出力ガイド](runtime-export-guide.md)を参照してください。
 宣言設定・貸出Registry・supervisorを扱う場合は[監督・貸出ガイド](supervisor-guide.md)を参照してください。
 固定bundleの初回prepare・起動停止は[runtime制御ガイド](runtime-control-guide.md)を参照してください。
+人間用の一括起動・状態確認・保存停止は[一括操作ガイド](human-server-guide.md)を参照してください。
 管理接続の固定設定・短命の貸出引継ぎは[接続プロファイルガイド](connection-profile-guide.md)を参照してください。
 別PCからの開発用接続と切断証跡は[SSH仲介ガイド](ssh-guide.md)を参照してください。
 Managerの管理接続と終了証明は[管理writerガイド](writer-guide.md)を参照してください。

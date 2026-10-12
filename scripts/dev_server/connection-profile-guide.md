@@ -4,7 +4,7 @@ Managerと人間用起動入口の共通契約です。貸出とwriterの正本�
 [管理CLI](supervisor-guide.md)・[writer契約](writer-guide.md)です。
 別PCから同じ契約を使う場合は[SSH仲介ガイド](ssh-guide.md)を参照してください。
 固定設定を一度登録し、実行時はprofile ID・枠候補・借用または引継ぎを選びます。
-Manager画面への組込みはServerManager #196/#197、人間用一括起動は.github #16/#17、SSH仲介は #15で行います。
+Manager画面への組込みはServerManager #196/#197、人間用ローカル一括起動は[一括操作ガイド](human-server-guide.md)、OS別wrapper/SSH入口は.github #17、SSH仲介は #15で扱います。
 このIssueでは接続画面や起動停止の自動化を追加しません。
 
 ## 保存先と登録
