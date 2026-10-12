@@ -339,7 +339,7 @@ class WriterControlTests(unittest.TestCase):
 
     def test_stale_generation_epoch_nonce_and_secret_paths_are_rejected(self):
         self.open()
-        for key, value in (("epoch", 2), ("expectedGeneration", "generation-old"), ("nonce", "old-nonce"), ("runId", "old-run")):
+        for key, value in (("leaseId", "old-lease"), ("epoch", 2), ("expectedGeneration", "generation-old"), ("nonce", "old-nonce"), ("runId", "old-run")):
             payload = dict(self.binding, request={"action": "write", "path": "item_data/stats/shared.yml", "text": "late"})
             payload[key] = value
             self.assertFalse(self.command("writer-io", payload)["ok"])
@@ -361,6 +361,20 @@ class WriterControlTests(unittest.TestCase):
         self.assertFalse(self.status()["snapshotClean"])
         self.fixture.start("start-new")
         self.assertFalse(self.io(text="old-run")["ok"])
+
+    def test_native_writer_blocks_snapshot_and_restore_until_close(self):
+        self.open()
+        self.fixture.stop()
+        snapshot = self.command("snapshot", dict(self.fixture.token, action="create", snapshotId="blocked-snapshot"))
+        restore = self.command("restore", dict(self.fixture.token, artifactId=self.fixture.state()["artifact"],
+                                               generationId="blocked-generation", snapshotId="absent-snapshot", acceptEula=True))
+        for response in (snapshot, restore):
+            self.assertFalse(response["ok"], response)
+            self.assertEqual("PROOF_REQUIRED", response["error"]["code"])
+        self.assertEqual(1, self.status()["writers"])
+        self.assertFalse(self.status()["cleanEligible"])
+        self.assertTrue(self.command("writer-close", dict(self.binding, drained=True, disconnected=True))["ok"])
+        self.assertTrue(self.status()["cleanEligible"])
 
     def test_api_write_and_stop_share_lock_and_api_response_not_persisted(self):
         self.open()
