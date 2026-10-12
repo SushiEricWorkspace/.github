@@ -4,7 +4,7 @@ Managerと人間用起動入口の共通契約です。貸出とwriterの正本�
 [管理CLI](supervisor-guide.md)・[writer契約](writer-guide.md)です。
 別PCから同じ契約を使う場合は[SSH仲介ガイド](ssh-guide.md)を参照してください。
 固定設定を一度登録し、実行時はprofile ID・枠候補・借用または引継ぎを選びます。
-Manager画面への組込みはServerManager #196/#197、人間用ローカル一括起動は[一括操作ガイド](human-server-guide.md)、OS別wrapper/SSH入口は.github #17、SSH仲介は #15で扱います。
+Manager画面への組込みはServerManager #196/#197、人間用ローカル一括起動は[一括操作ガイド](human-server-guide.md)、OS別wrapper/SSH入口は[操作ガイド](human-entry-guide.md)、SSH仲介は #15で扱います。
 このIssueでは接続画面や起動停止の自動化を追加しません。
 
 ## 保存先と登録
@@ -51,7 +51,7 @@ python3.12 -B scripts/connection-profile.py check --directory /Users/example/con
 python3.12 -B scripts/connection-profile.py edit --directory /Users/example/connection-private < profile.json
 ```
 
-PowerShellでは `Get-Content -Raw -Encoding utf8 'C:\設定\profile.json' | & 'C:\Python312\python.exe' -B scripts/connection-profile.py register --directory 'C:\設定\connection-private'` を使用できます。
+PowerShellでは、パイプの日本語をUTF-8で渡すため `$OutputEncoding = [Text.UTF8Encoding]::new($false)` を設定してから `Get-Content -Raw -Encoding utf8 'C:\設定\profile.json' | & 'C:\Python312\python.exe' -B scripts/connection-profile.py register --directory 'C:\設定\connection-private'` を使用できます。
 `check`は保存記録の形式・権限検査だけで、ホストへの接続・Pythonの実バージョン・運用適合は確認しません。
 profileは`profiles/<profileId>.json`、短命情報は`handoffs/<handoffId>.json`に分離します。
 保存・編集途中の失敗ファイルは保全し、自動で消したり上書きして成功扱いにしたりしません。

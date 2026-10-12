@@ -1,7 +1,7 @@
 # 人間用の起動・正常停止入口
 
 Python 3.12で scripts/human-server.py を実行します。貸出・世代・保存の正本は[既存管理CLI](supervisor-guide.md)です。
-Windows/macOSのローカルprofileに対応し、OS別wrapper・SSH入口はIssue #17で追加します。
+Windows/macOSのlocal/SSH profileに対応します。OS別入口・初回setup・短い操作例は[操作ガイド](human-entry-guide.md)を参照してください。
 
 ## 初回設定と選択
 
@@ -63,7 +63,7 @@ python3.12 -B scripts/human-server.py handoff --directory /absolute/connection-p
 ~~~
 
 statusは接続アドレス・固定port・枠状態・writer・貸出期限・担当・途中要求・証跡先を表示します。
-logsは現在runのconsole.logの末尾最大64KiBを表示し、保持する貸出token・その世代のRCON秘密を伏せます。
+logsは現在runのconsole.logの末尾最大16KiBをresult.textへ返し、保持する貸出token・その世代のRCON秘密を伏せます。
 renew担当は明示したownerです。期限は既定3600秒でttl-secondsにより変更できます。
 自動renewサービスはありません。ownerがstatusのexpiresAtより前にrenewを実行し、
 Managerへの引継ぎ後も更新・正常停止・返却の責任を持ちます。端末の終了は返却を意味しません。

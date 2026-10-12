@@ -2,7 +2,7 @@
 
 承認済みSSH profileを使い、サーバーホスト上の一接続・一枠の仲介を介して既存supervisorを操作します。
 Python 3.12とOpenSSHクライアントを使用します。IPCは同一ユーザー専用、Management APIはloopbackのままです。
-Manager画面への組込みはServerManager #196/#197、人間用入口は別Issueの対象です。
+Manager画面への組込みはServerManager #196/#197、人間用入口は[操作ガイド](human-entry-guide.md)を参照してください。
 
 ## 接続条件
 
@@ -52,6 +52,7 @@ APIの`success: false`を変更しません。接続・protocol・timeoutの結�
 | --- | --- |
 | status/acquire/renew/lease-check/release | 通常CLIのpayload。接続に固定したinstanceIdだけを許可 |
 | prepare/restore/reset/start/stop/snapshot/recover | 通常CLIのpayloadと同じ貸出・世代検査を使用 |
+| human | command/owner/options/actionId/resume/targetClient。確認済みホストの共通HumanServerへ委譲。writer接続とは混在不可 |
 | open | token、owner、sessionId、runId、nonce。PID/cwdは受け取らず仲介自身を登録 |
 | io | `{"request": ...}`。[writer-I/O](writer-guide.md)の許可対象だけを委譲 |
 | monitor-open | `{"intervalTicks": 20}`。1〜1200tick、接続ごとに監視socketは一つ |
@@ -91,7 +92,14 @@ python3.12 -B -m unittest discover -s scripts -p 'test_*.py' -q
 
 macOSのテストプロセスには`TMPDIR=/private/tmp`を使用します。
 両OSで合成Registry、実native子プロセス/private IPC、実WebSocketの応答・peer Closeを検査します。
-Windowsのbinary標準stream中継はWindows上で検証し、macOSではその一件をskipします。
+Windowsのbinary標準stream・EOF前の二往復はWindows上で検証し、macOSではWindows native試験をskipします。
 別途許可したWindows→macOSの実SSHで、合成runtimeの貸出・prepare/start/renew、Unicode保存・読込、
 APIのsuccess保持、監視購読解除・peer Close、正常SSH終了、仲介自身のPID登録、切断後の貸出保持を確認しました。
-macOS→Windowsの実SSH往復、実Minecraft保存、Manager画面、本番運用は未検証です。
+この記録はIssue #15の検証範囲です。人間用入口による両OSの実Mod・実SSHの結果は、
+[Issue #17の検証記録](human-entry-guide.md#issue-17の検証記録)に記載します。Manager画面と本番運用は未検証です。
+
+## 人間用一括操作の応答
+
+humanの外側okはRPCの応答確定、result内のokは一括操作の成功を表します。内側の未完了はphase/actionId/operationId/evidenceを返し、貸出を自動解除しません。
+操作の再送は新しいSSH接続から同じclientId/actionIdと選択でresumeを明示します。接続journalのoperationIdは一接続内で再利用しません。
+一括操作のtokenとjournalはホスト側human-clientsへ、client側は固定選択と応答確定だけをprivateへ保存します。handoff材料はframe内だけで渡し、一回限りofferの正本はclientのConnectionStoreに一つだけ作ります。

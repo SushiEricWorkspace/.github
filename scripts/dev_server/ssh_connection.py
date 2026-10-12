@@ -19,13 +19,15 @@ def remote_command(profile):
     arguments = [profile["python"], "-B", profile["cli"], "ssh-broker", "--root", profile["managementRoot"]]
     if profile["targetOs"] == "macos":
         return "cd -- " + shlex.quote(str(PurePosixPath(profile["cli"]).parent)) + " && exec " + shlex.join(arguments)
-    # PowerShellのnativeパイプを通さず、子へ標準ハンドルをそのまま継承する。
-    bridge = """using System.Diagnostics;
+    # stdinは子へ引き継ぎ、PowerShellが再符号化するnative出力だけbyteのまま中継する。
+    bridge = """using System; using System.Diagnostics;
 public static class BrokerPipe {
  public static int Run(string executable, string arguments, string directory) {
-  var info = new ProcessStartInfo(executable, arguments) { UseShellExecute = false, WorkingDirectory = directory };
+  var info = new ProcessStartInfo(executable, arguments) { UseShellExecute = false,
+   RedirectStandardOutput = true, WorkingDirectory = directory };
   using (var process = Process.Start(info)) {
-   process.WaitForExit(); return process.ExitCode;
+   var output = process.StandardOutput.BaseStream.CopyToAsync(Console.OpenStandardOutput());
+   process.WaitForExit(); output.GetAwaiter().GetResult(); return process.ExitCode;
   }
  }
 }"""

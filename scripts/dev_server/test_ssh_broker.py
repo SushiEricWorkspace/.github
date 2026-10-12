@@ -115,6 +115,39 @@ class SshProtocolTests(unittest.TestCase):
             self.assertEqual(23, process.returncode, errors)
 
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows native双方向stream試験")
+    def test_windows_launcher_replies_before_input_eof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "dev-server.py"
+            script.write_text("import sys\nfor _ in range(2):\n b=sys.stdin.buffer.read(4)\n sys.stdout.buffer.write(b)\n sys.stdout.buffer.flush()\nsys.stdin.buffer.read()\n", encoding="utf-8")
+            profile = example_profile("windows", "ssh")
+            profile.update(python=sys.executable, cli=str(script))
+            process = subprocess.Popen(remote_command(profile).split(), stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+            response = []
+            received_before_eof = True
+            try:
+                for body in (b"\x00\xff\r\n", b"next"):
+                    reader = threading.Thread(target=lambda: response.append(process.stdout.read(4)))
+                    reader.start()
+                    process.stdin.write(body)
+                    process.stdin.flush()
+                    reader.join(10)
+                    if reader.is_alive():
+                        received_before_eof = False
+                        break
+            finally:
+                process.stdin.close()
+                process.wait(timeout=20)
+                reader.join(5)
+                process.stdout.close()
+                error = process.stderr.read()
+                process.stderr.close()
+            self.assertEqual(0, process.returncode, error)
+            self.assertTrue(received_before_eof, "入力EOF前に応答が届きません")
+            self.assertEqual([b"\x00\xff\r\n", b"next"], response)
+
+
 class MonitorPeer(ApiPeer):
     def run(self):
         self.requests = []

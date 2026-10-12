@@ -225,6 +225,7 @@ class HumanServerTests(unittest.TestCase):
         self.target.request("shutdown-idle", record["shutdown"]["payload"], "shutdown-record")
         with patch("dev_server.human_server.runtime_process.identity", return_value=None):
             result = self.target.shutdown(self.store)
+            self.assertEqual("STOPPED", self.target.shutdown(self.store)["state"])
         self.assertEqual("STOPPED", result["state"])
         self.assertEqual("STOPPED", self.store.read("supervisors", self.profile["profileId"])["state"])
 

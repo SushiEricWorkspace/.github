@@ -131,6 +131,20 @@ class RuntimeBundleTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             launch_command(deployed, "server", generation, auxiliary=first)
 
+    def test_unicode_classpath_uses_java_launcher_encoding(self):
+        bundle = self.freeze()
+        deployed = self.root / "日 空 ソ 表 bundle"
+        shutil.copytree(bundle, deployed)
+        run = self.root / "日 空 ソ 表 generation"
+        run.mkdir()
+        command = launch_command(deployed, "server", run)
+        encoding = "mbcs" if os.name == "nt" else "utf-8"
+        arguments = [json.loads(line.decode("latin-1")).encode("latin-1").decode(encoding)
+                     for line in Path(command[1][1:]).read_bytes().splitlines()]
+        classpath = arguments[arguments.index("-cp") + 1]
+        self.assertTrue(all(Path(entry).exists() for entry in classpath.split(os.pathsep)))
+        self.assertIn(str(run), arguments[0])
+
     def test_partial_management_properties_rejected_before_writing(self):
         bundle = self.freeze()
         run = self.root / "run"
