@@ -22,10 +22,13 @@ SCRIPT = Path(__file__).parents[1] / "connection-profile.py"
 def example_profile(target_os="windows", transport="local"):
     paths = {"windows": ("C:/開発 環境/root", "C:/Python312/python.exe", "C:/管理 tools/dev-server.py"),
              "macos": ("/Users/example/開発 環境/root", "/opt/python3.12", "/Users/example/管理 tools/dev-server.py")}[target_os]
-    return {"version": 1, "profileId": "test-dev", "displayName": "開発 環境", "transport": transport,
+    profile = {"version": 1, "profileId": "test-dev", "displayName": "開発 環境", "transport": transport,
             "targetOs": target_os, "host": "approved-dev", "managementRoot": paths[0], "python": paths[1],
             "cli": paths[2], "instances": [{"instanceId": "persistent-01", "displayName": "永続枠 1"}],
             "approval": {"operator": "test-operator", "reference": "架空の承認参照"}}
+    if transport == "ssh":
+        profile["sshUser"] = "approved-user"
+    return profile
 
 
 class ProfileContractTests(unittest.TestCase):

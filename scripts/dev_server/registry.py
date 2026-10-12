@@ -306,7 +306,7 @@ class Registry:
             return self.snapshot.execute(payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"prepare", "restore", "reset", "recover"}:
             return self.generation.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
-        if command in {"writer-open", "writer-io", "writer-close"}:
+        if command in {"writer-open", "writer-io", "writer-check", "writer-close"}:
             return self.writer.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"start", "stop"}:
             return self.runtime.execute(command, payload, operation_id=operation_id, dry_run=dry_run)

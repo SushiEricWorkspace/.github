@@ -2,6 +2,7 @@
 
 Managerと人間用起動入口の共通契約です。貸出とwriterの正本は
 [管理CLI](supervisor-guide.md)・[writer契約](writer-guide.md)です。
+別PCから同じ契約を使う場合は[SSH仲介ガイド](ssh-guide.md)を参照してください。
 固定設定を一度登録し、実行時はprofile ID・枠候補・借用または引継ぎを選びます。
 Manager画面への組込みはServerManager #196/#197、人間用一括起動は.github #16/#17、SSH仲介は #15で行います。
 このIssueでは接続画面や起動停止の自動化を追加しません。
@@ -22,6 +23,7 @@ Host設定、認証鍵、パスワード、passphrase、RCON password、API認�
   "profileId": "dev-mac",
   "displayName": "開発用 Mac",
   "transport": "ssh",
+  "sshUser": "approved-user",
   "targetOs": "macos",
   "host": "approved-dev-mac",
   "managementRoot": "/Users/example/開発 環境/minecraft-dev",
@@ -32,7 +34,8 @@ Host設定、認証鍵、パスワード、passphrase、RCON password、API認�
 }
 ```
 
-localの場合はtransportを`local`、hostを実行ホスト名にします。
+SSHの場合は`sshUser`で承認済みのログインユーザーを固定します。既存のSSH profileはこの項目を追加して明示編集してください。編集前の引継ぎはhash不一致で拒否されます。
+localの場合はtransportを`local`、hostを実行ホスト名にし、`sshUser`を指定しません。
 WindowsではtargetOsを`windows`にし、三つのパスを対象Windowsホストの絶対パスにします。
 例えば `C:\\開発 環境\\minecraft-dev` です。クライアントOSで遠隔パスをresolveしません。
 profile version=1の項目は全て必須・未知項目禁止で、枠候補のIDは重複できません。

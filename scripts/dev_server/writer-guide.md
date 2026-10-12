@@ -5,6 +5,7 @@ RUNNINGの固定世代へManagerを接続し、停止・保存・切断の境界
 この接続だけでsnapshot cleanを証明しません。正常停止したデータの保存は[snapshotガイド](snapshot-guide.md)に従います。
 
 固定設定・短命貸出の共通契約と責任分担は[接続プロファイルガイド](connection-profile-guide.md)を参照してください。
+別PCからの仲介は[SSH仲介ガイド](ssh-guide.md)を参照してください。
 現行Manager画面は以下の手動接続を使用し、共通契約への組込みはServerManager #196/#197で行います。
 
 ## 接続と識別
@@ -20,6 +21,9 @@ CLIの`writer-open`/`writer-io`/`writer-close`はoperationIdと以下の共通pa
 | instanceId/leaseId/epoch/expectedGeneration | 対象枠と貸出・世代 |
 | sessionId | 接続ごとに新規のID |
 | runId/nonce | statusで取得した起動識別 |
+
+`writer-check`は共通payloadだけでOPEN登録・native識別・RUNNINGを読み取り専用で照合します。
+登録や完了証跡を追加せず、終了済み・結果不明のwriterを監視の根拠にしません。
 
 openにはpid/startMillis/cwdを加えます。監督はnative PID・開始識別・boot・cwd・実行ファイル・command hash・OS ownerを記録し、
 操作ごとに再照合します。native照合、FS、通信はSQL write transaction外で行い、
