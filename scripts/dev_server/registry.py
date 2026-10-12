@@ -313,13 +313,29 @@ class Registry:
         if command in {"list", "status", "doctor"} and not dry_run:
             self.runtime.refresh()
         mutations = {"acquire", "renew", "release", "shutdown"}
-        require(command in mutations | {"list", "status", "doctor"}, "NOT_IMPLEMENTED", "この操作は未実装です")
+        require(command in mutations | {"list", "status", "doctor", "lease-check"}, "NOT_IMPLEMENTED", "この操作は未実装です")
         identifier(operation_id, "operationId")
         required = {"acquire": {"instanceId", "owner", "ttlSeconds"},
                     "renew": {"instanceId", "leaseId", "epoch", "expectedGeneration", "ttlSeconds"},
                     "release": {"instanceId", "leaseId", "epoch", "expectedGeneration"},
-                    "list": set(), "status": {"instanceId"}, "doctor": set(), "shutdown": set()}
+                    "list": set(), "status": {"instanceId"}, "doctor": set(), "shutdown": set(),
+                    "lease-check": {"instanceId", "leaseId", "epoch", "expectedGeneration", "owner"}}
         fields(payload, required[command])
+        if command == "lease-check":
+            require(not dry_run, "INVALID_INPUT", "貸出検査にdry-runの証明は使えません")
+            identifier(payload["owner"], "owner")
+            checked = self.runtime._row(payload)
+            if checked["state"] == "RUNNING":
+                self.runtime._running(checked)
+            with self.transaction(read_only=True) as connection:
+                row = self._instance(connection, payload["instanceId"])
+                self._token(row, payload)
+                require(row["owner"] == payload["owner"], "OWNER_MISMATCH", "貸出ownerが一致しません")
+                require(not row["pending"], "RECOVERY_REQUIRED", "未完了操作が残っています")
+                return {"instanceId": row["id"], "owner": row["owner"], "epoch": row["epoch"],
+                        "generation": row["generation"], "generationBound": bool(row["generation_bound"]),
+                        "expiresAt": row["expires"], "state": row["state"], "pending": row["pending"],
+                        **self.writer.summary(connection, row)}
         if command == "release":
             with self.transaction(read_only=True) as connection:
                 releasing = dict(self._instance(connection, payload["instanceId"]))
