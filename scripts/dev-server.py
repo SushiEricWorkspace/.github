@@ -22,9 +22,9 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 def main() -> int:
     parser = JsonArgumentParser(description="分離テスト環境の管理（macOS/Windows、Python 3.12）")
-    parser.add_argument("command", choices=("init", "supervise", "doctor", "list", "status", "lease-check", "acquire", "renew", "release", "shutdown",
+    parser.add_argument("command", choices=("init", "supervise", "ssh-broker", "doctor", "list", "status", "lease-check", "acquire", "renew", "release", "shutdown",
                                            "prepare", "start", "stop", "snapshot", "restore", "reset", "recover", "gc",
-                                           "writer-open", "writer-io", "writer-close", "gametest"))
+                                           "writer-open", "writer-io", "writer-check", "writer-close", "gametest"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--inventory", type=Path)
     parser.add_argument("--operation-id")
@@ -46,13 +46,18 @@ def main() -> int:
             if Path(inventory.get("managementRoot", "")) != args.root:
                 raise RegistryError("INVALID_INPUT", "--rootとinventory.managementRootが一致しません")
             response = {"ok": True, "operationId": operation_id, "result": initialize(inventory, operation_id=operation_id, dry_run=args.dry_run)}
+        elif args.command == "ssh-broker":
+            if args.dry_run or args.inventory is not None or args.operation_id is not None or args.payload != "{}" or args.payload_file is not None or args.payload_stdin:
+                raise RegistryError("INVALID_INPUT", "ssh-brokerは承認済みrootだけを指定してください")
+            from dev_server.ssh_broker import serve
+            return serve(args.root, sys.stdin.buffer, sys.stdout.buffer)
         elif args.command == "supervise":
             if args.dry_run or args.inventory is not None or args.payload != "{}" or args.payload_file is not None or args.payload_stdin:
                 raise RegistryError("INVALID_INPUT", "superviseは初期化済みrootだけを指定してください")
             supervise(args.root)
             return 0
         else:
-            if args.command in {"prepare", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-close", "gametest", "gc"} and operation_id is None:
+            if args.command in {"prepare", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-check", "writer-close", "gametest", "gc"} and operation_id is None:
                 raise RegistryError("INVALID_INPUT", "runtime操作には再送用の--operation-idを明示してください")
             if args.inventory is not None:
                 raise RegistryError("INVALID_INPUT", "--inventoryはinitだけで指定してください")

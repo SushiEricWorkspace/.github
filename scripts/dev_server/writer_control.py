@@ -6,7 +6,7 @@ import re
 import uuid
 
 from .build_inputs import canonical, digest
-from .contracts import absolute_path, validate_relative_path
+from .contracts import ContractError, absolute_path, validate_relative_path
 from .local_ipc import MAX_MESSAGE, encode, make_private, plain_path
 from .registry import RegistryError, fields, identifier, require
 from .runtime_control import TOKEN
@@ -61,7 +61,7 @@ class WriterControl:
     def execute(self, command, payload, *, operation_id, dry_run=False):
         identifier(operation_id, "operationId")
         fields(payload, SESSION | ({"pid", "startMillis", "cwd"} if command == "writer-open" else
-                                  {"request"} if command == "writer-io" else {"drained", "disconnected"}))
+                                  {"request"} if command == "writer-io" else set() if command == "writer-check" else {"drained", "disconnected"}))
         for name in ("instanceId", "sessionId", "runId", "nonce"):
             identifier(payload[name], name)
         if command == "writer-open":
@@ -71,9 +71,11 @@ class WriterControl:
         elif command == "writer-close":
             require(payload["drained"] is True and payload["disconnected"] is True,
                     "WRITER_PENDING", "保存・upload完了と接続終了の確認が必要です")
-        else:
+        elif command == "writer-io":
             try:
                 self._validate_request(payload["request"])
+            except ContractError:
+                raise RegistryError("INVALID_INPUT", "操作対象のパス形式が不正です", rejected_before_effect=True) from None
             except RegistryError as error:
                 error.rejected_before_effect = True
                 raise
@@ -112,6 +114,8 @@ class WriterControl:
             return dict(json.loads(cached["response"]), replayed=True, dryRun=dry_run)
         if command != "writer-close":
             self.registry.runtime._running(row)
+        if command == "writer-check":
+            return {"sessionId": payload["sessionId"], "open": True}
         if dry_run:
             return {"dryRun": True, "wouldExecute": command}
         if read:

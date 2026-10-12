@@ -25,7 +25,10 @@ HANDOFF_FIELDS = {"version", "handoffId", "profileHash", "owner", "sourceClient"
 
 def validate_profile(profile: dict) -> None:
     """未知項目・秘密用項目を拒否する。承認の実在や対象ホストの実体は証明しない。"""
-    fields(profile, PROFILE_FIELDS)
+    fields(profile, PROFILE_FIELDS | ({"sshUser"} if type(profile) is dict and profile.get("transport") == "ssh" else set()))
+    if profile["transport"] == "ssh":
+        require(type(profile["sshUser"]) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@\\-]{0,127}", profile["sshUser"]) is not None,
+                "INVALID_INPUT", "承認済みのSSHユーザー名が必要です")
     require(type(profile["version"]) is int and profile["version"] == 1,
             "INVALID_INPUT", "profile version=1が必要です")
     identifier(profile["profileId"], "profileId")
