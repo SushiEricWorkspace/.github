@@ -31,6 +31,7 @@ class Broker:
         require_private(root / "manager", directory=True)
         self.identity = (identity or runtime_process.identity)(os.getpid())
         require(self.identity is not None, "PROCESS_UNVERIFIED", "仲介のnative識別が必要です")
+        self.profile, self.root, self.client_id = profile, root, client_id
         self.instance = instance_id
         self.call = call or (lambda command, payload, operation: request(root, new_request(command, payload, operation_id=operation), timeout=35))
         self.journal = ConnectionJournal(root / "manager/ssh-connections",
@@ -66,6 +67,14 @@ class Broker:
         require(self.state not in {"UNKNOWN", "CLOSED"}, "CONNECTION_PENDING", "結果不明・終了済みの接続は再利用できません")
         require(type(command) is str and command in COMMANDS, "INVALID_INPUT", "SSH仲介の許可対象外です")
         require(type(payload) is dict, "INVALID_INPUT", "payload objectが必要です")
+        if command == "human":
+            fields(payload, {"command", "owner", "options", "actionId", "resume", "targetClient"})
+            require(self.binding is None and self.monitor is None, "WRITER_PENDING", "人間用操作はwriter接続と混在できません")
+            identifier(payload["owner"], "owner")
+            identifier(payload["actionId"], "actionId")
+            require(type(payload["resume"]) is bool and type(payload["options"]) is dict,
+                    "INVALID_INPUT", "操作選択と明示再送が必要です")
+            return
         if command in CLI_COMMANDS:
             require(payload.get("instanceId") == self.instance, "TARGET_MISMATCH", "接続に固定した枠が必要です")
             require(command != "release" or self.binding is None, "WRITER_PENDING", "writer接続中は返却できません")
@@ -99,7 +108,10 @@ class Broker:
             command, payload = document["command"], document["payload"]
             self._validate(command, payload)
             entry = self.journal.accepted(document)
-            if command in CLI_COMMANDS:
+            if command == "human":
+                from .human_remote import serve_human
+                result = serve_human(self, payload)
+            elif command in CLI_COMMANDS:
                 result = self._result(command, payload, operation)
             elif command == "open":
                 token = {key: payload[key] for key in TOKEN_FIELDS}

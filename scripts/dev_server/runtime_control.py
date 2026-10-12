@@ -303,6 +303,7 @@ class RuntimeControl:
             with prebind(endpoints):
                 pass
             with (diagnostics / "console.log").open("xb") as log:
+                make_private(diagnostics / "console.log")
                 process = self.process_adapter.OwnedProcess()
                 self.processes[run_id] = process
                 try:

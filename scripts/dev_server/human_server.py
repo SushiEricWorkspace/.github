@@ -49,25 +49,29 @@ class HumanStore:
 
 class LocalTarget:
     """承認済み同一ホストのCLIだけを呼ぶ。SSHは別入口から仲介する。"""
-    def __init__(self, profile: dict):
+    def __init__(self, profile: dict, *, via_broker=False):
         validate_profile(profile)
         supported_os()
-        require(profile["transport"] == "local", "UNAVAILABLE", "SSH入口は後続Issue #17で追加します")
+        require(profile["transport"] == ("ssh" if via_broker else "local"),
+                "HOST_MISMATCH", "SSH profileは確認済み仲介だけで実行できます")
         require(profile["targetOs"] == {"win32": "windows", "darwin": "macos"}[sys.platform]
-                and profile["host"].casefold() == socket.gethostname().casefold(),
+                and (via_broker or profile["host"].casefold() == socket.gethostname().casefold()),
                 "HOST_MISMATCH", "profileのOS・hostが実行ホストと一致しません")
         self.profile = profile
         self.root = Path(profile["managementRoot"])
         self.children = []
         require(Path(profile["cli"]).is_file(), "UNAVAILABLE", "profileの管理CLIがありません")
-        process = subprocess.run([profile["python"], "-B", "-c",
-                                  "import json,os,struct,sys; from dev_server.runtime_process import identity; "
-                                  "print(json.dumps({'version':'%d.%d/%d' % (*sys.version_info[:2],struct.calcsize('P')*8),"
-                                  "'executable':identity(os.getpid())['executable']}))"],
-                                 cwd=Path(profile["cli"]).parent, capture_output=True, timeout=10)
-        probe = decode(process.stdout)
-        require(process.returncode == 0 and probe["version"] == "3.12/64",
-                "UNAVAILABLE", "対象ホストの64bit Python 3.12が必要です")
+        try:
+            process = subprocess.run([profile["python"], "-B", "-c",
+                                      "import json,os,struct,sys; from dev_server.runtime_process import identity; "
+                                      "print(json.dumps({'version':'%d.%d/%d' % (*sys.version_info[:2],struct.calcsize('P')*8),"
+                                      "'executable':identity(os.getpid())['executable']}))"],
+                                     cwd=Path(profile["cli"]).parent, capture_output=True, timeout=10)
+            probe = decode(process.stdout)
+            require(process.returncode == 0 and probe["version"] == "3.12/64",
+                    "UNAVAILABLE", "対象ホストの64bit Python 3.12が必要です")
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+            raise RegistryError("UNAVAILABLE", "対象ホストの64bit Python 3.12・native識別・CLIのパスを確認してください") from None
         self.python_executable = probe["executable"]
         self.registry = Registry(self.root)
         require(self.registry.inventory["operator"] == profile["approval"]["operator"],
@@ -107,7 +111,7 @@ class LocalTarget:
         with build_lock(store.lock):
             key = self.profile["profileId"]
             record = store.read("supervisors", key)
-            require(record["profileHash"] == profile_hash(self.profile) and record["state"] == "READY",
+            require(record["profileHash"] == profile_hash(self.profile) and record["state"] in {"READY", "STOPPED"},
                     "SUPERVISOR_UNKNOWN", "この入口が生成した監督の完成記録が必要です")
             actual = runtime_process.identity(record["pid"])
             if actual is None:
@@ -126,6 +130,7 @@ class LocalTarget:
                 record["state"] = "STOPPED"
                 store.write("supervisors", key, record)
                 return {"state": "STOPPED", "evidence": str(store.path("supervisors", key))}
+            require(record["state"] == "READY", "SUPERVISOR_UNKNOWN", "終了記録の監督が生存しています。証跡を保全してください")
             runtime_process.require_identity(record["identity"], actual)
             step = record.get("shutdown")
             if step is None:
@@ -182,6 +187,26 @@ class LocalTarget:
 
     def declaration(self, instance):
         return next(item for item in self.registry.inventory["instances"] if item["instanceId"] == instance)
+
+    def choices(self):
+        from .template_control import TemplateControl
+        templates = []
+        for path in sorted((self.root / "templates").glob("*.json")):
+            template = TemplateControl(self.registry).registered(path.stem)
+            templates.append({"templateId": template["templateId"], "displayName": template["templateId"],
+                              "artifactId": template["artifactId"]})
+        return {"profile": self.profile["displayName"], "instances": self.profile["instances"], "templates": templates}
+
+    def doctor(self, instance, artifact_id=None):
+        manifest = self.artifact(artifact_id) if artifact_id else None
+        java = None
+        if manifest:
+            java = next((tool["version"] for tool in manifest["tools"] if tool["name"] == "jdk"), None)
+            require(type(java) is str and java.startswith("21."), "JDK_REQUIRED", "固定artifactにJDK 21が必要です")
+        return {"host": socket.gethostname(), "targetOs": self.profile["targetOs"], "python": "3.12/64",
+                "managementRoot": str(self.root), "instanceId": instance,
+                "endpoints": instance_endpoints(self.declaration(instance)), "java": java,
+                "native": runtime_process.identity(os.getpid()), "approval": self.profile["approval"]["reference"]}
 
     def bind_supervisor(self, record):
         actual = runtime_process.identity(record["pid"])
@@ -242,7 +267,8 @@ class LocalTarget:
         require(not log.exists(), "SUPERVISOR_UNKNOWN", "監督の前回ログを上書きしません")
         storage.write(log, b"")
         arguments = [self.profile["python"], "-B", self.profile["cli"], "supervise", "--root", str(self.root)]
-        options = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+        options = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                                   | subprocess.CREATE_BREAKAWAY_FROM_JOB}
                    if os.name == "nt" else {"start_new_session": True})
         with log.open("ab") as output:
             process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
@@ -470,6 +496,7 @@ class HumanServer:
                                  "expiresAt": self.session["expiresAt"], "renewOwner": self.owner,
                                  "evidence": str(self.store.path("actions", action_id))}
             if action.get("previousActionId"):
+                action["summary"]["resolvedActionId"] = action["previousActionId"]
                 previous = self.store.read("actions", action["previousActionId"])
                 previous.update(state="RESOLVED", resolvedBy=action_id)
                 self.store.write("actions", previous["actionId"], previous)
@@ -508,21 +535,29 @@ class HumanServer:
                 "leaseExpired": row["leaseExpired"], "renewOwner": self.session["renewOwner"],
                 "expiresAt": self.session["expiresAt"], "pendingActionId": self.session["actionId"],
                 "endpoints": instance_endpoints(self.target.declaration(self.instance)),
+                "pendingRequest": human_failure(RegistryError("ACTION_PENDING", "途中要求"), self.store,
+                                                self.session["actionId"]) if self.session["actionId"] else None,
                 "evidence": str(self.target.root / "instances" / self.instance / "diagnostics")}
+
+    def handoff_material(self):
+        """human.lockを所有した呼出側へ、共通offerに必要な秘密と照合結果だけを渡す。"""
+        self.load()
+        require(self.session["actionId"] is None, "ACTION_PENDING", "途中の要求を先に照合してください")
+        return {"token": deepcopy(self.session["token"]), "checked": self.checked(),
+                "sourceClient": "human-" + self.key}
 
     def handoff(self, target_client):
         """明示したManager clientへ一回限りの引継ぎIDを返す。renew責任は発行元に残す。"""
         with build_lock(self.store.lock):
-            self.load()
-            require(self.session["actionId"] is None, "ACTION_PENDING", "途中の要求を先に照合してください")
-            checked = self.checked()
+            material = self.handoff_material()
+            checked = material["checked"]
             handoff_id = self.store.connections.offer(self.profile, self.session["token"], checked,
                                                       owner=self.owner, source_client="human-" + self.key,
                                                       target_client=identifier(target_client, "targetClient"))
             return {"handoffId": handoff_id, "expiresAt": checked["expiresAt"], "renewOwner": self.owner,
                     "directory": str(self.store.directory)}
 
-    def logs(self, limit=65536):
+    def logs(self, limit=16384):
         self.load()
         row = self.row()
         require(row["runId"] is not None, "NOT_FOUND", "起動ログがありません")
@@ -548,3 +583,21 @@ class HumanServer:
                     if secret:
                         text = text.replace(secret, "[秘密]")
         return "".join(char for char in text if char in "\n\t" or ord(char) >= 32 and ord(char) != 127)
+
+
+def human_failure(error, store, action_id):
+    """入口とSSH仲介へ、秘密を含めない段階・要求識別・証跡を返す。"""
+    code = getattr(error, "code", "INTERRUPTED" if isinstance(error, KeyboardInterrupt)
+                   else "LOCK_BUSY" if isinstance(error, BuildLockError) else "UNAVAILABLE")
+    message = str(error) if isinstance(error, RegistryError) else "設定・private権限・管理資源と証跡を確認してください"
+    phase, operation_id = "事前検査", None
+    try:
+        action = store.read("actions", action_id)
+        sending = [step for step in action["steps"] if step["state"] == "SENDING"]
+        phase = sending[0]["command"] if sending else action["state"]
+        operation_id = sending[0]["operationId"] if sending else None
+    except (OSError, RegistryError, ValueError, KeyError):
+        pass
+    return {"ok": False, "error": {"code": code, "message": message}, "phase": phase,
+            "actionId": action_id, "operationId": operation_id,
+            "evidence": str(store.directory / "actions" / (action_id + ".json"))}

@@ -48,6 +48,9 @@ generation.jsonを構築し、全hash照合後にactive.jsonとDBへ同じ世代
 normalのserver profileを使い、GameTest runner引数を手編集しません。
 generationをcwdとして、診断用instances/<instanceId>/diagnostics/<runId>/.launchだけをrunごとに変えます。
 nonce、proofPath、instance/generation、runtime manifestの全管理propertyを追加します。
+Javaの引数ファイルはWindowsではシステム文字コード、macOSではUTF-8で出力し、byte単位で引用します。
+Windowsのシステム文字コードで表現できないパスは置換せず拒否します。
+[Java 21の引数ファイル仕様](https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html#java-command-line-argument-files)に従い、OSの文字コード設定は変更しません。
 JAVA_TOOL_OPTIONS、JDK_JAVA_OPTIONS、_JAVA_OPTIONS、CLASSPATHによる暗黙入力は拒否します。
 
 各枠の固定TCP portはinventoryの承認済み宣言値を使い、競合する既存環境を停止しません。通信試験用範囲もinventoryで明示し、

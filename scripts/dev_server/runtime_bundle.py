@@ -323,5 +323,9 @@ def launch_command(root: Path, profile: str, run: Path, *, auxiliary: Path | Non
                  os.pathsep.join(str(root / entry) for entry in recipe["classpath"]), recipe["mainClass"], *recipe["args"]]
     # Windowsのコマンド長上限を避ける。Javaの引用内ではbackslashをescapeする。
     argfile = auxiliary / "java.args"
-    argfile.write_text("\n".join(json.dumps(arg, ensure_ascii=False) for arg in arguments) + "\n", encoding="utf-8")
+    encoding = "mbcs" if os.name == "nt" else "utf-8"
+    # Javaのbyte単位lexerに合わせ、DBCSの末尾backslashも引用してから書き込む。
+    quoted = [json.dumps(arg.encode(encoding).decode("latin-1"), ensure_ascii=False).encode("latin-1")
+              for arg in arguments]
+    argfile.write_bytes(b"\n".join(quoted) + b"\n")
     return [str(java), "@" + str(argfile)]
