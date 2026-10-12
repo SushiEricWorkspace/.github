@@ -6,12 +6,13 @@ RUNNINGの固定世代へManagerを接続し、停止・保存・切断の境界
 
 固定設定・短命貸出の共通契約と責任分担は[接続プロファイルガイド](connection-profile-guide.md)を参照してください。
 別PCからの仲介は[SSH仲介ガイド](ssh-guide.md)を参照してください。
-現行Manager画面は以下の手動接続を使用し、共通契約への組込みはServerManager #196/#197で行います。
+開発用Managerのプロファイル選択・借用・引継ぎ操作は[Manager接続ガイド](../../../SushiEricServerManager/docs/managed/connection-guide.md)を参照してください。
 
 ## 接続と識別
 
-Managerの管理接続では管理root、Python 3.12、`scripts/dev-server.py`の絶対パス、instanceId、取得済みleaseId/epochを入力します。
-自動acquire/renew、SSH/SFTP、管理rootを直接開くLocalStore、失敗時の非管理接続へのfallbackは使用しません。
+Managerは登録済みの非秘密プロファイルと候補枠を選び、明示の借用または一回限りの引継ぎで接続します。
+Manager取得分だけrenewし、引継ぎでは発行元が貸出更新・停止・返却を担当します。
+ローカルは同一ユーザーCLI、SSHは対象ホスト上の仲介を通します。管理rootを直接LocalStore/SFTPで開かず、非管理接続へfallbackしません。
 statusからgeneration/runId/nonceとloopback Management endpointを固定し、接続中は追従しません。
 
 CLIの`writer-open`/`writer-io`/`writer-close`はoperationIdと以下の共通payloadを必要とします。
@@ -89,3 +90,5 @@ python3.12 -B -m unittest discover -s scripts -p 'test_*.py' -v
 
 合成runtime、native自己プロセス、使い捨てTCP/WebSocketの失敗注入と実Minecraft保存往復は別の証拠です。
 Windowsでの成功をmacOS native・JavaFX実画面の成功として扱いません。
+
+実Modと開発用ManagerのOS・方向別の結果は[統合検証記録](../../../SushiEricServerMod/docs/core/manager-integration-results-guide.md)を参照してください。

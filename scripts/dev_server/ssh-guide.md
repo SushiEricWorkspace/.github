@@ -2,7 +2,7 @@
 
 承認済みSSH profileを使い、サーバーホスト上の一接続・一枠の仲介を介して既存supervisorを操作します。
 Python 3.12とOpenSSHクライアントを使用します。IPCは同一ユーザー専用、Management APIはloopbackのままです。
-Manager画面への組込みはServerManager #196/#197、人間用入口は[操作ガイド](human-entry-guide.md)を参照してください。
+Manager画面は[Manager接続ガイド](../../../SushiEricServerManager/docs/managed/connection-guide.md)、人間用入口は[操作ガイド](human-entry-guide.md)を参照してください。
 
 ## 接続条件
 
@@ -103,3 +103,6 @@ APIのsuccess保持、監視購読解除・peer Close、正常SSH終了、仲介
 humanの外側okはRPCの応答確定、result内のokは一括操作の成功を表します。内側の未完了はphase/actionId/operationId/evidenceを返し、貸出を自動解除しません。
 操作の再送は新しいSSH接続から同じclientId/actionIdと選択でresumeを明示します。接続journalのoperationIdは一接続内で再利用しません。
 一括操作のtokenとjournalはホスト側human-clientsへ、client側は固定選択と応答確定だけをprivateへ保存します。handoff材料はframe内だけで渡し、一回限りofferの正本はclientのConnectionStoreに一つだけ作ります。
+
+実Modの二枠隔離・型付き保存・正常切断・別枠復元は[統合検証ガイド](../../../SushiEricServerMod/docs/core/manager-integration-guide.md)と
+[OS・方向別の検証記録](../../../SushiEricServerMod/docs/core/manager-integration-results-guide.md)を参照してください。
