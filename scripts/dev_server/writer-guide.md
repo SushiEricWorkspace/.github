@@ -4,6 +4,9 @@ RUNNINGの固定世代へManagerを接続し、停止・保存・切断の境界
 貸出は[監督・貸出](supervisor-guide.md)、JVM保存・終了は[runtime制御](runtime-control-guide.md)を参照してください。
 この接続だけでsnapshot cleanを証明しません。正常停止したデータの保存は[snapshotガイド](snapshot-guide.md)に従います。
 
+固定設定・短命貸出の共通契約と責任分担は[接続プロファイルガイド](connection-profile-guide.md)を参照してください。
+現行Manager画面は以下の手動接続を使用し、共通契約への組込みはServerManager #196/#197で行います。
+
 ## 接続と識別
 
 Managerの管理接続では管理root、Python 3.12、`scripts/dev-server.py`の絶対パス、instanceId、取得済みleaseId/epochを入力します。
