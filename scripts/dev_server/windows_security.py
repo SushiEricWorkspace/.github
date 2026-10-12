@@ -74,7 +74,7 @@ def security_descriptor(*, directory: bool = False):
 
 
 def make_private(path, *, directory: bool = False) -> None:
-    """新規管理ファイル・ディレクトリだけのownerとDACLを実行ユーザーへ固定する。"""
+    """新規管理資源の所有者を本人に設定し、保護DACLを本人限定にする。"""
     with security_descriptor(directory=directory) as descriptor:
         _check(advapi.SetFileSecurityW(str(path), 1 | 4 | 0x80000000, descriptor))
     require_private(path=path)
