@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import queue
 from pathlib import Path, PurePosixPath
 import shlex
 import socket
@@ -51,7 +52,6 @@ class SshProtocolTests(unittest.TestCase):
         profile = example_profile("windows", "ssh")
         script = base64.b64decode(remote_command(profile).split()[-1]).decode("utf-16-le")
         self.assertIn(profile["python"], script)
-        self.assertIn("CopyToAsync", script)
         self.assertNotIn("Invoke-Expression", script)
 
     def test_host_key_forwarding_and_login_are_explicit(self):
@@ -84,6 +84,35 @@ class SshProtocolTests(unittest.TestCase):
             result = subprocess.run(command, input=body, capture_output=True, timeout=20)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual(body, result.stdout)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows native継続入力試験")
+    def test_windows_launcher_transfers_requests_before_eof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "dev-server.py"
+            script.write_text("import sys\nwhile True:\n b=sys.stdin.buffer.read(4)\n if not b: break\n sys.stdout.buffer.write(b)\n sys.stdout.buffer.flush()\nsys.exit(23)\n", encoding="utf-8")
+            profile = example_profile("windows", "ssh")
+            profile.update(python=sys.executable, cli=str(script))
+            process = subprocess.Popen(remote_command(profile).split(), stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            responses = queue.Queue()
+            def receive():
+                while body := process.stdout.read(4):
+                    responses.put(body)
+            reader = threading.Thread(target=receive, daemon=True)
+            reader.start()
+            try:
+                for body in (b"\x00\xff\r\n", "あ".encode() + b"\x00", b"ABCD"):
+                    process.stdin.write(body)
+                    process.stdin.flush()
+                    self.assertEqual(body, responses.get(timeout=5))
+            finally:
+                process.stdin.close()
+                process.wait(timeout=20)
+                reader.join(timeout=5)
+                process.stdout.close()
+                errors = process.stderr.read()
+                process.stderr.close()
+            self.assertEqual(23, process.returncode, errors)
 
 
 class MonitorPeer(ApiPeer):
