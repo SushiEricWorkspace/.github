@@ -309,7 +309,7 @@ class Registry:
             return self.gametest.execute(payload, operation_id=operation_id, dry_run=dry_run)
         if command == "snapshot":
             return self.snapshot.execute(payload, operation_id=operation_id, dry_run=dry_run)
-        if command in {"prepare", "restore", "reset", "recover"}:
+        if command in {"prepare", "import", "restore", "reset", "recover"}:
             return self.generation.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"writer-open", "writer-io", "writer-check", "writer-close"}:
             return self.writer.execute(command, payload, operation_id=operation_id, dry_run=dry_run)

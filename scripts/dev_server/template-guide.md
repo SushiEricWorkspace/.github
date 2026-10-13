@@ -1,4 +1,4 @@
-# 固定fixtureから不変テンプレートを作る
+# 不変テンプレートの作成と正式登録
 
 `smoke-v1`、`save-roundtrip-v1`を新規生成・別枠検証して、運用者の明示承認後に登録する手順です。
 貸出と停止は[監督ガイド](supervisor-guide.md)、private保存は[snapshotガイド](snapshot-guide.md)、
@@ -93,7 +93,7 @@ passedChecksを自己申告する入力はありません。合成テストのJS
 
 approvedByは人間の承認の代替ではありません。同一OSユーザーの非協調編集に対する認証境界ではなく、
 協調する運用者の監査契約です。journalにはRegistryで照合したownerも固定して残します。
-テンプレート名は初期2種類の名前と版に限定し、同名上書き、latest別名、自動昇格は拒否します。
+テンプレート名は標準2種類とOS別持込2種類の名前・版に限定し、同名上書き、latest別名、自動昇格は拒否します。
 resetは完成した昇格登録・検証hash・候補hashを照合します。異なるartifactへ自動互換としません。
 旧開発用の手書き参照ファイルは登録済みとして使用できず、新規検証・昇格が必要です。
 
@@ -105,12 +105,74 @@ recoverのresumeで完成できます。targetOperationIdは失敗した操作ID
 dry-runで照合してから実行してください。公開物のrollback削除、未公開証跡の推測生成はしません。
 一致しない場合はそのまま保全し、診断を依頼します。保留解除や別名での再試験を独断で行いません。
 
-## 人間用worldの手動持込
+## 人間用runを正式テンプレートへ持ち込む
 
-人間用runは移動・削除しません。持込元を正常停止し、全writerの完了とプロセス終了を確認して、
-元の保存データと設定・使用artifactを保全してください。稼働中コピーや強制停止後のコピーをclean扱いしません。
-承認した新規使い捨て領域へ通常コピーし、秘密・外部root・accountlistsを分類してから別枠で検証します。
-標準2テンプレートは固定seedの新規prepareが必須なので、この持込worldを標準fixtureとして昇格できません。
-持込world用の期待値・用途・検証方式を別途確定し、既存worldへの自動取り込みを追加しないでください。
+Windowsは`initial-world-windows-v1`、Macは`initial-world-macos-v1`を使用します。
+それぞれのOSにあるrunを独立して取り込みます。標準fixtureの固定seed/API検証とは別の検証契約です。
+テンプレートは各OSの私有管理rootに登録し、リポジトリへworld・プロフィール・秘密を公開しません。
 
+持込元を正常停止し、JVM・子プロセス・外部writerの終了を確認してください。
+`sourceStopped=true`はこの運用者確認を表し、worldロックだけで正常保存したと推測しません。
+元runは管理rootと重ならない絶対パスが必要です。空instanceまたは正常停止済みの貸出instanceへ次のpayloadでimportします。既存世代がある場合はexpectedGenerationにそのIDを指定します。
+
+```json
+{
+  "instanceId": "persistent-01",
+  "leaseId": "<持込先のleaseId>",
+  "epoch": 1,
+  "expectedGeneration": null,
+  "artifactId": "<固定artifactのhash>",
+  "generationId": "initial-world-source",
+  "acceptEula": true,
+  "sourceDirectory": "C:/absolute/SushiEricServerMod/run",
+  "sourceHash": null,
+  "sourceStopped": true,
+  "approvedBy": "<inventoryのoperator>",
+  "taskId": "<実際のtask-id>",
+  "purpose": "reset時の初期world"
+}
+```
+
+MacではsourceDirectoryをMacの絶対パスにしてください。
+まず`dev-server.py import --dry-run`へ送信し、返ったsourceHashとplatform・fileCountを確認します。
+payloadのsourceHashを返った値へ置き換え、同じoperationIdでimportを実行します。
+実行時も既存session.lockを非ブロッキングで保持し、コピー前後・参照切替前の元データhashを照合します。
+元runへのファイル作成、設定変更、移動、削除はありません。
+
+worldの全dimension、プレイヤー進捗、Mod保存データをコピーします。
+ops/whitelist/banは空にし、固定port・RCON秘密を置き換えます。
+session.lock、logs、crash-reports、usercache、通常ファイルの.DS_Storeは除外します。
+空resourcesだけを許可し、未知root・設定・非空resources・外部DB・リンクは拒否します。
+
+取り込んだ管理世代をstartして正常stopし、private snapshotと共有candidateを作成します。
+同じartifactで別instanceへrestoreし、startして正常stopしてください。
+上記validateのfixtureとpromoteのtemplateIdにOS別IDを指定します。managedfixtureコマンドは不要です。
+IMPORT_SOURCEは登録済みimport journal・元hash・OS・初期コピーhash、IMPORT_RESTOREは独立復元journal・候補全hash、
+IMPORT_SAVEは両管理世代の別nonce・保存成功・JVM/child終了の照合を表します。
+ゲーム内プロフィールやアイテムの個別API値を検証したという意味ではありません。
+
+昇格後は既存resetでそのIDを選択できます。同名の上書きは拒否します。
+途中障害は元runとstagingを保全します。完成コピーは元hashの一致したresume、未完成コピーは明示rollbackで扱います。
 この検証は実運用バックアップ、別媒体、停電耐性、非協調writerの排除を証明しません。
+
+## 取り込み経路の検証
+
+`test_import_control.py`は元run保全、秘密除外、途中変更の拒否、障害復旧、独立復元・昇格・resetを検証します。
+`test_import_lock.py`は実JDK 21のFileChannelとPythonの排他を双方向で確認します。
+実JDKのjava絶対パスを`SUSHIERIC_TEST_JAVA21`へ指定して実行してください。未指定時はskipです。
+この合成データの試験を実worldのロード・保存成功として扱いません。
+
+## 実データの確認（2026-10-13、Issue #31）
+
+Windowsのwindows-managedとMacのhuman-16-macosへ、各自の既存runから独立して登録しました。
+Windowsは119ファイル・15,626,822 bytes、Macは30ファイル・2,291,295 bytesを取り込みました。
+両OSで管理起動・正常停止、private snapshot、共有候補、別instanceへのrestore・起動・正常停止、
+validate・promote、登録テンプレートからのreset・再起動・正常停止まで成功しました。
+元runのsourceHashは取り込み前後で一致し、旧世代・snapshot・診断を保全しています。
+最後に貸出を返却し、監督を正常終了しました。証跡は各rootのmanager/audit/issue-31-registration/report.jsonです。
+
+Windowsの関連74件（1skip）と104件（2skip）、最終import13件、実Java排他2件は失敗なしです。
+Macは同じ関連範囲の184件中183成功・1skipでした。Java排他の双方向試験を含みます。
+標準fixtureの個別ゲームAPI検証、実運用バックアップ、別媒体の確認としては数えません。
+登録テンプレートは、Windowsが4051b6a4c2a12cb4f36166f69246cfeb05a65f818f49ae5f006a0fcdaa49b305、
+Macがbe516b52b40ae02ccf70fa69c0cb970c81443a1cfa30510c7aa67febb4b9a72aの同一固定artifactに限りresetできます。

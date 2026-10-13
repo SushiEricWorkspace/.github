@@ -4,6 +4,7 @@ import json
 from .build_inputs import canonical, digest, regular_bytes
 from .contracts import require_compatible, validate
 from .fixtures import FIXTURES
+from .import_data import IMPORTED_TEMPLATES, IMPORT_CHECKS
 from .local_ipc import plain_path, require_private
 from .registry import RegistryError, fields, identifier, require
 from .runtime_bundle import verify_bundle
@@ -11,6 +12,9 @@ from .runtime_control import TOKEN, read_json
 from .snapshot_data import entry, transform
 from .template_data import require_shared
 from . import storage
+
+
+TEMPLATE_IDS = {value["name"] for value in FIXTURES} | IMPORTED_TEMPLATES.keys()
 
 
 TABLES = ("operations", "runtime_operations", "writer_operations", "reference_operations", "snapshot_operations")
@@ -54,9 +58,45 @@ class TemplateControl:
                 "PROOF_MISMATCH", "fixtureの検証ファイル集合が一致しません")
         return run, path, document
 
+    def _imported(self, fixture, row, manifest):
+        clean = manifest["cleanStop"]
+        with self.registry.transaction(read_only=True) as connection:
+            source_row = dict(self.registry._instance(connection, clean["instanceId"]))
+        require(source_row["generation"] == clean["generation"] and source_row["run_id"] == clean["runId"],
+                "PROOF_MISMATCH", "取り込み元世代の停止runが一致しません")
+        source_generation = self.registry.runtime._active_generation(source_row)
+        source_run, source_saved = self.registry.snapshot.stopped(source_row, source_generation)
+        record = read_json(source_generation / "generation.json")
+        journal = self.registry.generation._journal(record["operationId"])
+        imported = read_json(journal / "requested.json")
+        require(imported["command"] == "import" and imported["payload"]["generationId"] == clean["generation"]
+                and imported["payload"]["instanceId"] == clean["instanceId"]
+                and imported["sourceHash"] == imported["payload"]["sourceHash"] == digest(canonical(imported.get("importSource")))
+                and imported["importSource"]["platform"] == IMPORTED_TEMPLATES[fixture]
+                and imported["importSource"]["layout"] == manifest["layout"],
+                "PROOF_MISMATCH", "正式テンプレートと停止済み取り込み元のOS・hash・保存rootが一致しません")
+        with self.registry.transaction(read_only=True) as connection:
+            operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (record["operationId"],)).fetchone()
+            require(operation is not None and operation["status"] == "COMPLETED" and operation["command"] == "import"
+                    and operation["fingerprint"] == imported["fingerprint"]
+                    == digest(canonical({"command": "import", "payload": imported["payload"]})),
+                    "PROOF_MISMATCH", "取り込みjournalと登録要求が一致しません")
+        initial = {file["path"]: file for file in record["files"]}
+        for file in imported["importSource"]["files"]:
+            if file["path"] not in {"server.properties", "config/SushiEricServerMod/management/config.yml"}:
+                require(initial.get(file["path"]) == file, "PROOF_MISMATCH", "取り込み直後の保存データhashが一致しません")
+        run, saved = self.registry.snapshot.stopped(row, self.registry.runtime._active_generation(row))
+        require(source_run["artifactId"] == run["artifactId"] == manifest["artifactId"]
+                and source_run["nonce"] == clean["nonce"] and run["nonce"] != source_run["nonce"],
+                "PROOF_MISMATCH", "取り込み元と独立復元先のartifact・起動識別が一致しません")
+        reports = [entry("import-requested.json", regular_bytes(journal / "requested.json")),
+                   entry("import-generation.json", regular_bytes(source_generation / "generation.json")),
+                   entry("import-source-save.json", canonical(source_saved)), entry("import-restored-save.json", canonical(saved))]
+        return run, reports, IMPORT_CHECKS
+
     def _validation(self, payload, row, manifest, root):
         fixture = payload["fixture"]
-        require(fixture in {value["name"] for value in FIXTURES}, "INVALID_INPUT", "固定fixture名を指定してください")
+        require(fixture in TEMPLATE_IDS, "INVALID_INPUT", "固定fixture名を指定してください")
         clean = manifest["cleanStop"]
         require(clean["instanceId"] != row["id"] and row["artifact"] == manifest["artifactId"],
                 "VALIDATION_REQUIRED", "同じ固定artifactを別のinstanceへ復元して検証してください")
@@ -73,29 +113,34 @@ class TemplateControl:
                 and request["payload"]["generationId"] == row["generation"]
                 and request["sourceHash"] == digest(canonical(manifest)),
                 "PROOF_MISMATCH", "実際に復元した候補snapshot・世代・hashが一致しません")
-        source_run, _, created = self._report(clean["instanceId"], clean["runId"], fixture, "create")
-        source_generation = self.registry.runtime._paths(clean["instanceId"]) / "generations" / clean["generation"]
-        source_record = read_json(source_generation / "generation.json")
-        prepared = read_json(self.registry.generation._journal(source_record["operationId"]) / "requested.json")
-        spec = next(value for value in FIXTURES if value["name"] == fixture)
-        require(prepared["command"] == "prepare" and prepared["sourceHash"] is None
-                and prepared["payload"]["seed"] == spec["seed"]
-                and prepared["payload"]["generationId"] == clean["generation"],
-                "PROOF_MISMATCH", "固定seedから新規生成したfixtureが必要です。既存worldを自動取り込みしません")
-        with self.registry.transaction(read_only=True) as connection:
-            source_operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (source_record["operationId"],)).fetchone()
-            require(source_operation is not None and source_operation["status"] == "COMPLETED"
-                    and source_operation["command"] == "prepare"
-                    and source_operation["fingerprint"] == prepared["fingerprint"]
-                    == digest(canonical({"command": "prepare", "payload": prepared["payload"]})),
-                    "PROOF_MISMATCH", "新規生成journalと登録要求が一致しません")
-        run, report_path, observed = self._report(row["id"], row["run_id"], fixture, "verify")
-        require(source_run["artifactId"] == run["artifactId"] == manifest["artifactId"]
-                and created["files"] == observed["files"], "PROOF_MISMATCH", "生成・復元試験のartifactまたはデータが一致しません")
-        for file in created["files"]:
-            require(file == entry(file["path"], regular_bytes(root / file["path"]))
-                    == entry(file["path"], regular_bytes(generation / file["path"])),
-                    "SOURCE_CHANGED", "fixtureのデータがsnapshot・独立枠・API証跡間で一致しません")
+        if fixture in IMPORTED_TEMPLATES:
+            run, reports, checks = self._imported(fixture, row, manifest)
+        else:
+            source_run, _, created = self._report(clean["instanceId"], clean["runId"], fixture, "create")
+            source_generation = self.registry.runtime._paths(clean["instanceId"]) / "generations" / clean["generation"]
+            source_record = read_json(source_generation / "generation.json")
+            prepared = read_json(self.registry.generation._journal(source_record["operationId"]) / "requested.json")
+            spec = next(value for value in FIXTURES if value["name"] == fixture)
+            require(prepared["command"] == "prepare" and prepared["sourceHash"] is None
+                    and prepared["payload"]["seed"] == spec["seed"]
+                    and prepared["payload"]["generationId"] == clean["generation"],
+                    "PROOF_MISMATCH", "固定seedから新規生成したfixtureが必要です。既存worldを自動取り込みしません")
+            with self.registry.transaction(read_only=True) as connection:
+                source_operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (source_record["operationId"],)).fetchone()
+                require(source_operation is not None and source_operation["status"] == "COMPLETED"
+                        and source_operation["command"] == "prepare"
+                        and source_operation["fingerprint"] == prepared["fingerprint"]
+                        == digest(canonical({"command": "prepare", "payload": prepared["payload"]})),
+                        "PROOF_MISMATCH", "新規生成journalと登録要求が一致しません")
+            run, report_path, observed = self._report(row["id"], row["run_id"], fixture, "verify")
+            require(source_run["artifactId"] == run["artifactId"] == manifest["artifactId"]
+                    and created["files"] == observed["files"], "PROOF_MISMATCH", "生成・復元試験のartifactまたはデータが一致しません")
+            for file in created["files"]:
+                require(file == entry(file["path"], regular_bytes(root / file["path"]))
+                        == entry(file["path"], regular_bytes(generation / file["path"])),
+                        "SOURCE_CHANGED", "fixtureのデータがsnapshot・独立枠・API証跡間で一致しません")
+            reports = [entry(report_path.name, regular_bytes(report_path))]
+            checks = spec["expected"]["checks"]
         # worldの保存値は実起動後に変わるため、復元直後の記録で全コピーを照合する。
         initial = {file["path"]: file for file in record["files"]}
         for file in manifest["files"]:
@@ -107,12 +152,11 @@ class TemplateControl:
         stopped_run, saved = self.registry.snapshot.stopped(row, generation)
         proof = dict(manifest["cleanStop"], instanceId=row["id"], generation=row["generation"], runId=run["runId"], nonce=run["nonce"],
                      saveResults=[{"writer": key, "success": value, "pendingCount": 0} for key, value in sorted(saved["saves"]["results"].items())])
-        spec = next(value for value in FIXTURES if value["name"] == fixture)
         document = {"schemaVersion": 1, "validationId": payload["validationId"], "snapshotId": payload["snapshotId"],
                     "artifactId": manifest["artifactId"], "fixture": fixture, "sourceInstanceId": clean["instanceId"],
                     "restoredInstanceId": row["id"], "runId": stopped_run["runId"], "nonce": stopped_run["nonce"],
-                    "cleanStop": proof, "passedChecks": spec["expected"]["checks"],
-                    "reportFiles": [entry(report_path.name, regular_bytes(report_path))]}
+                    "cleanStop": proof, "passedChecks": checks,
+                    "reportFiles": reports}
         validate("validation", document)
         return document
 
@@ -182,7 +226,7 @@ class TemplateControl:
         else:
             identifier(payload["taskId"], "taskId")
             require(payload["approvedBy"] == self.registry.inventory["operator"] and type(payload["purpose"]) is str
-                    and bool(payload["purpose"].strip()) and payload["templateId"] in {value["name"] for value in FIXTURES},
+                    and bool(payload["purpose"].strip()) and payload["templateId"] in TEMPLATE_IDS,
                     "APPROVAL_REQUIRED", "元の運用者承認・用途・固定版が必要です")
             previous = self._completed(payload["validationId"])
             require(previous["manifestHash"] == manifest_hash and previous["validation"] == validation,
@@ -220,7 +264,7 @@ class TemplateControl:
             require(payload["approvedBy"] == self.registry.inventory["operator"]
                     and type(payload["purpose"]) is str and bool(payload["purpose"].strip()),
                     "APPROVAL_REQUIRED", "inventoryの運用者の明示承認と用途が必要です")
-            require(payload["templateId"] in {value["name"] for value in FIXTURES}, "INVALID_INPUT", "初期テンプレートは固定の名前・版だけを指定してください")
+            require(payload["templateId"] in TEMPLATE_IDS, "INVALID_INPUT", "初期テンプレートは固定の名前・版だけを指定してください")
         fingerprint = digest(canonical(payload))
         with self.registry.transaction(read_only=True) as connection:
             for table in TABLES[:-1]:

@@ -23,7 +23,7 @@ class JsonArgumentParser(argparse.ArgumentParser):
 def main() -> int:
     parser = JsonArgumentParser(description="分離テスト環境の管理（macOS/Windows、Python 3.12）")
     parser.add_argument("command", choices=("init", "supervise", "ssh-broker", "doctor", "list", "status", "lease-check", "acquire", "renew", "release", "shutdown", "shutdown-idle",
-                                           "prepare", "start", "stop", "snapshot", "restore", "reset", "recover", "gc",
+                                           "prepare", "import", "start", "stop", "snapshot", "restore", "reset", "recover", "gc",
                                            "writer-open", "writer-io", "writer-check", "writer-close", "gametest"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--inventory", type=Path)
@@ -57,7 +57,7 @@ def main() -> int:
             supervise(args.root)
             return 0
         else:
-            if args.command in {"prepare", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-check", "writer-close", "gametest", "gc"} and operation_id is None:
+            if args.command in {"prepare", "import", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-check", "writer-close", "gametest", "gc"} and operation_id is None:
                 raise RegistryError("INVALID_INPUT", "runtime操作には再送用の--operation-idを明示してください")
             if args.inventory is not None:
                 raise RegistryError("INVALID_INPUT", "--inventoryはinitだけで指定してください")

@@ -97,10 +97,10 @@
     }},
     "validation": {"type": "object", "properties": {
       "schemaVersion": {"ref": "version"}, "validationId": {"ref": "id"}, "snapshotId": {"ref": "id"},
-      "artifactId": {"ref": "hash"}, "fixture": {"type": "string", "enum": ["smoke-v1", "save-roundtrip-v1"]},
+      "artifactId": {"ref": "hash"}, "fixture": {"type": "string", "enum": ["smoke-v1", "save-roundtrip-v1", "initial-world-windows-v1", "initial-world-macos-v1"]},
       "sourceInstanceId": {"ref": "id"}, "restoredInstanceId": {"ref": "id"}, "runId": {"ref": "id"}, "nonce": {"ref": "text"},
       "cleanStop": {"ref": "cleanStop"},
-      "passedChecks": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["A08", "A09", "A20", "A23", "A24"]}},
+      "passedChecks": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["A08", "A09", "A20", "A23", "A24", "IMPORT_SOURCE", "IMPORT_RESTORE", "IMPORT_SAVE"]}},
       "reportFiles": {"ref": "files"}
     }}
   }
