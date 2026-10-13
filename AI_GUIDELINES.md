@@ -78,7 +78,7 @@
 - 作成・一覧・担当引継ぎ・削除は`.github/scripts/setup-worktrees.py`を使用する。task-id、Issue番号、対象repo、同時書込ownerを明示し、記録された基準commitから`feature/issue-<番号>`を作成する。使い方は`.github/scripts/dev_server/worktrees-guide.md`を参照する。
 - 基準はrepoごとの最新origin開発ブランチを用いる（Common・ServerManager・CombatCoreはdevelop、ServerMod・.githubはmain）。前提Issueへ依存する場合は、repoごとに依存commitを明示する。現在のprimaryやorigin/HEADのリリースブランチから推測しない。
 - 同一タスクの担当交代はownerを引き継ぐ。別worktreeを追加して同じタスクを二重実行しない。Gitのworktree lockは編集排他ではない。owner記録は同一ユーザー間の協調契約であり、他ownerは直接書き込まない。
-- 既存branch/worktreeを上書きしない。未コミット変更がある作業の引継ぎ・削除は拒否する。途中失敗や登録不一致は既存の実体を残し、勝手に修復・強制削除しない。
+- 既存branch/worktreeを上書きしない。引継ぎは旧ownerの書込み停止後、未コミット変更を保持してowner登録のみを更新する。未コミット変更がある作業の作成再実行・削除・削除復旧は拒否する。途中失敗や登録不一致は既存の実体を残し、勝手に修復・強制削除しない。
 - タスクworktreeへ`run/`や`.idea/`を複製しない。`build/`とプロジェクト`.gradle/`はworktreeごとに独立する。サーバーの永続instance、snapshot、artifactはworktreeの削除対象にしない。
 - 削除はtask-idと現在ownerを明示して行う。worktreeをディレクトリ削除、force、広範囲のpruneで片付けない。worktree削除だけの指示からbranch削除の許可は推定しない。
 - 特定branchの作業専用に作成したworktreeは、対象branchの削除を指示された場合、保持する明示指示がなければ一緒に削除する。branch削除指示は対応する専用worktreeの削除許可を含むため、同じ許可を改めて求めない。Git一覧と管理記録でrepo、branch、専用worktree、task-id、ownerを照合し、worktreeを管理手順で先に削除してからbranchを削除する。primary、共有・固定AI用、他branch用のworktreeは対象に含めない。複数repoのtaskでは指示対象外のworktreeをまとめて削除しない。

@@ -111,16 +111,87 @@ class TaskWorktreesTest(unittest.TestCase):
         with self.assertRaisesRegex(TaskError, "branch"):
             self.create()
 
-    def test_dirty_handoff_and_removal_are_rejected(self):
+    def test_dirty_handoff_preserves_all_repo_contents_and_git_state(self):
+        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        before = {}
+        for name in ("Common", "SushiEricServerMod"):
+            path = self.manager.target("task-a", name)
+            (path / "source.txt").write_text("staged\n", encoding="utf-8")
+            git(path, "add", "source.txt")
+            (path / "source.txt").write_text("unstaged\n", encoding="utf-8")
+            (path / "new.txt").write_text("untracked\n", encoding="utf-8")
+            (path / "run").mkdir()
+            (path / "run/private").write_text("ignored\n", encoding="utf-8")
+            before[name] = (
+                {file: (path / file).read_bytes()
+                 for file in ("source.txt", "new.txt", "run/private", ".git")},
+                [git(path, *args) for args in (
+                    ("rev-parse", "HEAD"), ("branch", "--show-current"), ("ls-files", "--stage"),
+                    ("status", "--porcelain", "--untracked-files=all"),
+                    ("diff", "--cached", "--binary"), ("diff", "--binary"))],
+            )
+        record = self.manager.list("task-a")[0]
+        result = self.manager.handoff("task-a", "codex-a", "publisher")[0]
+        self.assertEqual(dict(record, owner="publisher"), result)
+        for name, (files, state) in before.items():
+            path = self.manager.target("task-a", name)
+            self.assertEqual(files, {file: (path / file).read_bytes() for file in files})
+            self.assertEqual(state, [git(path, *args) for args in (
+                ("rev-parse", "HEAD"), ("branch", "--show-current"), ("ls-files", "--stage"),
+                ("status", "--porcelain", "--untracked-files=all"),
+                ("diff", "--cached", "--binary"), ("diff", "--binary"))])
+        with self.assertRaisesRegex(TaskError, "owner"):
+            self.manager.handoff("task-a", "codex-a", "other")
+        self.assertEqual("next", self.manager.handoff("task-a", "publisher", "next")[0]["owner"])
+
+    def test_dirty_creation_retry_and_removal_are_rejected(self):
+        self.create()
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                (path / "source.txt").write_text("unsaved", encoding="utf-8")
+                if staged:
+                    git(path, "add", "source.txt")
+                for operation in (lambda: self.create(),
+                                  lambda: self.manager.remove("task-a", "codex-a")):
+                    with self.assertRaisesRegex(TaskError, "未コミット"):
+                        operation()
+                self.assertEqual("ACTIVE", self.manager.list()[0]["state"])
+                self.assertEqual("unsaved", (path / "source.txt").read_text())
+
+    def test_handoff_preflights_all_repos_before_changing_owner(self):
+        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        common = self.manager.target("task-a", "Common")
+        (common / "source.txt").write_text("unsaved", encoding="utf-8")
+        mod = self.manager.target("task-a", "SushiEricServerMod")
+        git(mod, "checkout", "-b", "different")
+        record = self.manager.list("task-a")
+        with self.assertRaisesRegex(TaskError, "branch"):
+            self.manager.handoff("task-a", "codex-a", "publisher")
+        self.assertEqual(record, self.manager.list("task-a"))
+        self.assertEqual("unsaved", (common / "source.txt").read_text())
+        self.assertEqual("different", git(mod, "branch", "--show-current"))
+
+    def test_handoff_rejects_other_owner_nonactive_state_and_missing_git(self):
         self.create()
         path = self.manager.target("task-a", "SushiEricServerMod")
         (path / "new.txt").write_text("unsaved", encoding="utf-8")
-        for operation in (lambda: self.manager.handoff("task-a", "codex-a", "claude"),
-                          lambda: self.manager.remove("task-a", "codex-a")):
-            with self.assertRaisesRegex(TaskError, "未コミット"):
-                operation()
-        self.assertEqual("ACTIVE", self.manager.list()[0]["state"])
-        self.assertTrue(path.exists())
+        record = self.manager.list("task-a")
+        with self.assertRaisesRegex(TaskError, "owner"):
+            self.manager.handoff("task-a", "other", "publisher")
+        self.assertEqual(record, self.manager.list("task-a"))
+        for state in ("CREATING", "REMOVING", "RECOVERY_REQUIRED", "REMOVED"):
+            self.set_state(state, removal_started=False)
+            with self.assertRaisesRegex(TaskError, "状態"):
+                self.manager.handoff("task-a", "codex-a", "publisher")
+            self.assertEqual("codex-a", self.manager.list()[0]["owner"])
+            self.assertEqual(state, self.manager.list()[0]["state"])
+        self.set_state("ACTIVE", removal_started=False)
+        (path / ".git").unlink()
+        with self.assertRaises(TaskError):
+            self.manager.handoff("task-a", "codex-a", "publisher")
+        self.assertEqual("codex-a", self.manager.list()[0]["owner"])
+        self.assertEqual("unsaved", (path / "new.txt").read_text())
 
     def test_all_repos_are_preflighted_before_creation(self):
         git(self.root / "SushiEricServerMod", "branch", "feature/issue-100")
@@ -484,7 +555,7 @@ class TaskWorktreesTest(unittest.TestCase):
         git(repo, "config", "core.longpaths", "false")
         path = self.manager.target("task-a", "SushiEricServerMod")
         for directory in ("build", ".gradle"):
-            output = path / directory / ("long-path-" * 8) / ("output-" * 10) / "result.txt"
+            output = path / directory / ("long-path-" * 16) / ("output-" * 10) / "result.txt"
             self.assertGreater(len(str(output)), 300)
             output.parent.mkdir(parents=True)
             output.write_text("disposable", encoding="utf-8")
@@ -499,7 +570,7 @@ class TaskWorktreesTest(unittest.TestCase):
         repo = self.root / "SushiEricServerMod"
         git(repo, "config", "core.longpaths", "false")
         path = self.manager.target("task-a", "SushiEricServerMod")
-        data = path / "run" / ("persistent-" * 8) / ("world-" * 12) / "keep.txt"
+        data = path / "run" / ("persistent-" * 16) / ("world-" * 12) / "keep.txt"
         self.assertGreater(len(str(data)), 300)
         data.parent.mkdir(parents=True)
         data.write_text("preserve", encoding="utf-8")

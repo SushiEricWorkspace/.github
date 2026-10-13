@@ -15,7 +15,7 @@ primary、人間、別ownerの作業ディレクトリを使わない。
 1. `scripts/setup-worktrees.py --list`で登録を確認する。既存固定worktreeは`--list-legacy`で読み取れる。
 2. 新規作成ではIssue番号・repo・task-id・ownerを明示する。既定の起点はAGENTS.mdに対応するoriginの最新開発基準であり、前提Issueの依存commitや基準変更があるrepoだけ`--base REPO=REF`を追加する。
 3. 出力されたパス `<workspace>/worktrees/<task-id>/<repo>/`で作業する。既存branch/worktreeの衝突を別パス作成やforceで回避しない。
-4. 引継ぎは旧ownerの作業終了を確認してから`--handoff-from`を使う。未コミット変更があれば中断してユーザーへ相談する。
+4. 引継ぎは旧ownerの書込み停止を確認してから`--handoff-from`を使う。未コミット変更を保持した同じworktreeのowner登録だけを更新し、HEAD・branch・index・追跡済み/未追跡/ignoredファイルは変更しない。commit・push・PR作成等の実行許可は別に確認する。
 5. 特定branch専用のworktreeは、branch削除を指示された場合、保持指示がなければ一緒に削除する。同じ削除許可を改めて求めず、Git一覧と管理記録を照合し、`--remove --task-id ... --owner ...`でworktreeを先に削除してからbranchを削除する。primary、共有・固定AI用、他branch用、指示対象外repoのworktreeを含めない。保全データや登録不一致、削除失敗があればworktreeとbranchを保全して報告する。worktree削除だけの指示からbranch削除の許可は推定しない。
 
 ownerは協調契約でありGit lockやアクセス制御ではない。削除時はdirtyと未知の追跡外データを拒否する。
