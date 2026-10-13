@@ -155,14 +155,13 @@ class TaskWorktrees:
         require(task["state"] in states, f"操作できない状態です: {task['state']}")
         return db.execute("SELECT * FROM repos WHERE task_id = ? ORDER BY name", (task_id,)).fetchall()
 
-    def verify(self, task_id: str, plan, *, deleting: bool = False) -> tuple[Path, Path]:
+    def verify(self, task_id: str, plan) -> tuple[Path, Path]:
         repo = self.primary(plan["name"])
         target = self.target(task_id, plan["name"])
         require(worktrees(repo).get(target.resolve()) == f"refs/heads/{plan['branch']}",
                 f"登録とGitのworktree/branchが一致しません: {target}")
         require(git(target, "rev-parse", "--show-toplevel") == target.as_posix(),
                 f"worktreeの実体が一致しません: {target}")
-        clean(target, deleting=deleting)
         return repo, target
 
     def create(self, task_id: str, issue: int, owner: str, bases: dict[str, str | None],
@@ -191,7 +190,8 @@ class TaskWorktrees:
                         == {(name, commit) for name, _, _, commit in plans},
                         "同一taskのrepo/基準commitは変更できません")
                 for plan in saved:
-                    self.verify(task_id, plan)
+                    _, target = self.verify(task_id, plan)
+                    clean(target)
             else:
                 for _, repo, target, _ in plans:
                     require(not target.exists() and target.resolve() not in worktrees(repo),
@@ -251,7 +251,8 @@ class TaskWorktrees:
             return repo, target, "absent"
         if registered:
             require((target / ".git").is_file(), f"worktreeの.gitがありません: {target}")
-            self.verify(task_id, plan, deleting=True)
+            self.verify(task_id, plan)
+            clean(target, deleting=True)
             common = Path(git(target, "rev-parse", "--git-common-dir"))
             require((target / common).resolve() == (repo / ".git").resolve(),
                     f"worktreeのGit管理先が一致しません: {target}")

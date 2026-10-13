@@ -29,6 +29,13 @@ origin/HEADがリリースbranchを指していても、開発基準から起点
 ownerの更新はSQLiteトランザクションで排他します。Gitのref操作はGit自身のlockを使用します。
 ownerは同一ユーザーの協調契約であり、OSのアクセス制御ではありません。手作業のGit操作も同じownerが行います。
 
+担当引継ぎは旧ownerの書込み停止を確認してから、同じworktreeを`--handoff-from`で新ownerへ渡します。
+実装担当からGit公開担当への引継ぎでは、ステージ済み・未ステージ・未追跡・ignoredファイルを保持したままowner登録だけを更新します。
+HEAD、branch、index、ファイルは変更せず、自動commit・stash・reset・checkoutや別worktreeへの複製は行いません。
+現在owner・ACTIVE状態・全repoの実体とGit登録・branch・管理パスを確認し、ビルド中や不一致があればownerを更新しません。
+新規作成・既存登録の作成再実行・削除・削除復旧は従来の保全条件を維持します。
+引継ぎはGit公開操作の許可を増やしません。commit・push・PR作成・merge・削除にはそれぞれ実行許可が必要です。
+
 ## 削除と途中失敗
 
 ```bash
@@ -111,7 +118,7 @@ python3.12 -B scripts/sync-agent-rules.py --check --repo-root Common=worktrees/i
 python3.12 -B -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-一時Git repositoryで二タスクのsource/index/build分離、owner競合、引継ぎ、dirty拒否、実行領域の保全を確認します。
+一時Git repositoryで二タスクのsource/index/build分離、owner競合、未コミット変更を保持した引継ぎ、作成再実行・削除・削除復旧のdirty拒否、実行領域の保全を確認します。
 部分削除、Git削除直後の中断、複数repoの途中失敗、アクセス拒否は一時repositoryへの故障注入で確認します。
 Windows実Gitで300文字を超えるignored build/.gradle出力の削除を確認する試験は、Windows以外ではskipします。
 skipを実行成功として扱いません。macOSの一時ディレクトリにsymlinkの祖先がある場合は`TMPDIR=/private/tmp`で実行します。
