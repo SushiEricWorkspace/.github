@@ -294,7 +294,9 @@ class Registry:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
         with self.resource_use(exclusive=command in {"gc", "shutdown-idle"}, allow_stopping=command == "shutdown-idle"):
             if command == "gc":
-                return self.gc.execute(payload, operation_id=operation_id, dry_run=dry_run)
+                from .supervisor import private_lock
+                with private_lock(self.root / "manager/locks/deployment.lock"):
+                    return self.gc.execute(payload, operation_id=operation_id, dry_run=dry_run)
             if command not in {"stop", "list", "status", "doctor", "shutdown", "shutdown-idle", "renew", "writer-close"}:
                 with self.transaction(read_only=True) as connection:
                     require(not connection.execute("SELECT 1 FROM runtime_operations WHERE command='gc-apply' AND status!='COMPLETED'").fetchone(),
@@ -309,7 +311,7 @@ class Registry:
             return self.gametest.execute(payload, operation_id=operation_id, dry_run=dry_run)
         if command == "snapshot":
             return self.snapshot.execute(payload, operation_id=operation_id, dry_run=dry_run)
-        if command in {"prepare", "import", "restore", "reset", "recover"}:
+        if command in {"prepare", "template-init", "import", "restore", "reset", "recover"}:
             return self.generation.execute(command, payload, operation_id=operation_id, dry_run=dry_run)
         if command in {"writer-open", "writer-io", "writer-check", "writer-close"}:
             return self.writer.execute(command, payload, operation_id=operation_id, dry_run=dry_run)

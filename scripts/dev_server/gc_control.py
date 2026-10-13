@@ -179,7 +179,7 @@ class GcControl:
                 reference = "generation:" + declaration["instanceId"] + "/" + path.name
                 record = read_json(path / "generation.json")
                 with self.registry.transaction(read_only=True) as connection:
-                    completed = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND command IN ('prepare','restore','reset') AND status='COMPLETED'", (record["operationId"],)).fetchone()
+                    completed = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND command IN ('prepare','template-init','import','restore','reset') AND status='COMPLETED'", (record["operationId"],)).fetchone()
                 require(completed is not None and json.loads(completed["response"])["generation"] == path.name,
                         "RECOVERY_REQUIRED", "未確定の世代は回収できません")
                 if reference not in protected:

@@ -3,7 +3,7 @@
 タスクのソースworktreeを作成・引き継ぎ・削除する場合は[worktreeガイド](worktrees-guide.md)を参照してください。
 固定した開発runtimeを出力する場合は[runtime出力ガイド](runtime-export-guide.md)を参照してください。
 宣言設定・貸出Registry・supervisorを扱う場合は[監督・貸出ガイド](supervisor-guide.md)を参照してください。
-固定bundleの初回prepare・起動停止は[runtime制御ガイド](runtime-control-guide.md)を参照してください。
+実機用のOS別初期ワールド作成は[テンプレートガイド](template-guide.md#新しいビルド管理rootでの初期ワールド作成)、固定bundleの起動停止は[runtime制御ガイド](runtime-control-guide.md)を参照してください。
 人間用の一括起動・状態確認・保存停止は[一括操作ガイド](human-server-guide.md)を参照してください。
 管理接続の固定設定・短命の貸出引継ぎは[接続プロファイルガイド](connection-profile-guide.md)を参照してください。
 別PCからの開発用接続と切断証跡は[SSH仲介ガイド](ssh-guide.md)を参照してください。
@@ -47,7 +47,7 @@ Minecraftワールド、NBT、独自定義YAML、JARを実生成しません。
 管理CLI `scripts/dev-server.py`の初期化・監督・貸出は実装済みです。
 固定bundleの初回prepare・JVM起動停止・Mod保存/終了証跡照合を実装しています。
 協調Managerの世代固定writerを登録し、正常停止・writer不在を固定したprivate snapshotの作成・検証を行います。
-prepare/restore/resetの世代構築、固定fixtureの検証・明示昇格、recover、参照照合付きGCを実装しています。
+prepare/template-init/import/restore/resetの世代構築、固定fixtureの検証・明示昇格、recover、参照照合付きGCを実装しています。
 管理外の非協調writerや停電耐性を証明せず、総合受入前の運用導入は行いません。
 既存worktreeやrun/への操作は行いません。
 

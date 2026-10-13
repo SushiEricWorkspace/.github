@@ -92,3 +92,10 @@ python3.12 -B scripts/dev_server/verify_generation.py --repo /absolute/task/.git
 この記録がない旧開発用管理rootの世代はstartできません。互換処理は追加していません。
 既存rootを削除・再初期化せず保全し、新しい使い捨てrootで生成し直してください。
 GC・実運用導入は本機能の完了とは別です。
+
+
+## 新しいビルド・管理rootでの初期ワールド作成
+
+実機確認にはOS別初期データを使用し、別root・artifactではtemplate-initを選びます。
+新規worldが明示目的の場合だけprepareを使用します。payload・承認・hash照合・実行検証の手順は
+[テンプレート運用](template-guide.md#新しいビルド管理rootでの初期ワールド作成)を参照してください。

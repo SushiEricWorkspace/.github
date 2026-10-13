@@ -44,12 +44,15 @@ Pythonの指定は環境変数のほか、PowerShellの `-Python '絶対パス'`
 
 ## 起動と日常操作
 
-以下はWindowsの例です。macOSでは `& scripts/human-server.ps1` を `sh scripts/human-server.sh` に置換します。
+以下はWindowsの例です。macOSでは `& scripts/human-server.ps1` を `sh scripts/human-server.sh` に置換し、初期templateに`initial-world-macos-v1`を指定します。
 選択済みの貸出・停止世代は、コマンド省略の入口を一回実行するとmode=keepで起動します。
-空枠の初回は借用とprepare、EULA同意を明示します。同意前にaccept-eulaを指定しないでください。
+初回もOS別登録テンプレートを選びます。同じroot・artifactではresetを使用します。
+新しいroot・artifactの準備は管理CLIの[template-init](template-guide.md#新しいビルド管理rootでの初期ワールド作成)で行い、
+取得した同じ貸出tokenでstart・stopまで操作してください。この入口のmodeにtemplate-initはありません。
+空worldが明示目的の試験だけprepareを選びます。同意前にaccept-eulaを指定しないでください。
 
 ```powershell
-& scripts/human-server.ps1 --acquire --mode prepare --seed 52452502 --accept-eula
+& scripts/human-server.ps1 --acquire --mode reset --template initial-world-windows-v1 --accept-eula
 & scripts/human-server.ps1 status
 & scripts/human-server.ps1 logs
 & scripts/human-server.ps1 renew

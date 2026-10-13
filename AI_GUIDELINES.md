@@ -91,7 +91,8 @@
 ### 分離テスト環境の実行
 
 - 管理対象rootは`.github/scripts/dev-server.py`で操作する。初期化前にoperator、絶対root、二永続枠のport、GameTest同時数、quota/reserve、別物理媒体のbackup先を明示して承認を得る。測定値と未確認項目は`scripts/dev_server/acceptance-guide.md`に従って残す。
-- ソースworktreeではtest/buildと固定runtime出力だけを行う。管理対象への起動はacquireで取得したlease/epoch/世代を付けてprepareまたはrestore/reset後にstartし、GameTestは固定bundleからgametestで実行する。直接runServer、手動JVM、管理外SFTP・ファイル編集で管理rootへ書き込まない。非管理の人間用runは明示的な移行依頼まで維持する。
+- ソースworktreeではtest/buildと固定runtime出力だけを行う。管理対象への起動はacquireで取得したlease/epoch/世代を付けてtemplate-initまたはrestore/reset後にstartし、GameTestは固定bundleからgametestで実行する。直接runServer、手動JVM、管理外SFTP・ファイル編集で管理rootへ書き込まない。非管理の人間用runは明示的な移行依頼まで維持する。
+- 人間が別の初期データを明示しない限り、実機確認サーバーはOS別の登録済みワールドから作成する。WindowsのsourceRootは`C:/Users/ryuma/IdeaProjects/SushiEricWorkspace/minecraft-dev/windows-managed`、templateIdは`initial-world-windows-v1`、Macは`/Users/ryuman/IdeaProjects/SushiEricWorkspace/minecraft-dev/human-16-macos`、`initial-world-macos-v1`を使う。同じroot・artifactではreset、新しいrootまたはartifactではtemplate-initを選ぶ。dry-runのtemplateHashと新artifactを確認し、起動・正常保存停止を検証する。テンプレート不足・不一致時は止め、prepareへ切り替えない。空worldが目的の自動試験・明示された新規worldだけprepareを使う。
 - 同じtaskのGradle生成は管理ビルドスクリプトのOS lockで直列化し、Common等の成果物はtask専用発行先と完全座標・hashで固定する。完成bundleの実行時にworktree/buildへ戻らず、bundleの作成OSを越えて流用しない。
 - 人間による実機確認は起動するroot・枠・portと確認事項の許可を得る。管理対象はstartがrunServer相当の開発profileを起動する。待受なしの自動GameTestと、クライアント・JavaFXの実機確認を区別する。
 - 停止は管理CLIのstopを使い、識別済みRCON、保存結果、writer drain、JVM/child終了を照合する。タイムアウト・IPC切断・結果不明は保全して診断し、新しいoperationIdで再試行、自動kill、期限切れだけの再貸出しを行わない。RCONが使えなくても強制終了は別の明示許可を要する。

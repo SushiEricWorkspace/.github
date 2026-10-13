@@ -16,6 +16,7 @@ from .snapshot_control import verify_snapshot
 from .snapshot_data import entry, properties, collect, transform
 from .template_data import shared_data
 from .import_data import inspect_source, source_guard
+from .template_initialization import template_source, template_guard, check_runtime
 from . import storage
 
 
@@ -71,6 +72,8 @@ class GenerationControl:
             return None
         if command == "import":
             return inspect_source(payload["sourceDirectory"])
+        if command == "template-init":
+            return template_source(self.registry, payload)
         snapshot_id = payload.get("snapshotId")
         if command == "reset":
             template_id = identifier(payload["templateId"], "templateId")
@@ -90,6 +93,7 @@ class GenerationControl:
             return self.recover(payload, operation_id=operation_id, dry_run=dry_run)
         identifier(operation_id, "operationId")
         extra = {"prepare": {"seed"}, "restore": {"snapshotId"}, "reset": {"templateId"},
+                 "template-init": {"sourceRoot", "templateId", "templateHash", "approvedBy", "taskId", "purpose"},
                  "import": {"sourceDirectory", "sourceHash", "sourceStopped", "approvedBy", "taskId", "purpose"}}[command]
         fields(payload, TOKEN | {"artifactId", "generationId", "acceptEula"} | extra)
         identifier(payload["generationId"], "generationId")
@@ -98,6 +102,13 @@ class GenerationControl:
         if command == "prepare":
             require(type(payload["seed"]) is int and -(2**63) <= payload["seed"] < 2**63,
                     "INVALID_INPUT", "seedは符号付き64bit整数です")
+        if command == "template-init":
+            absolute_path(payload["sourceRoot"], "sourceRoot")
+            identifier(payload["templateId"], "templateId")
+            identifier(payload["taskId"], "taskId")
+            require(payload["approvedBy"] == self.registry.inventory["operator"]
+                    and type(payload["purpose"]) is str and bool(payload["purpose"].strip()),
+                    "APPROVAL_REQUIRED", "新ビルドへの初期データ利用の運用者承認と用途が必要です")
         if command == "import":
             absolute_path(payload["sourceDirectory"], "sourceDirectory")
             identifier(payload["taskId"], "taskId")
@@ -122,7 +133,8 @@ class GenerationControl:
             require(not source.is_relative_to(self.registry.root.resolve())
                     and not self.registry.root.resolve().is_relative_to(source),
                     "ROOT_MISMATCH", "持込元runと管理rootは独立したディレクトリが必要です")
-        guard = source_guard(payload["sourceDirectory"]) if command == "import" else nullcontext()
+        guard = (source_guard(payload["sourceDirectory"]) if command == "import" else
+                 template_guard(self.registry, payload) if command == "template-init" else nullcontext())
         with guard:
             return self._create(command, payload, operation_id=operation_id, dry_run=dry_run, fingerprint=fingerprint)
 
@@ -135,8 +147,8 @@ class GenerationControl:
             self.registry.runtime._active_generation(row)
         else:
             require(not root.exists() or (root.is_dir() and not any(root.iterdir())), "EXISTING_DATA", "初回枠に既存データがあります")
-        require(command != "prepare" or row["generation"] is None,
-                "EXISTING_DATA", "prepareは初回の空枠だけに使用します")
+        require(command not in {"prepare", "template-init"} or row["generation"] is None,
+                "EXISTING_DATA", "prepare/template-initは初回の空枠だけに使用します")
         bundle = self.registry.root / "artifacts" / payload["artifactId"]
         artifact = verify_bundle(bundle)
         require(artifact["artifactId"] == payload["artifactId"] and artifact["layoutId"] == LAYOUT_ID,
@@ -146,6 +158,10 @@ class GenerationControl:
             source_hash = digest(canonical(manifest))
             require((dry_run and payload["sourceHash"] is None) or payload["sourceHash"] == source_hash,
                     "SOURCE_CHANGED", "dry-runで確認した持込元hashが必要です")
+        elif command == "template-init":
+            require((dry_run and payload["templateHash"] is None) or payload["templateHash"] == manifest["templateHash"],
+                    "SOURCE_CHANGED", "dry-runで確認したtemplateHashが必要です")
+            check_runtime(manifest, artifact, bundle)
         elif manifest:
             require_compatible(manifest, artifact)
         self.registry.runtime._space(sum(item["size"] for item in artifact["files"])
@@ -161,6 +177,9 @@ class GenerationControl:
             result = {"dryRun": True, "wouldExecute": command, "instanceId": row["id"]}
             if command == "import":
                 result.update(sourceHash=source_hash, platform=manifest["platform"], fileCount=len(manifest["files"]))
+            if command == "template-init":
+                result.update(templateHash=manifest["templateHash"], sourceArtifactId=manifest["artifactId"],
+                              snapshotId=manifest["snapshotId"], fileCount=len(manifest["files"]))
             return result
         request = {"operationId": operation_id, "fingerprint": fingerprint, "command": command,
                    "payload": payload, "old": row, "sourceHash": digest(canonical(manifest)) if manifest else None}
@@ -178,7 +197,7 @@ class GenerationControl:
             connection.execute("UPDATE instances SET state='PREPARING',pending=1 WHERE id=?", (row["id"],))
             references = ({"artifact:" + payload["artifactId"], "generation:" + payload["generationId"]}
                     | ({"generation:" + row["generation"]} if row["generation"] else set())
-                    | ({"snapshot:" + manifest["snapshotId"]} if manifest and command != "import" else set()))
+                    | ({"snapshot:" + manifest["snapshotId"]} if manifest and command not in {"import", "template-init"} else set()))
             for reference in references:
                 connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)", (operation_id, reference, row["id"], row["lease"], row["epoch"]))
             connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,?)", (self.registry.clock(), operation_id, command))
@@ -208,13 +227,14 @@ class GenerationControl:
             sources += [(Path(manifest["sourceDirectory"]) / file["path"], file["path"], file)
                         for file in manifest["sourceFiles"]]
         elif manifest:
-            sources += [(self.registry.root / "snapshots" / manifest["snapshotId"] / "data" / file["path"], file["path"], file)
+            source_root = Path(payload["sourceRoot"]) if request["command"] == "template-init" else self.registry.root
+            sources += [(source_root / "snapshots" / manifest["snapshotId"] / "data" / file["path"], file["path"], file)
                         for file in manifest["files"]]
         declaration = next(item for item in self.registry.inventory["instances"] if item["instanceId"] == row["id"])
         if imported:
             values = properties(transform("server.properties", regular_bytes(Path(manifest["sourceDirectory"]) / "server.properties")))
         else:
-            values = properties(regular_bytes(self.registry.root / "snapshots" / manifest["snapshotId"] / "data/server.properties")) if manifest else {"level-name": "world", "level-seed": payload["seed"]}
+            values = properties(regular_bytes((Path(payload["sourceRoot"]) if request["command"] == "template-init" else self.registry.root) / "snapshots" / manifest["snapshotId"] / "data/server.properties")) if manifest else {"level-name": "world", "level-seed": payload["seed"]}
         values.update({"server-ip": declaration["minecraftBind"], "server-port": declaration["ports"]["minecraft"],
                        "enable-rcon": "true", "rcon.port": declaration["ports"]["rcon"], "rcon.password": secrets.token_hex(24),
                        "enable-query": "false", "online-mode": "true"})
@@ -367,7 +387,7 @@ class GenerationControl:
             targets = [dict(value) for value in connection.execute("SELECT * FROM runtime_operations WHERE instance=? AND status!='COMPLETED' AND command!='recover'", (row["id"],))]
             snapshots = [dict(value) for value in connection.execute("SELECT * FROM snapshot_operations WHERE instance=? AND status!='COMPLETED'", (row["id"],))]
             if not targets and not snapshots and payload["targetOperationId"]:
-                completed = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND instance=? AND command IN ('prepare','restore','reset','import')",
+                completed = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND instance=? AND command IN ('prepare','template-init','restore','reset','import')",
                                                (payload["targetOperationId"], row["id"])).fetchone()
                 if completed:
                     targets = [dict(completed)]
@@ -383,7 +403,7 @@ class GenerationControl:
         request = None
         if targets:
             operation = targets[0]
-            require(operation["id"] == target and operation["command"] in {"prepare", "restore", "reset", "import"},
+            require(operation["id"] == target and operation["command"] in {"prepare", "template-init", "restore", "reset", "import"},
                     "PROCESS_UNVERIFIED", "起動・停止の結果不明または対象操作が一致しません")
             journal = self._journal(target)
             if (journal / "requested.json").exists():
@@ -399,9 +419,11 @@ class GenerationControl:
                     "JOURNAL_MISMATCH", "復旧journalの要求・所有権が一致しません")
             if payload["action"] == "resume":
                 self._built(request)
-                if request["command"] == "import":
-                    with source_guard(request["payload"]["sourceDirectory"]):
-                        require(digest(canonical(self._source("import", request["payload"]))) == request["sourceHash"],
+                if request["command"] in {"import", "template-init"}:
+                    guard = (source_guard(request["payload"]["sourceDirectory"]) if request["command"] == "import" else
+                             template_guard(self.registry, request["payload"]))
+                    with guard:
+                        require(digest(canonical(self._source(request["command"], request["payload"]))) == request["sourceHash"],
                                 "SOURCE_CHANGED", "持込元が変更されたためresumeできません")
             else:
                 require(row["generation"] == request["old"]["generation"], "RECOVERY_REQUIRED", "DB確定後の取り消しはrestoreを使用してください")
@@ -425,7 +447,8 @@ class GenerationControl:
                 connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)", (operation_id, fingerprint, "recover", row["id"], "PENDING", "{}"))
         if request:
             if payload["action"] == "resume":
-                guard = source_guard(request["payload"]["sourceDirectory"]) if request["command"] == "import" else nullcontext()
+                guard = (source_guard(request["payload"]["sourceDirectory"]) if request["command"] == "import" else
+                         template_guard(self.registry, request["payload"]) if request["command"] == "template-init" else nullcontext())
                 with guard:
                     self._commit(request, recovery=True)
             else:
