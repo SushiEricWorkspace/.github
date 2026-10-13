@@ -176,3 +176,40 @@ Macは同じ関連範囲の184件中183成功・1skipでした。Java排他の�
 標準fixtureの個別ゲームAPI検証、実運用バックアップ、別媒体の確認としては数えません。
 登録テンプレートは、Windowsが4051b6a4c2a12cb4f36166f69246cfeb05a65f818f49ae5f006a0fcdaa49b305、
 Macがbe516b52b40ae02ccf70fa69c0cb970c81443a1cfa30510c7aa67febb4b9a72aの同一固定artifactに限りresetできます。
+
+
+## 新しいビルド・管理rootでの初期ワールド作成
+
+実機確認サーバーの初期データにはOS別の登録テンプレートを使います。同じroot・artifactではreset、
+新しいrootまたはartifactでは`template-init`を使い、空worldが明示目的の場合だけprepareを使います。
+テンプレート不足・不一致時にprepareへ切り替えません。
+
+WindowsのsourceRootは`C:/Users/ryuma/IdeaProjects/SushiEricWorkspace/minecraft-dev/windows-managed`、
+templateIdは`initial-world-windows-v1`です。Macは`/Users/ryuman/IdeaProjects/SushiEricWorkspace/minecraft-dev/human-16-macos`、
+`initial-world-macos-v1`です。元rootのCLI/監督も本版へ更新し、GCはdeployment lockを共有する入口から実行してください。
+
+template-initは空の貸出枠だけを対象とし、TOKEN、artifactId、generationId、acceptEula=trueと、
+sourceRoot、templateId、templateHash、approvedBy、taskId、purposeを指定します。
+approvedByは作成先inventoryのoperator、purposeは新ビルドへの初期データ使用の承認範囲です。
+`templateHash=null`でdry-runを行い、返ったtemplateHash・sourceArtifactId・snapshotIdを確認して、
+templateHashを設定した同じoperationIdで実行します。CLIは`dev-server.py template-init --root TARGET --payload-file PAYLOAD --operation-id ID`です。
+
+承認済み昇格と検証、snapshot全hash、同じOS・Minecraft版・data-layoutを確認して通常コピーします。
+元のworld・プレイヤー進捗・Mod保存データを引き継ぎ、port・秘密・管理設定・EULAを対象枠へ再生成します。
+コピー元のsnapshotとテンプレートは変更せず、途中障害は既存recoverのresume/rollbackで扱います。
+別Modビルドとの保存互換性を保証する操作ではありません。起動後に対象機能・保存データを確認し、正常stopの成功まで検証してください。
+新ビルドのtemplateを自動昇格せず、reset/restoreの同一artifact制約は維持します。
+
+
+## template-initの実データ確認（2026-10-13、Issue #35）
+
+Windowsはwindows-managedの初期テンプレート（artifact 4051b6a4…）から、専用rootへ別Modビルド
+921fd7e9…で作成しました。Macはhuman-16-macosの初期テンプレート（be516b52…）から
+minecraft-dev/35-macへ、別固定artifact 799962dd…で作成しました。
+作成直後のworld・Mod保存データはWindows113ファイル、Mac25ファイルでコピー元snapshotと一致しました。
+両OSで実起動、Mod保存成功と正常終了、snapshot、GC plan、返却、監督終了まで確認しました。
+元templateHash・snapshot manifestHashは維持されています。証跡は検証rootのmanager/audit/issue35-verification/report.jsonです。
+
+新しい経路10件とGC23件はWindows31成功・2skip、Mac33成功です。
+関連する世代・template・監督65件も失敗なし（両OSとも1skip）で、修正後の重点レビューに追加指摘はありません。
+Macは既存の使い捨て検証rootのbackup設定・operatorを継承しており、別媒体バックアップの運用受入には数えません。

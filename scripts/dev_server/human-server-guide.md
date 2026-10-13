@@ -24,10 +24,13 @@ WindowsではPython 3.12の絶対実行パスとドライブ付き絶対パス�
 以下のARTIFACTは管理rootのartifactsへ配備済みの64桁SHA-256です。
 新規ビルドは[runtime出力](runtime-export-guide.md)の別操作です。
 COMPLETE・全ファイルhash・作成OS/アーキテクチャを照合し、別artifactへの互換性を推測しません。
-初回の空枠は明示借用とprepareを選びます。EULAは運用者の同意後だけ指定します。
+初回もOS別の登録初期テンプレートを選び、同じroot・artifactではresetを使用します。
+新しいroot・artifactでは管理CLIの[template-init](template-guide.md#新しいビルド管理rootでの初期ワールド作成)で準備し、
+同じ貸出tokenでstart・stopまで操作します。この入口のmodeにtemplate-initはありません。
+空worldが明示目的の試験だけprepareを使います。EULAは運用者の同意後だけ指定します。
 
 ~~~bash
-python3.12 -B scripts/human-server.py start --directory /absolute/connection-private --profile "開発 Mac" --instance "永続枠 1" --owner human-session --acquire --mode prepare --artifact ARTIFACT --seed 52452502 --accept-eula
+python3.12 -B scripts/human-server.py start --directory /absolute/connection-private --profile "開発 Mac" --instance "永続枠 1" --owner human-session --acquire --mode reset --template initial-world-macos-v1 --artifact ARTIFACT --accept-eula
 ~~~
 
 既存世代のある返却済み枠は明示restore/resetを要求します。resetは登録templateへ戻し、
