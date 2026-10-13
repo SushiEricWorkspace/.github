@@ -1,6 +1,9 @@
 """実データを使わず、一時Git repositoryでworktreeの分離と拒否条件を確認する。"""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -228,6 +231,344 @@ class TaskWorktreesTest(unittest.TestCase):
         task = self.manager.target("task-a", "SushiEricServerMod")
         self.assertEqual(self.root.resolve(), workspace_for(task))
         self.assertEqual(self.root.resolve(), workspace_for(self.root / "SushiEricServerMod"))
+
+    def set_state(self, state, *, removal_started=True):
+        with self.manager.database() as db:
+            if removal_started:
+                db.execute("INSERT OR IGNORE INTO removals VALUES ('task-a')")
+            db.execute("UPDATE tasks SET state=? WHERE task_id='task-a'", (state,))
+
+    def removed_without_record(self, *, empty=False, residue=False):
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        git(self.root / "SushiEricServerMod", "worktree", "remove", str(path))
+        if empty or residue:
+            path.mkdir()
+        if residue:
+            (path / "keep.txt").write_text("preserve", encoding="utf-8")
+        self.set_state("RECOVERY_REQUIRED")
+        return path
+
+    def test_recovery_reconciles_absent_and_empty_after_interruption(self):
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                self.create()
+                path = self.removed_without_record(empty=empty)
+                with self.assertRaises(TaskError):
+                    self.manager.remove("task-a", "codex-a")
+                result = self.manager.recover_remove("task-a", "codex-a")
+                self.assertEqual("REMOVED", result[0]["state"])
+                self.assertEqual(0, result[0]["repos"][0]["created"])
+                self.assertFalse(path.exists())
+                repo = self.root / "SushiEricServerMod"
+                self.assertNotIn(path.resolve(), worktrees(repo))
+                self.assertTrue(git(repo, "for-each-ref", "refs/heads/feature/issue-100"))
+                if not empty:
+                    # 次の独立した事例のため、一時registryの登録だけを片付ける。
+                    with self.manager.database() as db:
+                        db.execute("DELETE FROM removals WHERE task_id='task-a'")
+                        db.execute("DELETE FROM repos WHERE task_id='task-a'")
+                        db.execute("DELETE FROM tasks WHERE task_id='task-a'")
+                    git(repo, "branch", "-d", "feature/issue-100")
+
+    def test_recovery_preserves_nonempty_unregistered_directory(self):
+        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        path = self.removed_without_record(residue=True)
+        with self.assertRaisesRegex(TaskError, "非空"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertEqual("preserve", (path / "keep.txt").read_text())
+        self.assertTrue(self.manager.target("task-a", "Common").exists())
+        self.assertEqual([1, 1], [p["created"] for p in self.manager.list()[0]["repos"]])
+
+    def test_multiple_repo_failure_reports_and_resumes(self):
+        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        def failing_git(repo, *args):
+            if repo.name == "SushiEricServerMod" and "remove" in args:
+                raise TaskError("Permission denied: synthetic")
+            return git(repo, *args)
+        with patch("dev_server.task_worktrees.git", side_effect=failing_git):
+            with self.assertRaises(TaskError) as caught:
+                self.manager.remove("task-a", "codex-a")
+        message = str(caught.exception)
+        for text in ("Permission denied: synthetic", "処理済みrepo: Common",
+                     "未処理/要確認repo: SushiEricServerMod", "Git登録=True", ".git=True",
+                     "原因は未確定", "sandbox", "--recover-remove"):
+            self.assertIn(text, message)
+        self.assertEqual([0, 1], [p["created"] for p in self.manager.list()[0]["repos"]])
+        self.assertEqual("REMOVED", self.manager.recover_remove("task-a", "codex-a")[0]["state"])
+
+    def test_git_partial_failure_reports_residue_and_preserves_it(self):
+        self.create()
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        def partial_git(repo, *args):
+            if "remove" in args:
+                git(repo, *args)
+                path.mkdir()
+                (path / "source.txt").write_text("preserve", encoding="utf-8")
+                raise TaskError("Filename too long: synthetic")
+            return git(repo, *args)
+        with patch("dev_server.task_worktrees.git", side_effect=partial_git):
+            with self.assertRaisesRegex(TaskError, "Git登録=False, 実体=True, .git=False"):
+                self.manager.remove("task-a", "codex-a")
+        self.assertEqual(1, self.manager.list()[0]["repos"][0]["created"])
+        with self.assertRaisesRegex(TaskError, "非空"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertEqual("preserve", (path / "source.txt").read_text())
+
+    def test_git_success_before_record_interruption_can_be_recovered(self):
+        self.create()
+        def interrupted_git(repo, *args):
+            result = git(repo, *args)
+            if "remove" in args:
+                raise KeyboardInterrupt("synthetic interruption")
+            return result
+        with patch("dev_server.task_worktrees.git", side_effect=interrupted_git):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.manager.remove("task-a", "codex-a")
+        self.assertIn("Git登録=False", caught.exception.__notes__[0])
+        self.assertEqual(1, self.manager.list()[0]["repos"][0]["created"])
+        self.set_state("REMOVING")
+        self.assertEqual("REMOVED", self.manager.recover_remove("task-a", "codex-a")[0]["state"])
+
+    def test_git_success_with_residue_is_not_reported_as_removed(self):
+        self.create()
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        def incomplete_git(repo, *args):
+            result = git(repo, *args)
+            if "remove" in args:
+                path.mkdir()
+            return result
+        with patch("dev_server.task_worktrees.git", side_effect=incomplete_git):
+            with self.assertRaisesRegex(TaskError, "Git削除後"):
+                self.manager.remove("task-a", "codex-a")
+        self.assertEqual("RECOVERY_REQUIRED", self.manager.list()[0]["state"])
+        self.assertEqual("REMOVED", self.manager.recover_remove("task-a", "codex-a")[0]["state"])
+
+    def test_recovery_rejects_other_owner_and_unknown_or_creation_states(self):
+        self.create()
+        self.set_state("RECOVERY_REQUIRED")
+        with self.assertRaisesRegex(TaskError, "owner"):
+            self.manager.recover_remove("task-a", "other")
+        for state in ("ACTIVE", "CREATING", "REMOVED", "UNKNOWN"):
+            self.set_state(state)
+            with self.assertRaisesRegex(TaskError, "状態"):
+                self.manager.recover_remove("task-a", "codex-a")
+        self.assertTrue(self.manager.target("task-a", "SushiEricServerMod").exists())
+
+    def test_recovery_rejects_partial_creation(self):
+        def failing_git(repo, *args):
+            if repo.name == "SushiEricServerMod" and args[:2] == ("worktree", "add"):
+                raise TaskError("synthetic creation failure")
+            return git(repo, *args)
+        with patch("dev_server.task_worktrees.git", side_effect=failing_git):
+            with self.assertRaises(TaskError):
+                self.create(repos={"Common": None, "SushiEricServerMod": None})
+        with self.assertRaisesRegex(TaskError, "削除開始記録"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertTrue(self.manager.target("task-a", "Common").exists())
+
+    def test_creation_failure_after_branch_creation_is_not_removal_recovery(self):
+        repo = self.root / "SushiEricServerMod"
+        def failing_git(repo, *args):
+            if args[:2] == ("worktree", "add"):
+                git(repo, "branch", "feature/issue-100", args[-1])
+                raise TaskError("synthetic failure after branch creation")
+            return git(repo, *args)
+        with patch("dev_server.task_worktrees.git", side_effect=failing_git):
+            with self.assertRaises(TaskError):
+                self.create()
+        with self.assertRaisesRegex(TaskError, "削除開始記録"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertTrue(git(repo, "for-each-ref", "refs/heads/feature/issue-100"))
+        self.assertFalse(self.manager.list()[0]["removal_started"])
+
+    def test_created_repos_without_deletion_intent_are_not_recovered(self):
+        self.create()
+        self.set_state("RECOVERY_REQUIRED", removal_started=False)
+        with self.assertRaisesRegex(TaskError, "削除開始記録"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertTrue(self.manager.target("task-a", "SushiEricServerMod").exists())
+        self.assertEqual("RECOVERY_REQUIRED", self.manager.list()[0]["state"])
+
+    def test_legacy_removing_can_be_recovered_and_old_records_are_preserved(self):
+        self.create()
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        git(self.root / "SushiEricServerMod", "worktree", "remove", str(path))
+        with self.manager.database() as db:
+            db.execute("UPDATE tasks SET state='REMOVING' WHERE task_id='task-a'")
+            db.execute("DROP TABLE removals")
+            db.execute("PRAGMA user_version=1")
+        before = self.manager.list()[0]
+        self.assertEqual("codex-a", before["owner"])
+        self.assertEqual(1, before["repos"][0]["created"])
+        self.assertFalse(before["removal_started"])
+        result = self.manager.recover_remove("task-a", "codex-a")[0]
+        self.assertEqual("REMOVED", result["state"])
+        self.assertTrue(result["removal_started"])
+        with self.manager.database() as db:
+            self.assertEqual(2, db.execute("PRAGMA user_version").fetchone()[0])
+
+    def test_recovery_rejects_dirty_ignored_data_and_branch_mismatch(self):
+        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        self.set_state("RECOVERY_REQUIRED")
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        new = path / "new.txt"
+        new.write_text("keep", encoding="utf-8")
+        with self.assertRaisesRegex(TaskError, "未コミット"):
+            self.manager.recover_remove("task-a", "codex-a")
+        new.unlink()
+        (path / "run").mkdir()
+        data = path / "run/data"
+        data.write_text("keep", encoding="utf-8")
+        with self.assertRaisesRegex(TaskError, "追跡外データ"):
+            self.manager.recover_remove("task-a", "codex-a")
+        data.unlink()
+        (path / "run").rmdir()
+        git(path, "checkout", "-b", "different")
+        with self.assertRaisesRegex(TaskError, "branch"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertTrue(self.manager.target("task-a", "Common").exists())
+        self.assertEqual("RECOVERY_REQUIRED", self.manager.list()[0]["state"])
+
+    def test_recovery_rejects_unknown_registry_and_invalid_record(self):
+        self.create()
+        self.set_state("RECOVERY_REQUIRED")
+        with self.manager.database() as db:
+            db.execute("UPDATE repos SET branch='main' WHERE task_id='task-a'")
+        with self.assertRaisesRegex(TaskError, "管理記録"):
+            self.manager.recover_remove("task-a", "codex-a")
+        with self.manager.database() as db:
+            db.execute("PRAGMA user_version=99")
+        with self.assertRaisesRegex(TaskError, "未知"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertTrue(self.manager.target("task-a", "SushiEricServerMod").exists())
+
+    def test_recovery_and_removal_hold_build_lock_during_git_deletion(self):
+        self.create()
+        self.set_state("RECOVERY_REQUIRED")
+        with build_lock(self.root / "worktrees/task-a/.build.lock"):
+            with self.assertRaises(TaskError):
+                self.manager.recover_remove("task-a", "codex-a")
+        def locked_git(repo, *args):
+            if "remove" in args:
+                with self.assertRaisesRegex(RuntimeError, "操作中"):
+                    with build_lock(self.root / "worktrees/task-a/.build.lock"):
+                        self.fail("削除処理中のlockが解放されています")
+            return git(repo, *args)
+        with patch("dev_server.task_worktrees.git", side_effect=locked_git):
+            self.manager.recover_remove("task-a", "codex-a")
+
+    def test_windows_removal_uses_command_scoped_longpaths_without_force(self):
+        self.create()
+        repo = self.root / "SushiEricServerMod"
+        git(repo, "config", "core.longpaths", "false")
+        calls = []
+        def record_git(repo, *args):
+            calls.append(args)
+            return git(repo, *args)
+        with patch("dev_server.task_worktrees.os", wraps=os) as mock_os:
+            mock_os.name = "nt"
+            with patch("dev_server.task_worktrees.git", side_effect=record_git):
+                self.manager.remove("task-a", "codex-a")
+        removal = next(args for args in calls if "remove" in args)
+        self.assertEqual(("-c", "core.longpaths=true", "worktree", "remove"), removal[:4])
+        self.assertNotIn("--force", removal)
+        for args in calls:
+            if "status" in args or "ls-files" in args:
+                self.assertEqual(("-c", "core.longpaths=true"), args[:2])
+        self.assertEqual("false", git(repo, "config", "--local", "core.longpaths"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows実Gitの長いパス削除試験")
+    def test_windows_real_git_removes_long_ignored_build_and_gradle_paths(self):
+        self.create()
+        repo = self.root / "SushiEricServerMod"
+        git(repo, "config", "core.longpaths", "false")
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        for directory in ("build", ".gradle"):
+            output = path / directory / ("long-path-" * 8) / ("output-" * 10) / "result.txt"
+            self.assertGreater(len(str(output)), 300)
+            output.parent.mkdir(parents=True)
+            output.write_text("disposable", encoding="utf-8")
+        self.manager.remove("task-a", "codex-a")
+        self.assertFalse(path.exists())
+        self.assertNotIn(path.resolve(), worktrees(repo))
+        self.assertEqual("false", git(repo, "config", "--local", "core.longpaths"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows実Gitの長い保存パス保全試験")
+    def test_windows_long_ignored_runtime_data_is_preserved(self):
+        self.create()
+        repo = self.root / "SushiEricServerMod"
+        git(repo, "config", "core.longpaths", "false")
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        data = path / "run" / ("persistent-" * 8) / ("world-" * 12) / "keep.txt"
+        self.assertGreater(len(str(data)), 300)
+        data.parent.mkdir(parents=True)
+        data.write_text("preserve", encoding="utf-8")
+        with self.assertRaisesRegex(TaskError, "追跡外データ"):
+            self.manager.remove("task-a", "codex-a")
+        self.assertEqual("preserve", data.read_text())
+        self.assertIn(path.resolve(), worktrees(repo))
+        self.assertEqual("ACTIVE", self.manager.list()[0]["state"])
+
+    def test_recovery_rejects_descendant_ref_after_branch_disappears(self):
+        self.create()
+        self.removed_without_record()
+        repo = self.root / "SushiEricServerMod"
+        git(repo, "branch", "-d", "feature/issue-100")
+        git(repo, "branch", "feature/issue-100/other")
+        with self.assertRaisesRegex(TaskError, "branch消失"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertEqual("RECOVERY_REQUIRED", self.manager.list()[0]["state"])
+
+    def test_recovery_rejects_symlink_and_special_residual_file(self):
+        self.create()
+        path = self.removed_without_record(empty=True)
+        outside = self.root / "Common/source.txt"
+        link = path / "external"
+        try:
+            link.symlink_to(outside)
+        except OSError as error:
+            self.skipTest(f"このホストにはsymlink作成権限がありません: {error}")
+        with self.assertRaises(TaskError):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual("initial\n", outside.read_text())
+        link.unlink()
+        path.rmdir()
+        path.write_text("preserve", encoding="utf-8")
+        with self.assertRaisesRegex(TaskError, "特殊ファイル"):
+            self.manager.recover_remove("task-a", "codex-a")
+        self.assertEqual("preserve", path.read_text())
+
+    def test_recovery_rechecks_empty_directory_before_removing(self):
+        self.create()
+        path = self.removed_without_record(empty=True)
+        original = self.manager._removal_target
+        calls = 0
+        def changed_target(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (path / "new.txt").write_text("preserve", encoding="utf-8")
+            return original(*args, **kwargs)
+        with patch.object(self.manager, "_removal_target", side_effect=changed_target):
+            with self.assertRaisesRegex(TaskError, "非空"):
+                self.manager.recover_remove("task-a", "codex-a")
+        self.assertEqual("preserve", (path / "new.txt").read_text())
+
+    def test_cli_recovery_requires_task_owner_and_excludes_other_modes(self):
+        script = Path(__file__).resolve().parents[1] / "setup-worktrees.py"
+        for args in (("--recover-remove",), ("--recover-remove", "--task-id", "task-a"),
+                     ("--recover-remove", "--remove")):
+            result = subprocess.run([sys.executable, "-B", str(script), "--workspace-root",
+                                     str(self.root), *args], capture_output=True, text=True)
+            self.assertNotEqual(0, result.returncode)
+        self.create()
+        self.removed_without_record(empty=True)
+        result = subprocess.run([sys.executable, "-B", str(script), "--workspace-root", str(self.root),
+                                 "--recover-remove", "--task-id", "task-a", "--owner", "codex-a"],
+                                capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("REMOVED", result.stdout)
 
 
 if __name__ == "__main__":

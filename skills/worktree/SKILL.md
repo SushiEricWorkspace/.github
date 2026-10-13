@@ -22,6 +22,17 @@ ownerは協調契約でありGit lockやアクセス制御ではない。削除�
 `run/`・`.idea/`を複製しない。Minecraftの実行データはソースworktreeの寿命から切り離す。
 途中失敗のRECOVERY_REQUIREDは実体と登録を確認し、自動修復・強制削除しない。
 
+## 削除失敗の診断と明示復旧
+
+- Windowsの通常削除と削除前検査（status・ls-files）はGitコマンド単位で`core.longpaths=true`を指定する。local/global設定を書き換えず、forceを使用しない。
+- エラー原文、対象パス、Git登録・実体・`.git`の有無、処理済みrepoと未処理/要確認repoを報告する。`Filename too long`と`Permission denied`を同じ原因と決めつけない。
+- アクセス拒否では、対象をcwdにする端末・IDE、利用中プロセス、ファイル/親のアクセス権、sandbox実行権限を確認する。原因は確認するまで未確定とし、無関係なプロセス終了、自動kill、広範囲のpruneを行わない。
+- 対象task・現在owner・全repo・保全内容と削除復旧の許可を確認する。許可済みの範囲では再確認せず、`--recover-remove --task-id ... --owner ...`で明示復旧する。一般の開発依頼やテストから既存実環境の修復許可を推定しない。
+- registry形式2は既存task・repo・owner・state・created記録を保持して削除開始を記録する。形式1から記録を引き継ぎ、形式2未対応の旧スクリプトは使用しない。
+- 復旧は削除開始記録がある`RECOVERY_REQUIRED`または中断した`REMOVING`だけを対象にする。開始を判定できない旧`RECOVERY_REQUIRED`は保全して拒否する。全repoを先に照合し、Git登録・実体が消失したrepoの記録整合、Git登録と`.git`がない空ディレクトリだけの除去、正常な未処理repoの通常検査付き削除を行う。
+- Git登録のない非空ディレクトリ、残存`.git`、dirty、保全データ、他owner、異なるbranch・Git管理先、リンク・特殊ファイル、作成未完了や未知の状態は拒否して保全する。通常`--remove`から不一致を自動修復しない。
+- 復旧後の`REMOVED`・各repoの`created=0`とGit一覧・パスの消失を照合する。branchと登録履歴、primary・他task・固定AI用worktree、instance・snapshot・artifactは削除対象に含めない。
+
 ## 移行中の固定worktree
 
 進行中の作業は自分に割り当てられた`<repo>-codex/`または`<repo>-claude/`で完了できる。

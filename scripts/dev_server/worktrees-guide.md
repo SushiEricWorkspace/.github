@@ -22,8 +22,10 @@ origin/HEADがリリースbranchを指していても、開発基準から起点
 依存commitを使うrepoでは`--base Common=<commit>`のように指定します。複数repoの起点を個別に指定できます。
 既存のlocal/remote branchやworktreeは取り込んだり上書きしたりせず拒否します。
 
-登録は`worktrees/registry.sqlite`（形式1）で管理します。同一taskへの同じ入力の再実行は実体を確認して結果を返します。
+登録は`worktrees/registry.sqlite`（形式2）で管理します。同一taskへの同じ入力の再実行は実体を確認して結果を返します。
 異なるowner、repo、起点commit、Issueで同一taskを再利用しません。
+形式1の既存task・repo・owner・state・created記録を保持して、形式2の削除開始記録を追加します。
+形式2に未対応の旧スクリプトは使用せず、現在のスクリプトを使ってください。未知のregistry形式は拒否します。
 ownerの更新はSQLiteトランザクションで排他します。Gitのref操作はGit自身のlockを使用します。
 ownerは同一ユーザーの協調契約であり、OSのアクセス制御ではありません。手作業のGit操作も同じownerが行います。
 
@@ -45,11 +47,49 @@ primary、共有・固定AI用、他branch用のworktreeは対象外です。
 `--remove`はtask内の全repoを対象にするため、一部repoだけのbranch削除指示で他repoを巻き込まないでください。
 未コミット変更、保全データ、他ownerの作業継続、登録不一致、削除失敗があればworktreeとbranchを保全し、原因と残り作業を報告します。
 
-途中失敗は`RECOVERY_REQUIRED`となり、部分的に作成したworktreeも保全します。
-登録済みの実体が検証できる場合のみ、ownerを明示した削除を再実行できます。
-Git操作の直後に中断して登録と実体が食い違った場合は、自動修復せず手動確認で停止します。
-`CREATING`・`REMOVING`のまま中断したtaskも、別ownerで奪ったりtask-idを再利用したりしません。
-worktreeのディレクトリを直接消す、forceを付ける、広範囲のpruneを行う、という回避は禁止です。
+Windowsの削除前検査（`status`・`ls-files`）とGit削除はコマンド単位で`-c core.longpaths=true`を指定します。
+local/global設定は変更せず、dirty検査を無効化する`--force`も使用しません。
+全repoの事前検査から削除完了までbuild lockを保持します。
+
+途中失敗は`RECOVERY_REQUIRED`となり、失敗時のエラー原文、対象パス、Git登録・実体・`.git`の有無、処理済みrepoと未処理/要確認repoを表示します。
+Git削除前の`REMOVING`遷移と同じトランザクションで削除開始を記録し、一覧の`removal_started`で確認できます。
+Git削除成功後も実体と登録の消失を確認してから`created=0`を記録します。
+失敗や中断を削除完了として扱いません。`--list --task-id ...`で現在の管理記録を確認してください。
+
+### エラー別の確認
+
+- `Filename too long`: 出力された対象パスとGit登録・`.git`の有無を照合します。通常の削除では検査時もWindowsの長いパス設定を付け、保存データの列挙漏れを防ぎますが、失敗後の非空ディレクトリを再帰削除して回避しません。
+- `Permission denied` / `Access is denied`: 対象worktreeをcwdにする端末・IDE、ファイルを利用中のプロセス、ファイルと親ディレクトリのアクセス権、sandboxの実行権限を確認します。エラーだけで利用中プロセスや権限不足を断定しません。必要な許可を得て利用者が原因を解消してから再開します。無関係なプロセス終了、自動killは行いません。
+- 登録branch不一致、未知のファイル、リンク、特殊ファイル、照合不能: 全repoを保全して停止し、対象・owner・データの保全先と個別対応を確認します。force、広範囲のprune、DBの手編集で回避しません。
+
+### 中断した削除の明示復旧
+
+復旧の対象task、現在owner、全repo、保全すべきデータを確認し、削除復旧が許可された範囲内で実行します。
+既存実環境の不整合修復を、開発・テスト依頼だけから実行しません。
+
+```bash
+python3.12 -B scripts/setup-worktrees.py --list --task-id issue-123-a
+python3.12 -B scripts/setup-worktrees.py --recover-remove --task-id issue-123-a --owner claude-session-b
+```
+
+`--recover-remove`は`RECOVERY_REQUIRED`または中断した`REMOVING`の同一task・現在ownerだけを対象とします。
+`RECOVERY_REQUIRED`には削除開始記録が必要です。旧記録に開始記録がなければ作成失敗と区別できないため保全して拒否します。
+旧形式でも`REMOVING`は削除開始が確定しているため、全repoの照合後に復旧できます。
+開始記録のない旧`RECOVERY_REQUIRED`でも、全repoの登録・実体が正常なら許可範囲内で通常`--remove`の検査を通して削除できます。
+登録不一致を通常削除で回避せず、判定不能な旧記録は個別に保全と対応を確認してください。
+全repoの管理記録、管理範囲内のパス、branch・基準commit、Git登録、リンクと実体を先に検査してから、次の処理を行います。
+
+| repoの状態 | 処理 |
+|---|---|
+| Git登録と実体がない | 削除済みとして`created=0`を記録 |
+| Git登録と`.git`がなく空ディレクトリだけ残る | 削除直前にも再検査し、空ディレクトリだけ除去して記録を整合 |
+| 正常なGit登録・実体が残る | 通常のdirty・ignored・リンク検査を通してGit削除を再開 |
+| Git登録のない非空ディレクトリ、残存`.git`、異なるbranch・Git管理先、リンク・特殊ファイル、判定不能 | 変更せず拒否。個別に保全と対応が必要 |
+
+作成未完了のrepo、branch消失、未知の状態・registry形式も拒否します。作成途中のtaskを推測で修復しません。
+通常`--remove`では登録不一致を整合させません。`CREATING`の中断や他ownerのtaskを奪取せず、task-idを再利用しません。
+復旧後は`state=REMOVED`、各repoの`created=0`、Git一覧と対象パスの消失を確認します。
+復旧もtask内の全repoが対象で、branchと登録履歴、primary・固定AI用worktree、instance・snapshot・artifactは残します。
 
 ## 既存環境と同期
 
@@ -72,5 +112,8 @@ python3.12 -B -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 一時Git repositoryで二タスクのsource/index/build分離、owner競合、引継ぎ、dirty拒否、実行領域の保全を確認します。
+部分削除、Git削除直後の中断、複数repoの途中失敗、アクセス拒否は一時repositoryへの故障注入で確認します。
+Windows実Gitで300文字を超えるignored build/.gradle出力の削除を確認する試験は、Windows以外ではskipします。
+skipを実行成功として扱いません。macOSの一時ディレクトリにsymlinkの祖先がある場合は`TMPDIR=/private/tmp`で実行します。
 build分離試験は独立ディレクトリへの合成出力であり、Gradle実行の試験ではありません。
 Windowsでの単体テストをmacOS 15の運用適合や停電耐久性の実証として扱いません。
