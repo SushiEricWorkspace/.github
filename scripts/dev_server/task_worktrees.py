@@ -64,16 +64,20 @@ def workspace_for(repo: Path) -> Path:
 
 
 def clean(target: Path, *, deleting: bool = False) -> None:
-    require(not git(target, "status", "--porcelain", "--untracked-files=all"),
+    options = ("-c", "core.longpaths=true") if os.name == "nt" else ()
+    require(not git(target, *options, "status", "--porcelain", "--untracked-files=all"),
             f"未コミット変更があります: {target}")
     if not deleting:
         return
-    ignored = git(target, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+    ignored = git(target, *options, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
     for name in filter(None, ignored.split("\0")):
         require(name.startswith(("build/", ".gradle/")),
                 f"削除できない追跡外データがあります: {target / name}")
     # Gitに削除を委ねる前に、リンクや特殊ファイルをたどらないことを確認する。
-    for directory, dirs, files in os.walk(target, followlinks=False):
+    def walk_error(error):
+        raise error
+
+    for directory, dirs, files in os.walk(target, followlinks=False, onerror=walk_error):
         for name in (*dirs, *files):
             path = Path(directory) / name
             plain_path(path)
@@ -103,7 +107,7 @@ class TaskWorktrees:
         db = sqlite3.connect(self.root / "registry.sqlite", timeout=15)
         db.row_factory = sqlite3.Row
         try:
-            require(db.execute("PRAGMA user_version").fetchone()[0] in (0, 1),
+            require(db.execute("PRAGMA user_version").fetchone()[0] in (0, 1, 2),
                     "未知のworktree registry形式です")
             db.execute("PRAGMA foreign_keys = ON")
             db.executescript("""
@@ -114,7 +118,9 @@ class TaskWorktrees:
                     task_id TEXT NOT NULL REFERENCES tasks(task_id), name TEXT NOT NULL,
                     branch TEXT NOT NULL, base_commit TEXT NOT NULL, created INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (task_id, name));
-                PRAGMA user_version = 1;
+                CREATE TABLE IF NOT EXISTS removals (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id));
+                PRAGMA user_version = 2;
             """)
             with db:
                 yield db
@@ -234,35 +240,113 @@ class TaskWorktrees:
             db.execute("UPDATE tasks SET owner=? WHERE task_id=?", (owner, task_id))
         return self.list(task_id)
 
+    def _removal_target(self, task_id: str, plan, *, recovering: bool) -> tuple[Path, Path, str]:
+        repo = self.primary(plan["name"])
+        target = self.target(task_id, plan["name"])
+        registered = target.resolve() in worktrees(repo)
+        plain_path(target / ".git")
+        if not plan["created"]:
+            require(not target.exists() and not registered,
+                    f"未確定のworktreeが残っています。手動確認が必要です: {target}")
+            return repo, target, "absent"
+        if registered:
+            require((target / ".git").is_file(), f"worktreeの.gitがありません: {target}")
+            self.verify(task_id, plan, deleting=True)
+            common = Path(git(target, "rev-parse", "--git-common-dir"))
+            require((target / common).resolve() == (repo / ".git").resolve(),
+                    f"worktreeのGit管理先が一致しません: {target}")
+            return repo, target, "registered"
+        require(recovering, f"登録とGitのworktree/branchが一致しません: {target}")
+        require(not (target / ".git").exists(), f"Git登録のない.gitが残っています: {target}")
+        if not target.exists():
+            return repo, target, "absent"
+        require(target.is_dir() and not any(target.iterdir()),
+                f"Git登録のない非空ディレクトリまたは特殊ファイルは保全してください: {target}")
+        return repo, target, "empty"
+
     def remove(self, task_id: str, owner: str) -> list[dict]:
-        with self.build_guard(task_id), self.database() as db:
-            db.execute("BEGIN IMMEDIATE")
-            plans = self.owned(db, task_id, owner, ("ACTIVE", "RECOVERY_REQUIRED"))
-            targets = []
-            for plan in plans:
-                repo = self.primary(plan["name"])
-                target = self.target(task_id, plan["name"])
-                if plan["created"]:
-                    self.verify(task_id, plan, deleting=True)
-                    targets.append((plan["name"], repo, target))
-                else:
+        """全repoの削除前検査を通して削除する。登録不一致は自動修復しない。"""
+        return self._remove(task_id, owner, recovering=False)
+
+    def recover_remove(self, task_id: str, owner: str) -> list[dict]:
+        """同一task・現在ownerの中断した削除を照合し、消失・空の実体だけ整合させる。
+
+        非空の未登録ディレクトリや作成未完了のrepoは保全して拒否する。
+        正常な未処理repoは通常の削除前検査を通して削除する。branchと履歴は残す。
+        """
+        return self._remove(task_id, owner, recovering=True)
+
+    def _remove(self, task_id: str, owner: str, *, recovering: bool) -> list[dict]:
+        with self.build_guard(task_id):
+            with self.database() as db:
+                db.execute("BEGIN IMMEDIATE")
+                states = ("RECOVERY_REQUIRED", "REMOVING") if recovering else ("ACTIVE", "RECOVERY_REQUIRED")
+                plans = self.owned(db, task_id, owner, states)
+                task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                if recovering:
+                    require(task["state"] == "REMOVING" or db.execute(
+                        "SELECT 1 FROM removals WHERE task_id=?", (task_id,)).fetchone() is not None,
+                        "削除開始記録がなく、作成失敗と区別できません。実体を保全して個別確認してください")
+                require(bool(plans), "repoの管理記録がありません")
+                targets = []
+                for plan in plans:
+                    require(plan["created"] in (0, 1)
+                            and plan["branch"] == f"feature/issue-{task['issue']}",
+                            f"repoの管理記録が不正です: {plan['name']}")
+                    repo, target, kind = self._removal_target(task_id, plan, recovering=recovering)
+                    if recovering:
+                        require(git(repo, "for-each-ref", "--format=%(refname)",
+                                    f"refs/heads/{plan['branch']}").splitlines()
+                                == [f"refs/heads/{plan['branch']}"],
+                                f"作成未完了またはbranch消失のため復旧できません: {target}")
+                        require(git(repo, "rev-parse", "--verify", f"{plan['base_commit']}^{{commit}}")
+                                == plan["base_commit"], f"基準commitが不正です: {target}")
+                    targets.append((plan, repo, target, kind))
+                db.execute("INSERT OR IGNORE INTO removals VALUES (?)", (task_id,))
+                db.execute("UPDATE tasks SET state='REMOVING' WHERE task_id=?", (task_id,))
+            completed = []
+            try:
+                for plan, repo, target, kind in targets:
+                    # 削除直前にも再検査し、Gitのdirty検査を無効化するforceは使わない。
+                    require(self._removal_target(task_id, plan, recovering=recovering)[2] == kind,
+                            f"削除前検査後にworktreeの状態が変わりました: {target}")
+                    if kind == "registered":
+                        options = ("-c", "core.longpaths=true") if os.name == "nt" else ()
+                        git(repo, *options, "worktree", "remove", str(target))
+                    elif kind == "empty":
+                        # rmdirは再検査後にファイルが増えた場合も非空の実体を削除しない。
+                        target.rmdir()
                     require(not target.exists() and target.resolve() not in worktrees(repo),
-                            f"未確定のworktreeが残っています。手動確認が必要です: {target}")
-            db.execute("UPDATE tasks SET state='REMOVING' WHERE task_id=?", (task_id,))
-        try:
-            for name, repo, target in targets:
-                # 削除直前にも再検査し、Gitのdirty検査を無効化するforceは使わない。
-                plan = next(p for p in plans if p["name"] == name)
-                self.verify(task_id, plan, deleting=True)
-                git(repo, "worktree", "remove", str(target))
+                            f"Git削除後もworktreeの実体または登録が残っています: {target}")
+                    with self.database() as db:
+                        db.execute("UPDATE repos SET created=0 WHERE task_id=? AND name=?",
+                                   (task_id, plan["name"]))
+                    completed.append(plan["name"])
                 with self.database() as db:
-                    db.execute("UPDATE repos SET created=0 WHERE task_id=? AND name=?", (task_id, name))
-            with self.database() as db:
-                db.execute("UPDATE tasks SET state='REMOVED' WHERE task_id=?", (task_id,))
-        except BaseException:
-            with self.database() as db:
-                db.execute("UPDATE tasks SET state='RECOVERY_REQUIRED' WHERE task_id=?", (task_id,))
-            raise
+                    db.execute("UPDATE tasks SET state='REMOVED' WHERE task_id=?", (task_id,))
+            except BaseException as error:
+                with self.database() as db:
+                    db.execute("UPDATE tasks SET state='RECOVERY_REQUIRED' WHERE task_id=?", (task_id,))
+                details = [f"削除中断: task={task_id}, owner={owner}, state=RECOVERY_REQUIRED",
+                           f"原文: {error}", f"処理済みrepo: {', '.join(completed) or 'なし'}",
+                           "未処理/要確認repo: " + ", ".join(p["name"] for p in plans
+                                                            if p["name"] not in completed)]
+                for plan, repo, target, _ in targets:
+                    try:
+                        registered = target.resolve() in worktrees(repo)
+                        details.append(f"{plan['name']}: path={target}, Git登録={registered}, "
+                                       f"実体={target.exists()}, .git={(target / '.git').exists()}")
+                    except (TaskError, OSError) as diagnostic_error:
+                        details.append(f"{plan['name']}: path={target}, 照合不能: {diagnostic_error}")
+                if "permission denied" in str(error).lower() or "access is denied" in str(error).lower():
+                    details.append("アクセス拒否の原因は未確定です。対象をcwdにする端末・IDE、利用中プロセス、"
+                                   "ファイル/親のアクセス権、sandboxの実行権限を確認してください。自動killは行いません。")
+                details.append("実体を保全して確認し、削除復旧の許可範囲内で--recover-removeを実行してください。")
+                message = "\n".join(details)
+                if isinstance(error, Exception):
+                    raise TaskError(message) from error
+                error.add_note(message)
+                raise
         return self.list(task_id)
 
     def list(self, task_id: str | None = None) -> list[dict]:
@@ -274,6 +358,8 @@ class TaskWorktrees:
             result = []
             for row in rows:
                 record = dict(row)
+                record["removal_started"] = db.execute(
+                    "SELECT 1 FROM removals WHERE task_id=?", (row["task_id"],)).fetchone() is not None
                 record["repos"] = [dict(p, path=str(self.target(row["task_id"], p["name"])))
                                    for p in db.execute("SELECT * FROM repos WHERE task_id=? ORDER BY name",
                                                        (row["task_id"],))]

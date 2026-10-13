@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--list-legacy", action="store_true", help="既存worktreeを読み取り専用で一覧")
     mode.add_argument("--handoff-from", metavar="OWNER", help="現在のownerから担当を引き継ぐ")
     mode.add_argument("--remove", action="store_true", help="登録taskのworktreeだけを削除")
+    mode.add_argument("--recover-remove", action="store_true", help="現在ownerで中断した削除を明示復旧")
     return parser.parse_args()
 
 
@@ -38,7 +39,9 @@ def main() -> int:
             result = manager.list(args.task_id)
         else:
             require(bool(args.task_id) and bool(args.owner), "--task-idと--ownerが必要です")
-            if args.remove:
+            if args.recover_remove:
+                result = manager.recover_remove(args.task_id, args.owner)
+            elif args.remove:
                 result = manager.remove(args.task_id, args.owner)
             elif args.handoff_from:
                 result = manager.handoff(args.task_id, args.handoff_from, args.owner)
