@@ -111,7 +111,7 @@ def transform(name: str, data: bytes) -> bytes:
     return data
 
 
-def collect(generation: Path) -> tuple[dict, list[dict]]:
+def collect(generation: Path, *, importing: bool = False) -> tuple[dict, list[dict]]:
     """未知通常ファイルも全worldから収集する。リンク・hardlink・外部DBは拒否する。"""
     plain_path(generation)
     world = properties(regular_bytes(generation / "server.properties")).get("level-name", "")
@@ -123,6 +123,16 @@ def collect(generation: Path) -> tuple[dict, list[dict]]:
     validate("dataLayout", layout)
     allowed_top = {"runtime", "generation.json", "eula.txt", "logs", "crash-reports", "mods", "usercache.json",
                    world.split("/")[0], "config"} | ROOT_FILES
+    if importing:
+        allowed_top = (allowed_top - {"runtime", "generation.json"}) | {".DS_Store", "resources"}
+        metadata = generation / ".DS_Store"
+        plain_path(metadata)
+        require(not metadata.exists() or (metadata.is_file() and metadata.stat().st_nlink == 1),
+                "UNSUPPORTED_FILE", ".DS_Storeは通常ファイルだけを除外できます")
+        resources = generation / "resources"
+        plain_path(resources)
+        require(not resources.exists() or (resources.is_dir() and not any(resources.iterdir())),
+                "ROOT_MISMATCH", "空ではないresourcesは持込対象として未分類です")
     require({path.name for path in generation.iterdir()} <= allowed_top,
             "ROOT_MISMATCH", "generationに未登録rootがあります")
     for path in generation.iterdir():
@@ -141,6 +151,10 @@ def collect(generation: Path) -> tuple[dict, list[dict]]:
             for name in dirs + names:
                 path = Path(parent) / name
                 plain_path(path)
+                if importing and name == ".DS_Store":
+                    require(path.is_file() and path.stat().st_nlink == 1,
+                            "UNSUPPORTED_FILE", ".DS_Storeは通常ファイルだけを除外できます")
+                    continue
                 if name in names and path.relative_to(generation).as_posix() != world + "/session.lock":
                     paths.append(path)
     entries = []

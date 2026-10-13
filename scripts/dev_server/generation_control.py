@@ -3,10 +3,11 @@ import json
 import os
 import re
 import secrets
+from contextlib import nullcontext
 from pathlib import Path
 
 from .build_inputs import canonical, digest, regular_bytes
-from .contracts import LAYOUT_ID, require_compatible
+from .contracts import LAYOUT_ID, absolute_path, require_compatible
 from .local_ipc import make_private, plain_path, require_private
 from .registry import RegistryError, fields, identifier, require, ttl
 from .runtime_bundle import verify_bundle, _files
@@ -14,6 +15,7 @@ from .runtime_control import TOKEN, read_json
 from .snapshot_control import verify_snapshot
 from .snapshot_data import entry, properties, collect, transform
 from .template_data import shared_data
+from .import_data import inspect_source, source_guard
 from . import storage
 
 
@@ -67,6 +69,8 @@ class GenerationControl:
     def _source(self, command, payload):
         if command == "prepare":
             return None
+        if command == "import":
+            return inspect_source(payload["sourceDirectory"])
         snapshot_id = payload.get("snapshotId")
         if command == "reset":
             template_id = identifier(payload["templateId"], "templateId")
@@ -85,7 +89,8 @@ class GenerationControl:
         if command == "recover":
             return self.recover(payload, operation_id=operation_id, dry_run=dry_run)
         identifier(operation_id, "operationId")
-        extra = {"prepare": {"seed"}, "restore": {"snapshotId"}, "reset": {"templateId"}}[command]
+        extra = {"prepare": {"seed"}, "restore": {"snapshotId"}, "reset": {"templateId"},
+                 "import": {"sourceDirectory", "sourceHash", "sourceStopped", "approvedBy", "taskId", "purpose"}}[command]
         fields(payload, TOKEN | {"artifactId", "generationId", "acceptEula"} | extra)
         identifier(payload["generationId"], "generationId")
         require(type(payload["artifactId"]) is str and re.fullmatch("[0-9a-f]{64}", payload["artifactId"])
@@ -93,6 +98,12 @@ class GenerationControl:
         if command == "prepare":
             require(type(payload["seed"]) is int and -(2**63) <= payload["seed"] < 2**63,
                     "INVALID_INPUT", "seedは符号付き64bit整数です")
+        if command == "import":
+            absolute_path(payload["sourceDirectory"], "sourceDirectory")
+            identifier(payload["taskId"], "taskId")
+            require(payload["approvedBy"] == self.registry.inventory["operator"] and payload["sourceStopped"] is True
+                    and type(payload["purpose"]) is str and bool(payload["purpose"].strip()),
+                    "APPROVAL_REQUIRED", "持込元の正常停止・全writer終了の運用者確認と用途が必要です")
         fingerprint = digest(canonical({"command": command, "payload": payload}))
         with self.registry.transaction(read_only=True) as connection:
             for table in TABLES[:-1]:
@@ -106,6 +117,16 @@ class GenerationControl:
             require(not row["run_id"], "STALE_OPERATION", "起動後に古い世代切替を再適用しません")
             self.registry.runtime._active_generation(row)
             return dict(json.loads(cached["response"]), replayed=True, dryRun=dry_run)
+        if command == "import":
+            source = Path(payload["sourceDirectory"]).resolve()
+            require(not source.is_relative_to(self.registry.root.resolve())
+                    and not self.registry.root.resolve().is_relative_to(source),
+                    "ROOT_MISMATCH", "持込元runと管理rootは独立したディレクトリが必要です")
+        guard = source_guard(payload["sourceDirectory"]) if command == "import" else nullcontext()
+        with guard:
+            return self._create(command, payload, operation_id=operation_id, dry_run=dry_run, fingerprint=fingerprint)
+
+    def _create(self, command, payload, *, operation_id, dry_run, fingerprint):
         row = self._row(payload)
         require(row["state"] in {"LEASED_STOPPED", "READY"} and not row["pending"], "NOT_STOPPED", "停止済み枠が必要です")
         self._stopped(row)
@@ -114,13 +135,18 @@ class GenerationControl:
             self.registry.runtime._active_generation(row)
         else:
             require(not root.exists() or (root.is_dir() and not any(root.iterdir())), "EXISTING_DATA", "初回枠に既存データがあります")
-        require(command != "prepare" or row["generation"] is None, "EXISTING_DATA", "prepareは初回の空枠だけに使用します")
+        require(command != "prepare" or row["generation"] is None,
+                "EXISTING_DATA", "prepareは初回の空枠だけに使用します")
         bundle = self.registry.root / "artifacts" / payload["artifactId"]
         artifact = verify_bundle(bundle)
         require(artifact["artifactId"] == payload["artifactId"] and artifact["layoutId"] == LAYOUT_ID,
                 "ARTIFACT_MISMATCH", "artifactまたはlayoutが一致しません")
         manifest = self._source(command, payload)
-        if manifest:
+        if command == "import":
+            source_hash = digest(canonical(manifest))
+            require((dry_run and payload["sourceHash"] is None) or payload["sourceHash"] == source_hash,
+                    "SOURCE_CHANGED", "dry-runで確認した持込元hashが必要です")
+        elif manifest:
             require_compatible(manifest, artifact)
         self.registry.runtime._space(sum(item["size"] for item in artifact["files"])
                                     + (bundle / "runtime.json").stat().st_size
@@ -132,9 +158,14 @@ class GenerationControl:
             plain_path(path)
             require(not path.exists(), "EXISTING_DATA", "世代・作業領域・journalを上書きしません")
         if dry_run:
-            return {"dryRun": True, "wouldExecute": command, "instanceId": row["id"]}
+            result = {"dryRun": True, "wouldExecute": command, "instanceId": row["id"]}
+            if command == "import":
+                result.update(sourceHash=source_hash, platform=manifest["platform"], fileCount=len(manifest["files"]))
+            return result
         request = {"operationId": operation_id, "fingerprint": fingerprint, "command": command,
                    "payload": payload, "old": row, "sourceHash": digest(canonical(manifest)) if manifest else None}
+        if command == "import":
+            request["importSource"] = manifest
         with self.registry.transaction() as connection:
             current = self.registry._instance(connection, row["id"])
             self.registry._token(current, payload)
@@ -147,7 +178,7 @@ class GenerationControl:
             connection.execute("UPDATE instances SET state='PREPARING',pending=1 WHERE id=?", (row["id"],))
             references = ({"artifact:" + payload["artifactId"], "generation:" + payload["generationId"]}
                     | ({"generation:" + row["generation"]} if row["generation"] else set())
-                    | ({"snapshot:" + manifest["snapshotId"]} if manifest else set()))
+                    | ({"snapshot:" + manifest["snapshotId"]} if manifest and command != "import" else set()))
             for reference in references:
                 connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)", (operation_id, reference, row["id"], row["lease"], row["epoch"]))
             connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,?)", (self.registry.clock(), operation_id, command))
@@ -172,17 +203,27 @@ class GenerationControl:
             require_private(path, directory=True)
         sources = [(bundle / file["path"], "runtime/" + file["path"], file) for file in verify_bundle(bundle)["files"]]
         sources += [(bundle / name, "runtime/" + name, entry(name, regular_bytes(bundle / name))) for name in ("runtime.json", "COMPLETE")]
-        if manifest:
+        imported = request["command"] == "import"
+        if imported:
+            sources += [(Path(manifest["sourceDirectory"]) / file["path"], file["path"], file)
+                        for file in manifest["sourceFiles"]]
+        elif manifest:
             sources += [(self.registry.root / "snapshots" / manifest["snapshotId"] / "data" / file["path"], file["path"], file)
                         for file in manifest["files"]]
         declaration = next(item for item in self.registry.inventory["instances"] if item["instanceId"] == row["id"])
-        values = properties(regular_bytes(self.registry.root / "snapshots" / manifest["snapshotId"] / "data/server.properties")) if manifest else {"level-name": "world", "level-seed": payload["seed"]}
+        if imported:
+            values = properties(transform("server.properties", regular_bytes(Path(manifest["sourceDirectory"]) / "server.properties")))
+        else:
+            values = properties(regular_bytes(self.registry.root / "snapshots" / manifest["snapshotId"] / "data/server.properties")) if manifest else {"level-name": "world", "level-seed": payload["seed"]}
         values.update({"server-ip": declaration["minecraftBind"], "server-port": declaration["ports"]["minecraft"],
                        "enable-rcon": "true", "rcon.port": declaration["ports"]["rcon"], "rcon.password": secrets.token_hex(24),
                        "enable-query": "false", "online-mode": "true"})
         for source, name, file in sources:
             data = regular_bytes(source)
             require(entry(file["path"], data) == file, "SOURCE_CHANGED", "コピー元のhashが変更されました")
+            if imported and not name.startswith("runtime/"):
+                data = shared_data(name, transform(name, data))
+                require(entry(name, data) in manifest["files"], "SOURCE_CHANGED", "持込元の可搬データが変更されました")
             if name == "server.properties":
                 continue
             if name == "config/SushiEricServerMod/management/config.yml":
@@ -326,7 +367,7 @@ class GenerationControl:
             targets = [dict(value) for value in connection.execute("SELECT * FROM runtime_operations WHERE instance=? AND status!='COMPLETED' AND command!='recover'", (row["id"],))]
             snapshots = [dict(value) for value in connection.execute("SELECT * FROM snapshot_operations WHERE instance=? AND status!='COMPLETED'", (row["id"],))]
             if not targets and not snapshots and payload["targetOperationId"]:
-                completed = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND instance=? AND command IN ('prepare','restore','reset')",
+                completed = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND instance=? AND command IN ('prepare','restore','reset','import')",
                                                (payload["targetOperationId"], row["id"])).fetchone()
                 if completed:
                     targets = [dict(completed)]
@@ -342,7 +383,7 @@ class GenerationControl:
         request = None
         if targets:
             operation = targets[0]
-            require(operation["id"] == target and operation["command"] in {"prepare", "restore", "reset"},
+            require(operation["id"] == target and operation["command"] in {"prepare", "restore", "reset", "import"},
                     "PROCESS_UNVERIFIED", "起動・停止の結果不明または対象操作が一致しません")
             journal = self._journal(target)
             if (journal / "requested.json").exists():
@@ -358,6 +399,10 @@ class GenerationControl:
                     "JOURNAL_MISMATCH", "復旧journalの要求・所有権が一致しません")
             if payload["action"] == "resume":
                 self._built(request)
+                if request["command"] == "import":
+                    with source_guard(request["payload"]["sourceDirectory"]):
+                        require(digest(canonical(self._source("import", request["payload"]))) == request["sourceHash"],
+                                "SOURCE_CHANGED", "持込元が変更されたためresumeできません")
             else:
                 require(row["generation"] == request["old"]["generation"], "RECOVERY_REQUIRED", "DB確定後の取り消しはrestoreを使用してください")
         elif snapshots:
@@ -380,7 +425,9 @@ class GenerationControl:
                 connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)", (operation_id, fingerprint, "recover", row["id"], "PENDING", "{}"))
         if request:
             if payload["action"] == "resume":
-                self._commit(request, recovery=True)
+                guard = source_guard(request["payload"]["sourceDirectory"]) if request["command"] == "import" else nullcontext()
+                with guard:
+                    self._commit(request, recovery=True)
             else:
                 old = request["old"]
                 root = self.registry.runtime._paths(row["id"])

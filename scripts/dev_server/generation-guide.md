@@ -11,11 +11,12 @@
 | 操作 | tokenに追加する必須項目 |
 |---|---|
 | prepare | artifactId、generationId、acceptEula=true、seed |
+| import | artifactId、generationId、acceptEula=true、sourceDirectory、sourceHash、sourceStopped=true、approvedBy、taskId、purpose |
 | restore | artifactId、generationId、acceptEula=true、snapshotId |
 | reset | artifactId、generationId、acceptEula=true、templateId |
 | recover | action（resume/rollback）、targetOperationId、ttlSeconds |
 
-prepareは初回の空枠だけです。restoreは登録済みsnapshot全体を復元します。
+prepareは初回の空枠だけです。importは空枠または正常停止済みの貸出枠へ新しい世代を構築し、旧世代を保全します。importは停止確認済みの人間用runを通常コピーします。元runの移動・削除は行いません。restoreは登録済みsnapshot全体を復元します。
 resetは`templates/<templateId>.json`が指す不変snapshotへ戻します。空worldの再生成ではありません。
 テンプレートの登録・昇格は[テンプレートガイド](template-guide.md)に従います。未登録templateや異なる参照hashは拒否します。
 参照契約はschemaVersion=1、templateId、snapshotId、manifestHash、artifactId、validationId、operationIdです。
@@ -47,7 +48,7 @@ Windowsは同一volumeのMoveFileExW/WRITE_THROUGH、macOSはrename、file fsync
 
 supervisor再起動時は全枠をRECOVERY_REQUIREDへ保留します。
 復旧はまず`--dry-run`で確認し、同じ要求とoperationIdで実行します。
-targetOperationIdには途中のprepare/restore/reset/snapshot操作IDを指定します。
+targetOperationIdには途中のprepare/import/restore/reset/snapshot操作IDを指定します。
 途中操作がない停止枠の再起動照合にはnullを指定します。
 未貸出枠はleaseId=nullと現epoch/期待世代を指定し、resumeでAVAILABLEへ戻します。新しいleaseは勝手に発行しません。
 期限切れleaseでも同じlease/epochの明示recoverだけがttlSecondsを使って期限を更新できます。
@@ -57,6 +58,7 @@ python3.12 -B scripts/dev-server.py recover --root /absolute/minecraft-dev --ope
 python3.12 -B scripts/dev-server.py recover --root /absolute/minecraft-dev --operation-id recover-01 --payload-file /absolute/recover.json
 ```
 
+importのresumeは元runのworldロックを保持し、承認したsourceHashを再照合します。
 resumeは完成済み世代の全hashを再照合して切替を完了します。未完成コピーを推測して完成扱いにしません。
 rollbackはDB確定前の切替を旧世代へ戻します。初回の部分構築はinstance全体をquarantineへ同一FSで保全移動し、空枠を再利用できます。
 DB確定後に別の状態へ戻す場合は、新規restoreを使用します。
