@@ -57,6 +57,27 @@ bundleの内部へ実行データを置けませんが、generation/runtimeの�
 管理propertyは全5項目または未指定です。プロセス開始・正常停止・保存証跡は
 [runtime制御](runtime-control-guide.md)の責務です。
 
+## ビルド記録とMavenの明示回収
+
+helperはビルドUUIDごとに`worktrees/<task>/maven/<UUID>`へ発行し、task外の`worktrees/.build-records/<task>/<UUID>.json`へ開始・成功・失敗を記録します。
+成功は完成bundleの全hash、manifest hash・artifact ID、発行コピーと入力の再照合後に確定します。MavenのPOM/JAR以外のmetadata・checksum・claim・空dirもinventoryへ記録します。
+exporterはfreeze成功後にsource lockの拡張子を`.receipt.json`へ置き換えたreceiptを新規作成します。既存receiptは上書きせず拒否するため、直接exporterを呼ぶ場合も新しいsource lock名を使ってください。
+receiptだけでは成功記録になりません。失敗・開始途中・記録のない古い出力は推測で回収しません。
+
+worktree削除後、現在の登録ownerで候補を確認し、返されたUUIDと候補hashを明示して一つずつ回収します。成功記録のownerは開始時の監査情報であり、正規の引継ぎ後は現在ownerを指定します。
+
+```bash
+python3.12 -B scripts/collect-task-maven.py --workspace-root /workspace --task-id issue-123-a --owner codex-session-a --dry-run
+python3.12 -B scripts/collect-task-maven.py --workspace-root /workspace --task-id issue-123-a --owner codex-session-a --build-id <32桁UUID> --candidate-hash <dry-runの64桁hash>
+```
+
+dry-runはUUIDごとの候補hashまたは保持理由を返します。実回収は`REMOVED`のtaskで、成功記録・完成bundle・コピーpublication・全inventoryが一致するUUIDだけが対象です。
+同じbuild lockを保持し、owner/state・記録・bundle・inventoryを削除直前にも再照合します。リンク・特殊file・未知の追加file/dir・改変は拒否し、bundleとMaven候補の包含関係も両方向で拒否します。
+削除するのは選択UUID配下の記録済み通常fileと空dirだけです。task/Maven親、`.build.lock`、registry、Git、artifact、snapshotは残し、自動GCは行いません。
+Windowsは祖先dirを保持し、通常fileの固定パスとhashを同じhandleで確認して、そのhandleへ削除を指定します。POSIXはdir FDを固定し、leafをprivate quarantineへ移してinode/hashが一致したものだけを削除します。
+途中失敗は`COLLECTING`のまま保全し、自動復旧しません。POSIXで差替えを検出したfileはUUID内の`.maven-collect-*`へ残ります。個別に保全状況を確認してください。
+この手順は登録ownerとbuild lockに従う協調作業を前提にします。
+
 ## 検証境界
 
 ```bash

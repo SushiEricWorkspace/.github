@@ -12,7 +12,8 @@ import uuid
 from dev_server.build_inputs import canonical, capture_sources, digest, regular_bytes, verify_sources
 from dev_server.contracts import ContractError
 from dev_server.runtime_bundle import _directory
-from dev_server.task_worktrees import TaskWorktrees
+from dev_server.task_worktrees import TaskError, TaskWorktrees
+from dev_server.task_maven import TaskMaven
 from dev_server.build_lock import build_lock
 
 
@@ -95,43 +96,55 @@ def main():
         build_id = uuid.uuid4().hex
         maven = root / "maven" / build_id
         _directory(maven)
-        maven.mkdir(parents=True, exist_ok=False)
-        common = repos["Common"]
-        gradle(common, "build", "publishDevelopment", f"-PcommonDevelopmentRepository={maven}")
-        mod_coordinate = publication(common, "mod", "sushieric-common-mod-dev")
-        editor_coordinate = publication(common, "editor", "sushieric-common-editor-dev")
-        publications = []
-
-        def record_publication(coordinate, repository):
-            group, module, version = coordinate.split(":")
-            for suffix in ("jar", "pom"):
-                path = repository / group.replace(".", "/") / module / version / f"{module}-{version}.{suffix}"
-                publications.append({"coordinate": coordinate, "path": str(path),
-                                     "sha256": digest(regular_bytes(path))})
-
-        record_publication(mod_coordinate, maven)
-        record_publication(editor_coordinate, maven)
-        mod_args = [f"-PcommonDevelopmentRepository={maven}", f"-PcommonDevelopmentCoordinate={mod_coordinate}"]
-        if core:
-            core_repo = maven / "core"
-            gradle(repos["SushiEricCombatCore"], "build", "publishDevelopment", *mod_args,
-                   f"-PcombatCoreDevelopmentRepository={core_repo}")
-            record_publication(publication(repos["SushiEricCombatCore"], "core", "sushieric-combat-core-dev"), core_repo)
-        if manager:
-            gradle(repos["SushiEricServerManager"], "build", f"-PcommonDevelopmentRepository={maven}",
-                   f"-PcommonDevelopmentCoordinate={editor_coordinate}")
-        verify_sources(source_lock)
-        registered_task(root, args.owner, names)
-        source_lock["publications"] = publications
         lock = repos["SushiEricServerMod"] / "build/dev-runtime" / f"source-lock-{build_id}.json"
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_bytes(canonical(source_lock))
-        gradle(repos["SushiEricServerMod"], "build", "exportDevRuntime", *mod_args,
-               f"-PruntimeSourceLock={lock}", f"-PruntimeArtifactStore={args.store.absolute()}",
-               f"-PruntimePython={sys.executable}",
-               f"-PruntimeExporter={exporter}")
-        verify_sources(source_lock)
-        print(json.dumps({"task": root.name, "commonCoordinate": mod_coordinate, "status": "exported"}))
+        records = TaskMaven(root.parent.parent)
+        record = records.start(root.name, build_id, args.owner, lock)
+        try:
+            maven.mkdir(parents=True, exist_ok=False)
+            common = repos["Common"]
+            gradle(common, "build", "publishDevelopment", f"-PcommonDevelopmentRepository={maven}")
+            mod_coordinate = publication(common, "mod", "sushieric-common-mod-dev")
+            editor_coordinate = publication(common, "editor", "sushieric-common-editor-dev")
+            publications = []
+
+            def record_publication(coordinate, repository):
+                group, module, version = coordinate.split(":")
+                for suffix in ("jar", "pom"):
+                    path = repository / group.replace(".", "/") / module / version / f"{module}-{version}.{suffix}"
+                    publications.append({"coordinate": coordinate, "path": str(path),
+                                         "sha256": digest(regular_bytes(path))})
+
+            record_publication(mod_coordinate, maven)
+            record_publication(editor_coordinate, maven)
+            mod_args = [f"-PcommonDevelopmentRepository={maven}", f"-PcommonDevelopmentCoordinate={mod_coordinate}"]
+            if core:
+                core_repo = maven / "core"
+                gradle(repos["SushiEricCombatCore"], "build", "publishDevelopment", *mod_args,
+                       f"-PcombatCoreDevelopmentRepository={core_repo}")
+                record_publication(publication(repos["SushiEricCombatCore"], "core", "sushieric-combat-core-dev"), core_repo)
+            if manager:
+                gradle(repos["SushiEricServerManager"], "build", f"-PcommonDevelopmentRepository={maven}",
+                       f"-PcommonDevelopmentCoordinate={editor_coordinate}")
+            verify_sources(source_lock)
+            registered_task(root, args.owner, names)
+            source_lock["publications"] = publications
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.write_bytes(canonical(source_lock))
+            gradle(repos["SushiEricServerMod"], "build", "exportDevRuntime", *mod_args,
+                   f"-PruntimeSourceLock={lock}", f"-PruntimeArtifactStore={args.store.absolute()}",
+                   f"-PruntimePython={sys.executable}",
+                   f"-PruntimeExporter={exporter}")
+            verify_sources(source_lock)
+            registered_task(root, args.owner, names)
+            record = records.succeed(record, source_lock)
+        except BaseException as error:
+            try:
+                records.fail(record, error)
+            except (TaskError, OSError, ValueError, KeyError, TypeError) as record_error:
+                error.add_note(f"失敗記録を保存できませんでした: {record_error}")
+            raise
+        print(json.dumps({"task": root.name, "commonCoordinate": mod_coordinate, "status": "exported",
+                          "buildId": build_id, "artifactId": record["artifactId"]}))
 
 
 if __name__ == "__main__":

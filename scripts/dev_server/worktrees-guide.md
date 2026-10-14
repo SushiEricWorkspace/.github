@@ -134,6 +134,8 @@ python3.12 -B scripts/setup-worktrees.py --recover-remove --task-id issue-123-a 
 復旧後は`state=REMOVED`、各repoの`created=0`、Git一覧と対象パスの消失を確認します。
 復旧もtask内の全repoが対象で、branchと登録履歴、primary・固定AI用worktree、instance・snapshot・artifactは残します。
 
+Maven出力はworktree削除後も残します。成功ビルドの記録と完成bundleを照合する明示回収は[runtime exportガイド](runtime-export-guide.md#ビルド記録とmavenの明示回収)を参照してください。task全体やMaven親をディレクトリごと削除しません。
+
 ## 既存環境と同期
 
 既存の固定AI worktreeは`--list-legacy`で読めます。作成・削除・移動・runコピーを自動で行いません。
