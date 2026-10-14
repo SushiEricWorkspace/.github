@@ -15,13 +15,13 @@ primary、人間、別ownerの作業ディレクトリを使わない。
 変更範囲はIssueが属するrepo内に限定する。他repoの変更にはそのrepoの別Issue・branch・worktree・PRを用意する。
 関連Issueは`owner/repo#番号`で相互参照し、共有契約・前提commit・実施順を記載する。同番号でもrepoが異なれば別Issueである。
 依存ソースの読み取りや確定成果物の利用だけなら変更Issueは不要であり、元Issue番号のbranchを依存repoに作らない。
-現行CLIの`--repos`は全repoへ同番号のbranchを作るため、変更しない依存repoの登録に流用しない。
+新規taskの`--repos`は単一の変更repoとし、確定依存は反復可能な`--dependency REPO=COMMIT`で完全commit hashを指定する。依存はdetached HEAD・cleanを維持し、変更repoや他依存との重複を許さない。
 オーケストレーターは変更対象・読み取り対象と依存・競合を確認して独立作業を並列化し、前提commitが必要な実装はその確定を待つ。
 
 ## 手順
 
 1. `scripts/setup-worktrees.py --list`で登録を確認する。既存固定worktreeは`--list-legacy`で読み取れる。
-2. 新規作成ではIssue番号・repo・task-id・ownerを明示する。既定の起点はAGENTS.mdに対応するoriginの最新開発基準であり、前提Issueの依存commitや基準変更があるrepoだけ`--base REPO=REF`を追加する。
+2. 新規作成ではIssue番号・repo・task-id・ownerを明示する。既定の起点はAGENTS.mdに対応するoriginの最新開発基準であり、変更repoの基準変更が必要な場合だけ`--base REPO=REF`を追加する。別repoの前提成果は`--dependency REPO=COMMIT`で固定し、依存ソースを編集・commit・pushしない。
 3. 出力されたパス `<workspace>/worktrees/<task-id>/<repo>/`で作業する。既存branch/worktreeの衝突を別パス作成やforceで回避しない。
 4. 引継ぎは旧ownerの書込み停止を確認してから`--handoff-from`を使う。未コミット変更を保持した同じworktreeのowner登録だけを更新し、HEAD・branch・index・追跡済み/未追跡/ignoredファイルは変更しない。commit・push・PR作成等の実行許可は別に確認する。
 5. 特定branch専用のworktreeは、branch削除を指示された場合、保持指示がなければ一緒に削除する。同じ削除許可を改めて求めず、Git一覧と管理記録を照合し、`--remove --task-id ... --owner ...`でworktreeを先に削除してからbranchを削除する。primary、共有・固定AI用、他branch用、指示対象外repoのworktreeを含めない。保全データや登録不一致、削除失敗があればworktreeとbranchを保全して報告する。worktree削除だけの指示からbranch削除の許可は推定しない。
@@ -46,7 +46,7 @@ ACL変更、sandbox全体の無効化、owner奪取、別worktreeへの複製、
 - エラー原文、対象パス、Git登録・実体・`.git`の有無、処理済みrepoと未処理/要確認repoを報告する。`Filename too long`と`Permission denied`を同じ原因と決めつけない。
 - アクセス拒否では、対象をcwdにする端末・IDE、利用中プロセス、ファイル/親のアクセス権、sandbox実行権限を確認する。原因は確認するまで未確定とし、無関係なプロセス終了、自動kill、広範囲のpruneを行わない。
 - 対象task・現在owner・全repo・保全内容と削除復旧の許可を確認する。許可済みの範囲では再確認せず、`--recover-remove --task-id ... --owner ...`で明示復旧する。一般の開発依頼やテストから既存実環境の修復許可を推定しない。
-- registry形式2は既存task・repo・owner・state・created記録を保持して削除開始を記録する。形式1から記録を引き継ぎ、形式2未対応の旧スクリプトは使用しない。
+- registry形式3は形式1・2のtask・repo・owner・branch・state・created・削除開始記録を保全し、旧repoをkind=branchとして維持する。既存multi-repo taskの再実行・引継ぎ・削除・復旧を維持し、依存への変換や移動をしない。新しい依存はkind=dependency・固定base_commit・空branchで登録し、未知形式は拒否する。形式3未対応の旧スクリプトは使用しない。
 - 復旧は削除開始記録がある`RECOVERY_REQUIRED`または中断した`REMOVING`だけを対象にする。開始を判定できない旧`RECOVERY_REQUIRED`は保全して拒否する。全repoを先に照合し、Git登録・実体が消失したrepoの記録整合、Git登録と`.git`がない空ディレクトリだけの除去、正常な未処理repoの通常検査付き削除を行う。
 - Git登録のない非空ディレクトリ、残存`.git`、dirty、保全データ、他owner、異なるbranch・Git管理先、リンク・特殊ファイル、作成未完了や未知の状態は拒否して保全する。通常`--remove`から不一致を自動修復しない。
 - 復旧後の`REMOVED`・各repoの`created=0`とGit一覧・パスの消失を照合する。branchと登録履歴、primary・他task・固定AI用worktree、instance・snapshot・artifactは削除対象に含めない。
