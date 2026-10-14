@@ -19,20 +19,32 @@ python3.12 -B scripts/setup-worktrees.py --task-id issue-123-a --handoff-from co
 `--workspace-root PATH`でworkspaceを明示できます。primaryのbranch・index・作業ファイルは変更しません。
 originをfetchし、repoごとの開発基準commitを記録します。Common・ServerManager・CombatCoreはdevelop、Mod・.githubはmainです。
 origin/HEADがリリースbranchを指していても、開発基準から起点を変えません。
-依存commitを使うrepoでは`--base Common=<commit>`のように指定します。複数repoの起点を個別に指定できます。
+変更repoの起点だけを`--base SushiEricServerMod=<commit>`で指定できます。確定した依存ソースは反復可能な`--dependency REPO=COMMIT`で指定します。
+依存には完全commit hashを指定し、branch名・HEAD・短縮hashは使用しません。変更repoとの重複や依存repoの二重指定は拒否します。
 既存のlocal/remote branchやworktreeは取り込んだり上書きしたりせず拒否します。
 
 Issueの変更範囲はそのrepo内だけです。他repoも変更する場合は、そちらに別Issueを作り、`owner/repo#番号`で相互参照します。
 例えばModのIssueでCommonのAPI変更も必要になったら、Common側の別IssueでAPI・完成条件・検証を定め、その確定commitをModの前提にします。
 既存Commonソースの読み取りや確定成果物の利用だけなら、Commonの変更Issueは不要です。
 異なるrepoの同番号Issueは別の作業として扱い、依存repoへ元Issue番号の変更branchを作りません。
-現在のCLIは列挙した全repoへ同じIssue番号のbranchを作るため、変更しない依存repoをその目的で`--repos`へ含めないでください。確定依存worktreeの専用登録は[#40](https://github.com/SushiEricWorkspace/.github/issues/40)で対応します。
+新規taskの`--repos`はIssueが属する単一の変更repoです。依存repoは`--dependency`で同じtask配下のdetached HEADとして作り、変更branchを作りません。
+例えばModだけを変更して固定runtimeをビルドする場合、次のcommitプレースホルダーを各repoの確定した完全hashへ置き換えます。
 
-登録は`worktrees/registry.sqlite`（形式2）で管理します。同一taskへの同じ入力の再実行は実体を確認して結果を返します。
-異なるowner、repo、起点commit、Issueで同一taskを再利用しません。
-形式1の既存task・repo・owner・state・created記録を保持して、形式2の削除開始記録を追加します。
-形式2の通常接続・一覧はスキーマや形式番号を書き直しません。初回作成・旧形式の移行だけを書込みトランザクションで行います。
-形式2に未対応の旧スクリプトは使用せず、現在のスクリプトを使ってください。未知のregistry形式は拒否します。
+```bash
+python3.12 -B scripts/setup-worktrees.py --task-id mod-123 --issue 123 --owner codex-session-a --repos SushiEricServerMod --dependency "Common=<Commonの確定commit>" --dependency ".github=<.githubの確定commit>"
+```
+
+依存worktreeのHEADとGit登録・detached状態・tracked/未追跡のcleanを作成再実行・引継ぎ・ビルド・削除で照合します。
+依存ソースの編集・commit・pushは行いません。変更が必要なら依存repoの別Issueで確定commitを作ります。
+build・`.gradle`は各依存worktree内へ、発行成果物はtask専用Mavenへ分離します。primaryや他taskの出力は使いません。
+
+登録は`worktrees/registry.sqlite`（形式3）で管理します。同一taskへの同じ入力の再実行は実体を確認して結果を返します。
+異なるowner、repo、種別、固定commit、Issueで同一taskを再利用しません。
+形式1・2の既存task・repo・owner・branch・state・created・削除開始記録を保持し、repo種別`kind`を追加します。
+旧repoは`kind=branch`のままで、既存multi-repo taskの同じ入力での再実行・引継ぎ・削除・削除復旧も維持します。依存への変換や実体の移動はしません。
+新しい依存は`kind=dependency`、`branch`は空文字、`base_commit`は固定commitです。
+形式3の通常接続・一覧はスキーマや形式番号を書き直しません。初回作成・旧形式の移行だけを書込みトランザクションで行います。
+形式3に未対応の旧スクリプトは使用せず、現在のスクリプトを使ってください。未知のregistry形式は拒否します。
 ownerの更新はSQLiteトランザクションで排他します。Gitのref操作はGit自身のlockを使用します。
 ownerは同一ユーザーの協調契約であり、OSのアクセス制御ではありません。手作業のGit操作も同じownerが行います。
 
@@ -64,11 +76,11 @@ python3.12 -B scripts/setup-worktrees.py --remove --task-id issue-123-a --owner 
 ```
 
 全repoの事前検査を通してから、記録されたworktreeだけを`git worktree remove`します。
-未コミット変更、登録branchの不一致、symlink/reparse point、特殊ファイルは拒否します。
+未コミット変更、登録branchまたは依存detached HEAD/固定commitの不一致、symlink/reparse point、特殊ファイルは拒否します。
 ignoredデータは再生成可能な`build/`・`.gradle/`内の通常ファイルだけ削除対象にできます。
 `run/`などその他のignoredデータがあれば止まります。必要なデータを別途保全してから再実行してください。
 サーバー実行データの`minecraft-dev/`、artifact、snapshot、instanceは操作しません。
-worktree削除だけの指示ではbranchや登録履歴は残ります。
+worktree削除だけの指示ではbranchや登録履歴は残ります。依存worktreeも管理手順で削除し、元repoのbranch・artifact・snapshotは削除しません。
 特定branch専用のworktreeは、branch削除を指示された場合、保持指示がなければ一緒に削除します。
 Git一覧と管理記録で対象を照合し、worktreeを先に管理手順で削除してからbranchを削除してください。
 primary、共有・固定AI用、他branch用のworktreeは対象外です。
@@ -117,7 +129,7 @@ python3.12 -B scripts/setup-worktrees.py --recover-remove --task-id issue-123-a 
 | 正常なGit登録・実体が残る | 通常のdirty・ignored・リンク検査を通してGit削除を再開 |
 | Git登録のない非空ディレクトリ、残存`.git`、異なるbranch・Git管理先、リンク・特殊ファイル、判定不能 | 変更せず拒否。個別に保全と対応が必要 |
 
-作成未完了のrepo、branch消失、未知の状態・registry形式も拒否します。作成途中のtaskを推測で修復しません。
+作成未完了のrepo、変更branch消失や固定commit消失、未知の状態・registry形式も拒否します。作成途中のtaskを推測で修復しません。
 通常`--remove`では登録不一致を整合させません。`CREATING`の中断や他ownerのtaskを奪取せず、task-idを再利用しません。
 復旧後は`state=REMOVED`、各repoの`created=0`、Git一覧と対象パスの消失を確認します。
 復旧もtask内の全repoが対象で、branchと登録履歴、primary・固定AI用worktree、instance・snapshot・artifactは残します。

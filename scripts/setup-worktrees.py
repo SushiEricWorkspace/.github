@@ -16,9 +16,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-id", help="小文字英数字とハイフンのタスク識別子")
     parser.add_argument("--issue", type=int, help="feature/issue-<番号>の番号")
     parser.add_argument("--owner", help="同時書込担当。例: codex-session-a")
-    parser.add_argument("--repos", help="対象repoのカンマ区切り。作成時は必須")
+    parser.add_argument("--repos", help="単一の変更対象repo。旧taskの再実行だけカンマ区切り可")
     parser.add_argument("--base", action="append", default=[], metavar="REPO=REF",
                         help="repoごとの起点。省略repoはoriginの開発基準。複数指定可")
+    parser.add_argument("--dependency", action="append", default=[], metavar="REPO=COMMIT",
+                        help="確定commitのdetached依存repo。複数指定可")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--list", action="store_true", help="タスク登録一覧（task-idで限定可）")
     mode.add_argument("--list-legacy", action="store_true", help="既存worktreeを読み取り専用で一覧")
@@ -58,7 +60,13 @@ def main() -> int:
                             "--baseは対象REPO=REFを一度ずつ指定してください")
                     bases[name] = ref
                     specified.add(name)
-                result = manager.create(args.task_id, args.issue, args.owner, bases)
+                dependencies = {}
+                for pair in args.dependency:
+                    name, separator, commit = pair.partition("=")
+                    require(bool(separator) and bool(commit) and name not in bases and name not in dependencies,
+                            "--dependencyは変更repoと重複しないREPO=COMMITを一度ずつ指定してください")
+                    dependencies[name] = commit
+                result = manager.create(args.task_id, args.issue, args.owner, bases, dependencies=dependencies)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (TaskError, OSError) as error:

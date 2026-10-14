@@ -12,7 +12,7 @@ import uuid
 from dev_server.build_inputs import canonical, capture_sources, digest, regular_bytes, verify_sources
 from dev_server.contracts import ContractError
 from dev_server.runtime_bundle import _directory
-from dev_server.task_worktrees import TaskWorktrees, worktrees
+from dev_server.task_worktrees import TaskWorktrees
 from dev_server.build_lock import build_lock
 
 
@@ -46,15 +46,15 @@ def registered_task(root: Path, owner: str, names: set[str]):
     registry = TaskWorktrees(root.parent.parent)
     if not (registry.root / "registry.sqlite").is_file():
         raise ContractError("build: worktree registryがありません")
+    snapshot = registry._read_snapshot(root.name, owner, ("ACTIVE",))
+    plans = {row["name"]: row for row in snapshot[1]}
+    if not names <= plans.keys():
+        raise ContractError("build: 必要なrepoがtaskに登録されていません")
+    for plan in plans.values():
+        registry.verify(root.name, plan)
     with registry.database() as db:
-        plans = {row["name"]: row for row in registry.owned(db, root.name, owner, ("ACTIVE",))}
-        if not names <= plans.keys():
-            raise ContractError("build: 必要なrepoがtaskに登録されていません")
-        for name in names:
-            path = root / name
-            if (registry.target(root.name, name) != path.absolute()
-                    or worktrees(path).get(path.resolve()) != f"refs/heads/{plans[name]['branch']}"):
-                raise ContractError("build: 登録branch/worktreeと一致しません")
+        db.execute("BEGIN")
+        registry._recheck(db, root.name, snapshot)
     return plans
 
 
@@ -85,7 +85,10 @@ def main():
         names.add("SushiEricCombatCore")
     github = task_github(root, Path(__file__))
     with build_lock(root / ".build.lock"):
-        registered_task(root, args.owner, names)
+        plans = registered_task(root, args.owner, names)
+        names |= plans.keys()
+        manager = "SushiEricServerManager" in names
+        core = "SushiEricCombatCore" in names
         repos = {name: root / name for name in names}
         source_lock = capture_sources(repos)
         exporter = recorded_exporter(github, source_lock)
@@ -109,15 +112,16 @@ def main():
         record_publication(mod_coordinate, maven)
         record_publication(editor_coordinate, maven)
         mod_args = [f"-PcommonDevelopmentRepository={maven}", f"-PcommonDevelopmentCoordinate={mod_coordinate}"]
-        if args.with_core:
+        if core:
             core_repo = maven / "core"
             gradle(repos["SushiEricCombatCore"], "build", "publishDevelopment", *mod_args,
                    f"-PcombatCoreDevelopmentRepository={core_repo}")
             record_publication(publication(repos["SushiEricCombatCore"], "core", "sushieric-combat-core-dev"), core_repo)
-        if args.manager:
+        if manager:
             gradle(repos["SushiEricServerManager"], "build", f"-PcommonDevelopmentRepository={maven}",
                    f"-PcommonDevelopmentCoordinate={editor_coordinate}")
         verify_sources(source_lock)
+        registered_task(root, args.owner, names)
         source_lock["publications"] = publications
         lock = repos["SushiEricServerMod"] / "build/dev-runtime" / f"source-lock-{build_id}.json"
         lock.parent.mkdir(parents=True, exist_ok=True)

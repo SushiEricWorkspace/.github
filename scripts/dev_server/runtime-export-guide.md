@@ -13,8 +13,13 @@ python3.12 -B scripts/build-dev-runtime.py --task-root /workspace/worktrees/issu
 
 `--store`には運用者が初期設定したartifact領域を指定します。未設定の管理rootや他人のrunをコピー・初期化しません。
 同一taskのGradle実行はOS lockで直列化し、登録ownerの引継ぎとworktree削除もビルド中は拒否します。
-Commonをtask専用Mavenへ発行し、取得した完全座標でModをビルドします。Common・Mod・`.github`を同じownerのtaskとして登録し、exporterもその`.github`の入力として固定します。
-Managerも検証する場合は`--manager`、CombatCoreを検証・発行する場合は`--with-core`を指定します。
+Commonをtask専用Mavenへ発行し、取得した完全座標でModをビルドします。Common・Mod・`.github`が同じownerのtaskへ登録されていることが必要です。
+新規taskではIssueが属する単一の変更repoを`--repos`、残るrepoを固定commitの`--dependency`として[worktreeガイド](worktrees-guide.md)の手順で登録します。
+例えばCommonのIssueではMod・`.github`を依存にし、ManagerのIssueではCommon・Mod・`.github`を依存にします。`.github`のIssueではCommon・Modを依存にします。
+未登録の必要repoは自動追加しません。依存のdetached HEAD・固定commit・cleanとownerを照合し、変更repoのdirty入力は従来どおりhashへ記録します。
+登録全repoを入力集合に含め、exporterもtask `.github`の入力として固定します。
+登録にManagerがあればManagerもビルドし、CombatCoreがあれば検証・発行します。変更repoとして登録した場合も同じです。
+`--manager`・`--with-core`で追加検証を要求する場合も、対応するrepoの登録が必要です。
 Modが実際にCombatCoreへ依存していない状態ではCoreをModの依存へ追加しません。
 通常の開発ビルドは共有開発Commonの動的参照を維持します。正式版を開発bundleへ使用はできません。
 
@@ -59,7 +64,8 @@ python3.12 -B -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 合成runtimeの単体試験はhash・パス除去・入力変更・欠損/改変の拒否を確認します。
-build helperの試験は、helperコピーの事前拒否と、exporterパスがtask `.github`の入力記録に一致することを確認します。
+build helperの試験は、変更repoと固定依存の検査、未登録依存・owner・dirtyの拒否、登録Manager/Coreを含む入力固定、helperコピーの事前拒否とexporter入力の一致を確認します。
+一時Gitと合成Gradle出力の成功を実Gradleの結合ビルド成功として扱いません。実結合は対応repoの確定commitが揃ってから別途実行します。
 実際のLoom bundleからのGameTestは別途実行し、起動と開発専用定義の登録を確認します。
 `scripts/check-runtime-bundle.py --bundle PATH`で再照合し、`--game-test-root PATH`も指定した場合だけ
 新しいrun-idでGameTestを実行します。通常サーバーは起動しません。結果XMLとconsole.logはこの実行領域へ残します。

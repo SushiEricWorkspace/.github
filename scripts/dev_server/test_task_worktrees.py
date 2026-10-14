@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os
+import json
 import subprocess
 import sys
 import sqlite3
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from dev_server import task_worktrees
 from dev_server.task_worktrees import TaskError, TaskWorktrees, git, worktrees, workspace_for
 from dev_server.build_lock import BuildLockError, build_lock
 
@@ -38,7 +40,170 @@ class TaskWorktreesTest(unittest.TestCase):
             (repo / "run" / "private.txt").write_text("never copy", encoding="utf-8")
 
     def create(self, task="task-a", issue=100, owner="codex-a", repos=None):
-        return self.manager.create(task, issue, owner, repos or {"SushiEricServerMod": None}, fetch=False)
+        bases = repos or {"SushiEricServerMod": None}
+        if len(bases) > 1 and not self.manager.list(task):
+            # 形式2で作成済みだったmulti-repo taskを一時fixtureへ再現する。
+            plans = []
+            for name, ref in bases.items():
+                repo = self.manager.primary(name)
+                target = self.manager.target(task, name)
+                commit = git(repo, "rev-parse", ref or "HEAD")
+                if git(repo, "for-each-ref", f"refs/heads/feature/issue-{issue}"):
+                    raise TaskError("既存branchは上書きできません")
+                plans.append((name, repo, target, commit))
+            with self.manager.database() as db:
+                db.execute("INSERT INTO tasks VALUES (?, ?, ?, 'CREATING')", (task, issue, owner))
+                db.executemany("INSERT INTO repos (task_id,name,branch,base_commit) VALUES (?,?,?,?)",
+                               [(task, name, f"feature/issue-{issue}", commit) for name, _, _, commit in plans])
+            try:
+                for name, repo, target, commit in plans:
+                    task_worktrees.git(repo, "worktree", "add", "-b", f"feature/issue-{issue}", str(target), commit)
+                    with self.manager.database() as db:
+                        db.execute("UPDATE repos SET created=1 WHERE task_id=? AND name=?", (task, name))
+                with self.manager.database() as db:
+                    db.execute("UPDATE tasks SET state='ACTIVE' WHERE task_id=?", (task,))
+            except BaseException:
+                with self.manager.database() as db:
+                    db.execute("UPDATE tasks SET state='RECOVERY_REQUIRED' WHERE task_id=?", (task,))
+                raise
+        return self.manager.create(task, issue, owner, bases, fetch=False)
+
+    def test_same_issue_in_different_repos_shares_detached_dependencies(self):
+        common = git(self.root / "Common", "rev-parse", "HEAD")
+        mod = git(self.root / "SushiEricServerMod", "rev-parse", "HEAD")
+        first = self.manager.create("mod-100", 100, "owner", {"SushiEricServerMod": None},
+                                    dependencies={"Common": common}, fetch=False)
+        second = self.manager.create("common-100", 100, "owner", {"Common": None},
+                                     dependencies={"SushiEricServerMod": mod}, fetch=False)
+        for task, dependency, commit in (("mod-100", "Common", common),
+                                         ("common-100", "SushiEricServerMod", mod)):
+            path = self.manager.target(task, dependency)
+            self.assertEqual("", git(path, "branch", "--show-current"))
+            self.assertEqual(commit, git(path, "rev-parse", "HEAD"))
+            self.assertIsNone(worktrees(self.root / dependency)[path.resolve()])
+        self.assertEqual(first, self.manager.create("mod-100", 100, "owner", {"SushiEricServerMod": None},
+                                                    dependencies={"Common": common}, fetch=False))
+        self.assertEqual({"branch", "dependency"}, {p["kind"] for p in second[0]["repos"]})
+        self.manager.handoff("mod-100", "owner", "publisher")
+        self.manager.remove("mod-100", "publisher")
+        self.assertEqual("ACTIVE", self.manager.list("common-100")[0]["state"])
+        self.assertTrue(git(self.root / "Common", "for-each-ref", "refs/heads/feature/issue-100"))
+        self.manager.remove("common-100", "owner")
+
+    def test_new_multiple_changes_and_unfixed_dependencies_are_rejected(self):
+        common = git(self.root / "Common", "rev-parse", "HEAD")
+        for bases, dependencies in (({"Common": None, "SushiEricServerMod": None}, {}),
+                                    ({"SushiEricServerMod": None}, {"Common": "HEAD"}),
+                                    ({"SushiEricServerMod": None}, {"Common": common[:8]}),
+                                    ({"Common": None}, {"Common": common})):
+            with self.subTest(bases=bases, dependencies=dependencies):
+                with self.assertRaises(TaskError):
+                    self.manager.create("task-a", 100, "owner", bases, dependencies=dependencies, fetch=False)
+                self.assertEqual([], self.manager.list())
+        self.assertFalse(self.manager.target("task-a", "Common").exists())
+
+    def test_dependency_dirty_head_branch_and_owner_changes_are_rejected(self):
+        common = self.root / "Common"
+        commit = git(common, "rev-parse", "HEAD")
+        (common / "source.txt").write_text("later", encoding="utf-8")
+        git(common, "add", ".")
+        git(common, "commit", "-m", "fixture update")
+        later = git(common, "rev-parse", "HEAD")
+        self.manager.create("task-a", 100, "owner", {"SushiEricServerMod": None},
+                            dependencies={"Common": commit}, fetch=False)
+        path = self.manager.target("task-a", "Common")
+        operations = (lambda: self.manager.create("task-a", 100, "owner", {"SushiEricServerMod": None},
+                                                  dependencies={"Common": commit}, fetch=False),
+                      lambda: self.manager.handoff("task-a", "owner", "publisher"),
+                      lambda: self.manager.remove("task-a", "owner"))
+        for name in ("source.txt", "new.txt"):
+            (path / name).write_text("preserve", encoding="utf-8")
+            for operation in operations:
+                with self.assertRaisesRegex(TaskError, "未コミット"):
+                    operation()
+            if name == "new.txt":
+                (path / name).unlink()
+            else:
+                git(path, "restore", "source.txt")
+        for ref, detached in ((later, True), (commit, False)):
+            if detached:
+                git(path, "checkout", "--detach", ref)
+            else:
+                git(path, "checkout", "-b", "other", ref)
+            for operation in operations:
+                with self.assertRaisesRegex(TaskError, "固定commit|branch"):
+                    operation()
+        git(path, "checkout", "--detach", commit)
+        with self.assertRaisesRegex(TaskError, "owner"):
+            self.manager.handoff("task-a", "other", "publisher")
+        self.assertEqual("REMOVED", self.manager.remove("task-a", "owner")[0]["state"])
+        self.assertFalse(git(common, "for-each-ref", "refs/heads/feature/issue-100"))
+
+    def test_detached_missing_registration_and_partial_remove_are_preserved(self):
+        commit = git(self.root / "Common", "rev-parse", "HEAD")
+        self.manager.create("task-a", 100, "owner", {"SushiEricServerMod": None},
+                            dependencies={"Common": commit}, fetch=False)
+        plan = next(p for p in self.manager.list()[0]["repos"] if p["name"] == "Common")
+        with patch("dev_server.task_worktrees.worktrees", return_value={}):
+            with self.assertRaisesRegex(TaskError, "branch"):
+                self.manager.verify("task-a", plan)
+        def interrupt(repo, *args):
+            result = git(repo, *args)
+            if repo.name == "Common" and "remove" in args:
+                raise KeyboardInterrupt("fixture interruption")
+            return result
+        with patch("dev_server.task_worktrees.git", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.manager.remove("task-a", "owner")
+        self.assertEqual("REMOVED", self.manager.recover_remove("task-a", "owner")[0]["state"])
+        self.assertFalse(git(self.root / "Common", "for-each-ref", "refs/heads/feature/issue-100"))
+
+    def test_dependency_cli_creates_fixed_tree_and_rejects_invalid_requests(self):
+        script = Path(__file__).resolve().parents[1] / "setup-worktrees.py"
+        commit = git(self.root / "Common", "rev-parse", "HEAD")
+        prefix = [sys.executable, "-B", str(script), "--workspace-root", str(self.root),
+                  "--task-id", "cli-task", "--issue", "100", "--owner", "owner"]
+        result = subprocess.run([*prefix, "--repos", "SushiEricServerMod",
+                                 "--dependency", f"Common={commit}"], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(0, result.returncode, result.stderr)
+        records = json.loads(result.stdout)
+        self.assertEqual("dependency", records[0]["repos"][0]["kind"])
+        before = self.manager.list()
+        for args in (("--repos", "SushiEricServerMod", "--dependency", "Common=HEAD"),
+                     ("--repos", "SushiEricServerMod", "--dependency", f"Common={commit}",
+                      "--dependency", f"Common={commit}"),
+                     ("--repos", "Common", "--dependency", f"Common={commit}"),
+                     ("--repos", "Common,SushiEricServerMod")):
+            with self.subTest(args=args):
+                result = subprocess.run([*prefix, *args], capture_output=True, text=True, encoding="utf-8")
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual(before, self.manager.list())
+
+    def test_dependency_incomplete_record_and_unknown_kind_are_rejected(self):
+        commit = git(self.root / "Common", "rev-parse", "HEAD")
+        self.manager.create("task-a", 100, "owner", {"SushiEricServerMod": None},
+                            dependencies={"Common": commit}, fetch=False)
+        for sql, message in (("UPDATE repos SET created=0 WHERE name='Common'", "未確定"),
+                             ("UPDATE repos SET kind='unknown' WHERE name='Common'", "未知")):
+            with self.manager.database() as db:
+                db.execute(sql)
+            with self.assertRaisesRegex(TaskError, message):
+                self.manager.handoff("task-a", "owner", "publisher")
+            self.assertTrue(self.manager.target("task-a", "Common").exists())
+            with self.manager.database() as db:
+                db.execute("UPDATE repos SET created=1, kind='dependency' WHERE name='Common'")
+
+    def test_v2_migration_preserves_legacy_multi_repo_task(self):
+        first = self.create(repos={"Common": None, "SushiEricServerMod": None})
+        with self.manager.database() as db:
+            db.execute("ALTER TABLE repos DROP COLUMN kind")
+            db.execute("PRAGMA user_version=2")
+        migrated = self.manager.list()
+        self.assertEqual(first, migrated)
+        self.assertTrue(all(p["kind"] == "branch" for p in migrated[0]["repos"]))
+        self.assertEqual(first, self.create(repos={"Common": None, "SushiEricServerMod": None}))
+        self.manager.handoff("task-a", "codex-a", "publisher")
+        self.assertEqual("REMOVED", self.manager.remove("task-a", "publisher")[0]["state"])
 
     def test_two_tasks_source_index_and_build_are_independent(self):
         self.create()
@@ -128,6 +293,7 @@ class TaskWorktreesTest(unittest.TestCase):
             "UPDATE tasks SET state='RECOVERY_REQUIRED' WHERE task_id='task-a'",
             "UPDATE repos SET base_commit='changed' WHERE task_id='task-a'",
             "UPDATE repos SET created=0 WHERE task_id='task-a'",
+            "UPDATE repos SET kind='dependency' WHERE task_id='task-a'",
             "INSERT INTO removals VALUES ('task-a')",
         )
         operations = (
@@ -141,7 +307,7 @@ class TaskWorktreesTest(unittest.TestCase):
                 with self.subTest(mode=mode, sql=sql):
                     with self.manager.database() as db:
                         db.execute("UPDATE tasks SET owner='codex-a', state='ACTIVE' WHERE task_id='task-a'")
-                        db.execute("UPDATE repos SET created=1, base_commit=? WHERE task_id='task-a'",
+                        db.execute("UPDATE repos SET created=1, kind='branch', base_commit=? WHERE task_id='task-a'",
                                    (git(path, "rev-parse", "HEAD"),))
                         db.execute("DELETE FROM removals WHERE task_id='task-a'")
                         if mode == "recover":
@@ -165,6 +331,8 @@ class TaskWorktreesTest(unittest.TestCase):
                         self.assertEqual("changed", record["repos"][0]["base_commit"])
                     elif "created=" in sql:
                         self.assertEqual(0, record["repos"][0]["created"])
+                    elif "kind=" in sql:
+                        self.assertEqual("dependency", record["repos"][0]["kind"])
                     else:
                         self.assertTrue(record["removal_started"])
 
@@ -578,7 +746,7 @@ class TaskWorktreesTest(unittest.TestCase):
         self.assertEqual("REMOVED", result["state"])
         self.assertTrue(result["removal_started"])
         with self.manager.database() as db:
-            self.assertEqual(2, db.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(3, db.execute("PRAGMA user_version").fetchone()[0])
 
     def test_recovery_rejects_dirty_ignored_data_and_branch_mismatch(self):
         self.create(repos={"Common": None, "SushiEricServerMod": None})

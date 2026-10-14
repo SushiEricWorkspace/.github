@@ -1,6 +1,5 @@
 """固定runtime helperが登録taskの入力だけを使うことを検証する。"""
 
-from contextlib import contextmanager
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -13,6 +12,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 from dev_server.build_inputs import capture_sources
 from dev_server.contracts import ContractError
+from dev_server.task_worktrees import TaskError, TaskWorktrees, git
 
 spec = importlib.util.spec_from_file_location("build_dev_runtime", SCRIPTS / "build-dev-runtime.py")
 build_dev_runtime = importlib.util.module_from_spec(spec)
@@ -49,38 +49,48 @@ class BuildDevRuntimeTests(unittest.TestCase):
                 self.assertFalse((task / ".build.lock").exists())
                 self.assertFalse((task / "maven").exists())
 
-    def test_registered_task_requires_github_with_same_branch(self):
-        task = self.root / "worktrees/task-41"
-        names = {"Common", "SushiEricServerMod", ".github"}
+    def registered_fixture(self, change="SushiEricServerMod"):
+        names = {"Common", "SushiEricServerMod", ".github", "SushiEricServerManager", "SushiEricCombatCore"}
+        commits = {}
         for name in names:
-            (task / name / "scripts").mkdir(parents=True)
-        helper = task / ".github/scripts/build-dev-runtime.py"
-        helper.touch()
-        (task.parent.parent / "worktrees/registry.sqlite").touch()
-        rows = [{"name": name, "branch": "feature/issue-41"} for name in names]
-        calls = []
+            repo = self.root / name
+            repo.mkdir()
+            git(repo, "init", "-b", "main")
+            git(repo, "config", "user.name", "test")
+            git(repo, "config", "user.email", "test@example.invalid")
+            (repo / "source.txt").write_text("fixture")
+            (repo / ".gitignore").write_text("build/\n.gradle/\n")
+            if name == ".github":
+                (repo / "scripts").mkdir()
+                (repo / "scripts/export-dev-runtime.py").write_text("# fixture\n")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "fixture")
+            commits[name] = git(repo, "rev-parse", "HEAD")
+        registry = TaskWorktrees(self.root)
+        registry.create("task-40", 40, "owner", {change: commits.pop(change)},
+                        dependencies=commits, fetch=False)
+        return registry, self.root / "worktrees/task-40", names
 
-        class Registry:
-            root = task.parent.parent / "worktrees"
-
-            @contextmanager
-            def database(self):
-                yield object()
-
-            def owned(self, db, task_id, owner, states):
-                calls.append((task_id, owner, states))
-                return rows
-
-            def target(self, task_id, name):
-                return task / name
-
-        with patch.object(build_dev_runtime, "TaskWorktrees", return_value=Registry()), \
-                patch.object(build_dev_runtime, "worktrees", side_effect=lambda path: {
-                    path.resolve(): "refs/heads/feature/issue-41"}):
-            plans = build_dev_runtime.registered_task(task, "owner", names)
-        self.assertEqual(names, plans.keys())
-        self.assertEqual(task / ".github", build_dev_runtime.task_github(task, helper))
-        self.assertEqual([("task-41", "owner", ("ACTIVE",))], calls)
+    def test_registered_task_accepts_change_repo_and_fixed_dependencies(self):
+        for change in ("SushiEricServerMod", "Common", "SushiEricServerManager", ".github"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary)
+                registry, task, names = self.registered_fixture(change)
+                plans = build_dev_runtime.registered_task(task, "owner", names)
+                self.assertEqual("branch", plans[change]["kind"])
+                self.assertTrue(all(p["kind"] == "dependency" for n, p in plans.items() if n != change))
+                lock = capture_sources({name: task / name for name in plans})
+                self.assertEqual(names, {source["record"]["repo"] for source in lock["sources"]})
+                exporter = build_dev_runtime.recorded_exporter(task / ".github", lock)
+                self.assertEqual(task / ".github/scripts/export-dev-runtime.py", exporter)
+                with self.assertRaisesRegex(TaskError, "owner"):
+                    build_dev_runtime.registered_task(task, "other", names)
+                with self.assertRaisesRegex(ContractError, "必要なrepo"):
+                    build_dev_runtime.registered_task(task, "owner", names | {"missing"})
+                dependency = "Common" if change != "Common" else "SushiEricServerMod"
+                (task / dependency / "source.txt").write_text("changed")
+                with self.assertRaisesRegex(TaskError, "未コミット"):
+                    build_dev_runtime.registered_task(task, "owner", names)
 
     def test_exporter_is_from_and_recorded_in_task_github(self):
         repos = {}
@@ -112,11 +122,14 @@ class BuildDevRuntimeTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             build_dev_runtime.recorded_exporter(repos[".github"], source_lock)
 
-    def test_main_passes_recorded_task_exporter_to_gradle(self):
+    def main_fixture(self, extras=()):
         task = self.root / "worktrees/task-41"
         common = task / "Common"
         mod = task / "SushiEricServerMod"
         github = task / ".github"
+        names = {"Common", "SushiEricServerMod", ".github"} | set(extras)
+        for name in extras:
+            (task / name).mkdir(parents=True)
         common.mkdir(parents=True)
         mod.mkdir(parents=True)
         exporter = github / "scripts/export-dev-runtime.py"
@@ -137,12 +150,19 @@ class BuildDevRuntimeTests(unittest.TestCase):
             f"mod={mod_coordinate}\neditor={editor_coordinate}\n")
         build_id = "fixture-build"
         maven = task / "maven" / build_id
+        core_coordinate = editor_coordinate.replace("sushieric-common-editor-dev", "sushieric-combat-core-dev")
+        if "SushiEricCombatCore" in extras:
+            core_build = task / "SushiEricCombatCore/build"
+            core_build.mkdir()
+            (core_build / "development-publication.properties").write_text(f"core={core_coordinate}\n")
 
         def gradle_side_effect(repo, *args):
-            if repo == common:
-                for coordinate in (mod_coordinate, editor_coordinate):
+            if repo == common or repo.name == "SushiEricCombatCore":
+                coordinates = (mod_coordinate, editor_coordinate) if repo == common else (core_coordinate,)
+                repository = maven if repo == common else maven / "core"
+                for coordinate in coordinates:
                     group, module, version = coordinate.split(":")
-                    directory = maven / group.replace(".", "/") / module / version
+                    directory = repository / group.replace(".", "/") / module / version
                     directory.mkdir(parents=True)
                     (directory / f"{module}-{version}.jar").write_bytes(b"jar")
                     (directory / f"{module}-{version}.pom").write_bytes(b"pom")
@@ -152,17 +172,28 @@ class BuildDevRuntimeTests(unittest.TestCase):
         with patch.object(build_dev_runtime, "__file__", str(github / "scripts/build-dev-runtime.py")), \
                 patch.object(sys, "argv", ["build-dev-runtime.py", "--task-root", str(task),
                                             "--owner", "owner", "--store", str(store)]), \
-                patch.object(build_dev_runtime, "registered_task") as registered, \
+                patch.object(build_dev_runtime, "registered_task", return_value={name: {} for name in names}) as registered, \
                 patch.object(build_dev_runtime, "capture_sources", return_value=source_lock), \
                 patch.object(build_dev_runtime, "verify_sources"), \
                 patch.object(build_dev_runtime.uuid, "uuid4", return_value=type("Id", (), {"hex": build_id})()), \
                 patch.object(build_dev_runtime, "gradle", side_effect=gradle_side_effect) as gradle:
             build_dev_runtime.main()
 
-        registered.assert_called_once_with(task.absolute(), "owner", {"Common", "SushiEricServerMod", ".github"})
+        self.assertEqual(2, registered.call_count)
+        registered.assert_called_with(task.absolute(), "owner", names)
         export_call = next(call for call in gradle.call_args_list if "exportDevRuntime" in call.args)
         self.assertEqual(mod, export_call.args[0])
         self.assertIn(f"-PruntimeExporter={exporter.resolve()}", export_call.args)
+        return gradle.call_args_list
+
+    def test_main_passes_recorded_task_exporter_to_gradle(self):
+        self.main_fixture()
+
+    def test_registered_manager_and_core_are_built_without_extra_flags(self):
+        calls = self.main_fixture(("SushiEricServerManager", "SushiEricCombatCore"))
+        self.assertTrue(any(call.args[0].name == "SushiEricServerManager" for call in calls))
+        self.assertTrue(any(call.args[0].name == "SushiEricCombatCore" and "publishDevelopment" in call.args
+                            for call in calls))
 
 
 if __name__ == "__main__":
