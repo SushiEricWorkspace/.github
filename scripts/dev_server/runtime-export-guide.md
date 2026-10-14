@@ -3,6 +3,7 @@
 登録済みのタスクworktreeをビルドし、ソースworktreeの寿命とMinecraftの実行環境を分離するときに使います。
 配置・担当の管理は[worktreeガイド](worktrees-guide.md)、データ契約は[README](README.md)を参照してください。
 Python 3.12、JDK 21、対象のCommonとMod、同じタスクの`.github`が必要です。
+`build-dev-runtime.py`は登録済みtaskの`.github/scripts`から実行してください。primaryや別taskのhelperコピーは、ビルド生成物を作る前に拒否します。
 
 ## ビルド
 
@@ -12,7 +13,7 @@ python3.12 -B scripts/build-dev-runtime.py --task-root /workspace/worktrees/issu
 
 `--store`には運用者が初期設定したartifact領域を指定します。未設定の管理rootや他人のrunをコピー・初期化しません。
 同一taskのGradle実行はOS lockで直列化し、登録ownerの引継ぎとworktree削除もビルド中は拒否します。
-Commonをtask専用Mavenへ発行し、取得した完全座標でModをビルドします。
+Commonをtask専用Mavenへ発行し、取得した完全座標でModをビルドします。Common・Mod・`.github`を同じownerのtaskとして登録し、exporterもその`.github`の入力として固定します。
 Managerも検証する場合は`--manager`、CombatCoreを検証・発行する場合は`--with-core`を指定します。
 Modが実際にCombatCoreへ依存していない状態ではCoreをModの依存へ追加しません。
 通常の開発ビルドは共有開発Commonの動的参照を維持します。正式版を開発bundleへ使用はできません。
@@ -58,6 +59,7 @@ python3.12 -B -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 合成runtimeの単体試験はhash・パス除去・入力変更・欠損/改変の拒否を確認します。
+build helperの試験は、helperコピーの事前拒否と、exporterパスがtask `.github`の入力記録に一致することを確認します。
 実際のLoom bundleからのGameTestは別途実行し、起動と開発専用定義の登録を確認します。
 `scripts/check-runtime-bundle.py --bundle PATH`で再照合し、`--game-test-root PATH`も指定した場合だけ
 新しいrun-idでGameTestを実行します。通常サーバーは起動しません。結果XMLとconsole.logはこの実行領域へ残します。
