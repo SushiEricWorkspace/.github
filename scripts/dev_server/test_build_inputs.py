@@ -26,7 +26,14 @@ class BuildInputTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True)
 
     def lock(self):
-        return {"sourceLockVersion": 1, "sources": [capture_source(self.root, "Common")]}
+        return {"sourceLockVersion": 1, "sources": [capture_source(self.root, "SushiEricDataModel")]}
+
+    def test_new_inputs_require_data_model_name(self):
+        from dev_server.build_inputs import capture_sources
+        repos = {"SushiEricDataModel": self.root, "SushiEricServerMod": self.root}
+        self.assertEqual(set(repos), {s["record"]["repo"] for s in capture_sources(repos)["sources"]})
+        with self.assertRaises(ContractError):
+            capture_sources({"Common": self.root, "SushiEricServerMod": self.root})
 
     def test_ignored_outputs_do_not_change_source(self):
         lock = self.lock()

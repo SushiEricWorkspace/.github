@@ -37,9 +37,34 @@ class ContractTests(unittest.TestCase):
 
     def test_unknown_fields_and_versions(self):
         for kind, value in self.documents.items():
-            for key, invalid in (("schemaVersion", 2), ("unclassified", "hidden-secret")):
+            for key, invalid in (("schemaVersion", 99), ("unclassified", "hidden-secret")):
                 with self.subTest(kind=kind, key=key), self.assertRaises(ContractError):
                     validate(kind, dict(deepcopy(value), **{key: invalid}))
+
+    def test_runtime_version_selects_provider_without_mixed_keys(self):
+        v2 = deepcopy(self.documents["runtime"])
+        v1 = deepcopy(v2)
+        v1["schemaVersion"] = 1
+        v1["commonCoordinate"] = v1.pop("dataModelCoordinate").replace("sushieric-datamodel", "sushieric-common")
+        v1["sources"][0]["repo"] = "Common"
+        for version, runtime, field, other in ((1, v1, "commonCoordinate", "dataModelCoordinate"),
+                                               (2, v2, "dataModelCoordinate", "commonCoordinate")):
+            validate("runtime", runtime)
+            for invalid in (dict(runtime, **{other: runtime[field]}),
+                            dict(runtime, schemaVersion=3 - version), dict(runtime, schemaVersion=True)):
+                with self.subTest(version=version, invalid=invalid), self.assertRaises(ContractError):
+                    validate("runtime", invalid)
+            for coordinate in (runtime[field].replace("-mod-dev", "-editor-dev"),
+                               runtime[field].split(":")[0] + ":sushieric-datamodel-mod-dev:0.1.0-dev.+",
+                               runtime[field].replace("sushieric-" + ("common" if version == 1 else "datamodel"),
+                                                      "sushieric-" + ("datamodel" if version == 1 else "common"))):
+                with self.subTest(version=version, coordinate=coordinate), self.assertRaises(ContractError):
+                    validate("runtime", dict(runtime, **{field: coordinate}))
+        v1["commonCoordinate"] = v1["commonCoordinate"].rsplit(".", 1)[0]
+        validate("runtime", v1)
+        v2["sources"].append(dict(v2["sources"][0], repo="Common"))
+        with self.assertRaises(ContractError):
+            validate("runtime", v2)
 
     def test_integer_is_not_boolean(self):
         value = deepcopy(self.documents["inventory"])
@@ -153,7 +178,7 @@ class ContractTests(unittest.TestCase):
 
     def test_a20_unknown_runtime_layout_or_coordinate(self):
         for key, invalid in (("artifactId", "a" * 64), ("layoutId", "unknown-layout"),
-                             ("commonCoordinate", "io.github.sushiericworkspace:sushieric-common-mod-dev:0.1.0-dev.+"),
+                             ("dataModelCoordinate", "io.github.sushiericworkspace:sushieric-datamodel-mod-dev:0.1.0-dev.+"),
                              ("javaVersion", "25.0.1"), ("development", False)):
             runtime = dict(deepcopy(self.documents["runtime"]), **{key: invalid})
             with self.subTest(key=key), self.assertRaises(ContractError):

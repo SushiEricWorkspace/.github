@@ -2,7 +2,7 @@
 
 登録済みのタスクworktreeをビルドし、ソースworktreeの寿命とMinecraftの実行環境を分離するときに使います。
 配置・担当の管理は[worktreeガイド](worktrees-guide.md)、データ契約は[README](README.md)を参照してください。
-Python 3.12、JDK 21、対象のCommonとMod、同じタスクの`.github`が必要です。
+Python 3.12、JDK 21、対象のSushiEricDataModelとMod、同じタスクの`.github`が必要です。
 `build-dev-runtime.py`は登録済みtaskの`.github/scripts`から実行してください。primaryや別taskのhelperコピーは、ビルド生成物を作る前に拒否します。
 
 ## ビルド
@@ -13,20 +13,20 @@ python3.12 -B scripts/build-dev-runtime.py --task-root /workspace/worktrees/issu
 
 `--store`には運用者が初期設定したartifact領域を指定します。未設定の管理rootや他人のrunをコピー・初期化しません。
 同一taskのGradle実行はOS lockで直列化し、登録ownerの引継ぎとworktree削除もビルド中は拒否します。
-Commonをtask専用Mavenへ発行し、取得した完全座標でModをビルドします。Common・Mod・`.github`が同じownerのtaskへ登録されていることが必要です。
+SushiEricDataModelをtask専用Mavenへ発行し、取得した完全座標でModをビルドします。SushiEricDataModel・Mod・`.github`が同じownerのtaskへ登録されていることが必要です。
 新規taskではIssueが属する単一の変更repoを`--repos`、残るrepoを固定commitの`--dependency`として[worktreeガイド](worktrees-guide.md)の手順で登録します。
-例えばCommonのIssueではMod・`.github`を依存にし、ManagerのIssueではCommon・Mod・`.github`を依存にします。`.github`のIssueではCommon・Modを依存にします。
+例えばSushiEricDataModelのIssueではMod・`.github`を依存にし、ManagerのIssueではSushiEricDataModel・Mod・`.github`を依存にします。`.github`のIssueではSushiEricDataModel・Modを依存にします。
 未登録の必要repoは自動追加しません。依存のdetached HEAD・固定commit・cleanとownerを照合し、変更repoのdirty入力は従来どおりhashへ記録します。
 登録全repoを入力集合に含め、exporterもtask `.github`の入力として固定します。
 登録にManagerがあればManagerもビルドし、CombatCoreがあれば検証・発行します。変更repoとして登録した場合も同じです。
 `--manager`・`--with-core`で追加検証を要求する場合も、対応するrepoの登録が必要です。
 Modが実際にCombatCoreへ依存していない状態ではCoreをModの依存へ追加しません。
-通常の開発ビルドは共有開発Commonの動的参照を維持します。正式版を開発bundleへ使用はできません。
+通常の開発ビルドは共有開発SushiEricDataModelの動的参照を維持します。正式版を開発bundleへ使用はできません。
 
 ## Gradleとの境界
 
-- Common/Coreの`publishDevelopment`はtimestampとUUIDで座標を作り、atomic claimで同座標の再発行を拒否します。成功した完全座標は`build/development-publication.properties`へ出力します。
-- consumerには`-PcommonDevelopmentRepository=PATH -PcommonDevelopmentCoordinate=GROUP:MODULE:VERSION`を渡します。CommonのMod用・Editor用成果物を取り違える指定と正式版指定の併用は拒否します。
+- SushiEricDataModel/Coreの`publishDevelopment`はtimestampとUUIDで座標を作り、atomic claimで同座標の再発行を拒否します。成功した完全座標は`build/development-publication.properties`へ出力します。
+- consumerには`-PdataModelDevelopmentRepository=PATH -PdataModelDevelopmentCoordinate=GROUP:MODULE:VERSION`を渡します。SushiEricDataModelのMod用・Editor用成果物を取り違える指定と正式版指定の併用は拒否します。
 - Modの`describeDevRuntime`はLoomの実際のJavaExecからmain class、全classpath、JVM/プログラム引数、起動設定を取得します。配布jarから起動方法を推測しません。
 - Modの`exportDevRuntime`は取得したレシピをbundleへ変換します。手動呼出にはビルド前に取得した`runtimeSourceLock`、`runtimeArtifactStore`、`runtimePython`を明示します。標準のexporterは兄弟の`.github/scripts/export-dev-runtime.py`です。
 - exporterはJVMを起動しません。GameTest/実機実行は固定bundleを使う管理CLIの責務です。[runtime制御](runtime-control-guide.md)と[GameTest](gametest-guide.md)を参照してください。
@@ -36,11 +36,11 @@ Modが実際にCombatCoreへ依存していない状態ではCoreをModの依存
 commit、dirty binary patch、全tracked入力hash、未追跡入力hashとその実体を記録します。
 ignoreされた実行データ・build出力・秘密情報を入力へ混入させないでください。外部のinit script等による暗黙のビルド変更は使用しません。
 公開前にGit入力・コンパイル前の依存・コピー元の全ファイルを再照合します。変更中の入力では公開しません。
-Common/CoreのPOM/JAR、処理済みmain/gametestクラス・resource、Minecraft/mapping/依存Mod、
+SushiEricDataModel/CoreのPOM/JAR、処理済みmain/gametestクラス・resource、Minecraft/mapping/依存Mod、
 解決されたLoom本体とplugin依存、Gradleのlib、JDK全体をコピーします。
 JDK等にリンク・特殊ファイルがある場合も自動でたどらず拒否します。
 
-`runtime.json`にはmanifest・完全Common座標・ツールの実バージョンとSHA-256を保存します。
+`runtime.json`にはschemaVersion 2・dataModelCoordinateの完全座標・ツールの実バージョンとSHA-256を保存します。
 LoomがSNAPSHOT指定でも解決された実体を固定し、次回起動時にネットワークから解決し直しません。
 起動プロファイルはserver/GameTestを分け、GameTestクラスを通常serverのclasspathへ追加しません。
 サーバーで読まれないclientのassets設定は除外します。起動設定の外部パスは明示adapterでbundle/runへの相対参照へ変換し、未知の外部パスや環境変数は拒否します。
@@ -56,6 +56,18 @@ cwd/world/configを変えず同世代を再起動できます。既存の補助p
 bundleの内部へ実行データを置けませんが、generation/runtimeの配備は許可します。
 管理propertyは全5項目または未指定です。プロセス開始・正常停止・保存証跡は
 [runtime制御](runtime-control-guide.md)の責務です。
+
+## runtimeのversionと切替
+
+新規freezeは`recipeVersion: 2`と`dataModelCoordinate`だけを受け付け、`schemaVersion: 2`を出力します。
+DataModelのMod用JARと隣接POMは双方必須で、コンパイル前の`dependencyInputs`へSHA-256を記録します。
+`sources`には`SushiEricDataModel`と`SushiEricServerMod`を含め、旧提供元名やキーを混在させません。
+
+保存済み`schemaVersion: 1`のbundleは、旧`commonCoordinate`・Common入力記録をそのまま検証・起動できます。
+旧recipeの新規freeze、旧propertyへのfallback、bundleの再書込やartifact IDの付替えは行いません。
+snapshotは同じartifact ID・layout IDのbundleへだけ復元でき、v1 snapshotを別artifactのv2へ変換しません。
+切替時は対応済みrepoの確定commitで新bundleを作り、新bundle用の世代を初期化して起動・保存を検証します。
+既存bundleと対応snapshotは保全し、新bundleへ旧snapshotを直接復元しないでください。
 
 ## ビルド記録とMavenの明示回収
 
@@ -90,7 +102,7 @@ build helperの試験は、変更repoと固定依存の検査、未登録依存�
 実際のLoom bundleからのGameTestは別途実行し、起動と開発専用定義の登録を確認します。
 `scripts/check-runtime-bundle.py --bundle PATH`で再照合し、`--game-test-root PATH`も指定した場合だけ
 新しいrun-idでGameTestを実行します。通常サーバーは起動しません。結果XMLとconsole.logはこの実行領域へ残します。
-実Commonの並列発行試験は、`SUSHIERIC_COMMON_GRADLE_SOURCE`に対象Commonのパスを明示して
+実SushiEricDataModelの並列発行試験は、`SUSHIERIC_DATAMODEL_GRADLE_SOURCE`に対象SushiEricDataModelのパスを明示して
 `test_gradle_publication.py`を実行します。二つの独立コピーへ異なるresourceを追加し、並列発行後に両consumerの完全座標と内容を確認します。
 通常の単体試験ではこの重いGradle試験をスキップします。
 Windowsでの結果はmacOS 15の運用適合・停電耐久性の証明ではありません。
