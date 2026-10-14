@@ -22,6 +22,16 @@ ownerは協調契約でありGit lockやアクセス制御ではない。削除�
 `run/`・`.idea/`を複製しない。Minecraftの実行データはソースworktreeの寿命から切り離す。
 途中失敗のRECOVERY_REQUIREDは実体と登録を確認し、自動修復・強制削除しない。
 
+## 公開担当へのアクセス情報
+
+repo・worktreeの絶対パス、owner、許可操作、基準commit・差分と確認時点、sandbox権限、worktreeとGit共通管理領域へのアクセス可否、主担当で成功した実行方法を渡す。
+owner登録の引継ぎはOSやsandboxのアクセス権を変えない。
+アクセス拒否時は書込みを止め、明示したworkdirと絶対パスの`git -C`で読み取り確認する。
+通常実行が拒否され、操作が許可済みなら、対応環境では対象と理由を限定した`require_escalated`で読み取りを再試行する。
+成功したら差分・stage・追跡先・既存PRを確認して許可済みの公開を続ける。通常実行のエラーだけでworktree破損や利用不可と断定しない。
+承認付き実行の利用不可・拒否・再試行失敗では、実行方法・エラー原文・登録状態・未実行操作を報告して保全する。
+ACL変更、sandbox全体の無効化、owner奪取、別worktreeへの複製、Git管理情報の修復を回避策にしない。Git操作許可と実行時の承認レビューを区別する。
+
 ## 削除失敗の診断と明示復旧
 
 - Windowsの通常削除と削除前検査（status・ls-files）はGitコマンド単位で`core.longpaths=true`を指定する。local/global設定を書き換えず、forceを使用しない。
