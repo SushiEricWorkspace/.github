@@ -35,7 +35,13 @@ def parse_args() -> argparse.Namespace:
         "--repo-root", action="append", default=[], metavar="REPO=PATH",
         help="同期先worktreeを明示する。指定時は列挙したrepoだけを対象にする。複数指定可。",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.check and not args.repo_root:
+        parser.error(
+            "書き込みには--repo-root REPO=PATHが必要です。"
+            "例: --repo-root Common=worktrees/issue-123/Common"
+        )
+    return args
 
 
 def replace_common_block(text: str, common_rules: str) -> str:

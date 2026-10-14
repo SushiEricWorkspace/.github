@@ -91,7 +91,7 @@
 - 特定branchの作業専用に作成したworktreeは、対象branchの削除を指示された場合、保持する明示指示がなければ一緒に削除する。branch削除指示は対応する専用worktreeの削除許可を含むため、同じ許可を改めて求めない。Git一覧と管理記録でrepo、branch、専用worktree、task-id、ownerを照合し、worktreeを管理手順で先に削除してからbranchを削除する。primary、共有・固定AI用、他branch用のworktreeは対象に含めない。複数repoのtaskでは指示対象外のworktreeをまとめて削除しない。
 - 未コミット変更、保全が必要な追跡外・ignoredデータ、他ownerの作業継続、登録不一致、削除失敗がある場合はworktreeとbranchを保全し、原因と残り作業を報告する。未許可のプロセス終了や独断の登録修復で回避しない。
 - 移行中の既存`<repo>-claude/`・`<repo>-codex/`は自動移動・削除しない。進行中の作業は担当の固定worktreeで完了できる。作業branch削除後は最新の`origin/main`または`origin/develop`でdetached HEADへ戻す。新規タスクはタスクworktreeで開始する。
-- 共通ルールの同期先は`scripts/sync-agent-rules.py --repo-root REPO=PATH`で明示する。タスク作業から人間・他AIのAGENTS.mdへ暗黙に同期しない。
+- 共通ルールの書き込みでは`scripts/sync-agent-rules.py --repo-root REPO=PATH`で同期先を列挙する。省略時は拒否し、`--check`のみ省略してworkspace全体を読み取り確認できる。タスク作業から人間・他AIのAGENTS.mdへ暗黙に同期しない。
 - worktreeスキルの原本は`.github/skills/worktree/SKILL.md`とする。ローカル配置する場合は原本を使用し、`.claude/`等の配置先をコミットしない。
 - 分離テスト環境はホスト・管理rootごとの総合受入と運用者承認後に有効化する。未承認のrootやOSへ運用許可を流用せず、受入前は許可された使い捨て試験だけを行う。既存環境を自動移行しない。
 
