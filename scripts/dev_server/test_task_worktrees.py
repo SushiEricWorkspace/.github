@@ -23,7 +23,7 @@ class TaskWorktreesTest(unittest.TestCase):
         self.root = Path(self.temporary.name) / "検証 workspace"
         self.root.mkdir()
         self.manager = TaskWorktrees(self.root)
-        for name, branch in (("Common", "develop"), ("SushiEricServerMod", "main")):
+        for name, branch in (("SushiEricDataModel", "develop"), ("SushiEricServerMod", "main")):
             repo = self.root / name
             repo.mkdir()
             git(repo, "init", "-b", branch)
@@ -68,52 +68,93 @@ class TaskWorktreesTest(unittest.TestCase):
                 raise
         return self.manager.create(task, issue, owner, bases, fetch=False)
 
+    def test_registered_common_tasks_are_preserved_but_new_common_tasks_are_rejected(self):
+        legacy = self.root / "Common"
+        (self.root / "SushiEricDataModel").rename(legacy)
+        git(legacy, "remote", "set-url", "origin", str(legacy))
+        repos = {"Common": None, "SushiEricServerMod": None}
+        first = self.create(task="legacy-task", repos=repos)
+        self.assertEqual(first, self.create(task="legacy-task", repos=repos))
+        common = self.manager.target("legacy-task", "Common")
+        self.assertEqual("Common", common.name)
+        before = (common / "source.txt").read_bytes()
+        self.manager.handoff("legacy-task", "codex-a", "publisher")
+        result = self.manager.list("legacy-task")[0]
+        self.assertEqual("publisher", result["owner"])
+        self.assertEqual(first[0]["repos"], result["repos"])
+        self.assertEqual(before, (common / "source.txt").read_bytes())
+        for bases, dependencies in (({"Common": None}, {}),
+                                    ({"SushiEricServerMod": None},
+                                     {"Common": git(legacy, "rev-parse", "HEAD")})):
+            with self.subTest(bases=bases):
+                with self.assertRaisesRegex(TaskError, "新規taskの対象外"):
+                    self.manager.create("new-task", 101, "owner", bases,
+                                        dependencies=dependencies, fetch=False)
+                self.assertEqual([], self.manager.list("new-task"))
+        (common / "source.txt").write_text("preserve", encoding="utf-8")
+        with self.assertRaisesRegex(TaskError, "未コミット"):
+            self.manager.remove("legacy-task", "publisher")
+        self.assertTrue(common.exists())
+        git(common, "restore", "source.txt")
+        original = task_worktrees.git
+        def fail_mod_removal(repo, *args):
+            if repo.name == "SushiEricServerMod" and "remove" in args:
+                raise TaskError("synthetic removal failure")
+            return original(repo, *args)
+        with patch.object(task_worktrees, "git", side_effect=fail_mod_removal):
+            with self.assertRaisesRegex(TaskError, "synthetic removal failure"):
+                self.manager.remove("legacy-task", "publisher")
+        self.assertFalse(common.exists())
+        self.assertEqual("RECOVERY_REQUIRED", self.manager.list("legacy-task")[0]["state"])
+        self.manager.recover_remove("legacy-task", "publisher")
+        self.assertEqual("REMOVED", self.manager.list("legacy-task")[0]["state"])
+
     def test_same_issue_in_different_repos_shares_detached_dependencies(self):
-        common = git(self.root / "Common", "rev-parse", "HEAD")
+        common = git(self.root / "SushiEricDataModel", "rev-parse", "HEAD")
         mod = git(self.root / "SushiEricServerMod", "rev-parse", "HEAD")
         first = self.manager.create("mod-100", 100, "owner", {"SushiEricServerMod": None},
-                                    dependencies={"Common": common}, fetch=False)
-        second = self.manager.create("common-100", 100, "owner", {"Common": None},
+                                    dependencies={"SushiEricDataModel": common}, fetch=False)
+        second = self.manager.create("common-100", 100, "owner", {"SushiEricDataModel": None},
                                      dependencies={"SushiEricServerMod": mod}, fetch=False)
-        for task, dependency, commit in (("mod-100", "Common", common),
+        for task, dependency, commit in (("mod-100", "SushiEricDataModel", common),
                                          ("common-100", "SushiEricServerMod", mod)):
             path = self.manager.target(task, dependency)
             self.assertEqual("", git(path, "branch", "--show-current"))
             self.assertEqual(commit, git(path, "rev-parse", "HEAD"))
             self.assertIsNone(worktrees(self.root / dependency)[path.resolve()])
         self.assertEqual(first, self.manager.create("mod-100", 100, "owner", {"SushiEricServerMod": None},
-                                                    dependencies={"Common": common}, fetch=False))
+                                                    dependencies={"SushiEricDataModel": common}, fetch=False))
         self.assertEqual({"branch", "dependency"}, {p["kind"] for p in second[0]["repos"]})
         self.manager.handoff("mod-100", "owner", "publisher")
         self.manager.remove("mod-100", "publisher")
         self.assertEqual("ACTIVE", self.manager.list("common-100")[0]["state"])
-        self.assertTrue(git(self.root / "Common", "for-each-ref", "refs/heads/feature/issue-100"))
+        self.assertTrue(git(self.root / "SushiEricDataModel", "for-each-ref", "refs/heads/feature/issue-100"))
         self.manager.remove("common-100", "owner")
 
     def test_new_multiple_changes_and_unfixed_dependencies_are_rejected(self):
-        common = git(self.root / "Common", "rev-parse", "HEAD")
-        for bases, dependencies in (({"Common": None, "SushiEricServerMod": None}, {}),
-                                    ({"SushiEricServerMod": None}, {"Common": "HEAD"}),
-                                    ({"SushiEricServerMod": None}, {"Common": common[:8]}),
-                                    ({"Common": None}, {"Common": common})):
+        common = git(self.root / "SushiEricDataModel", "rev-parse", "HEAD")
+        for bases, dependencies in (({"SushiEricDataModel": None, "SushiEricServerMod": None}, {}),
+                                    ({"SushiEricServerMod": None}, {"SushiEricDataModel": "HEAD"}),
+                                    ({"SushiEricServerMod": None}, {"SushiEricDataModel": common[:8]}),
+                                    ({"SushiEricDataModel": None}, {"SushiEricDataModel": common})):
             with self.subTest(bases=bases, dependencies=dependencies):
                 with self.assertRaises(TaskError):
                     self.manager.create("task-a", 100, "owner", bases, dependencies=dependencies, fetch=False)
                 self.assertEqual([], self.manager.list())
-        self.assertFalse(self.manager.target("task-a", "Common").exists())
+        self.assertFalse(self.manager.target("task-a", "SushiEricDataModel").exists())
 
     def test_dependency_dirty_head_branch_and_owner_changes_are_rejected(self):
-        common = self.root / "Common"
+        common = self.root / "SushiEricDataModel"
         commit = git(common, "rev-parse", "HEAD")
         (common / "source.txt").write_text("later", encoding="utf-8")
         git(common, "add", ".")
         git(common, "commit", "-m", "fixture update")
         later = git(common, "rev-parse", "HEAD")
         self.manager.create("task-a", 100, "owner", {"SushiEricServerMod": None},
-                            dependencies={"Common": commit}, fetch=False)
-        path = self.manager.target("task-a", "Common")
+                            dependencies={"SushiEricDataModel": commit}, fetch=False)
+        path = self.manager.target("task-a", "SushiEricDataModel")
         operations = (lambda: self.manager.create("task-a", 100, "owner", {"SushiEricServerMod": None},
-                                                  dependencies={"Common": commit}, fetch=False),
+                                                  dependencies={"SushiEricDataModel": commit}, fetch=False),
                       lambda: self.manager.handoff("task-a", "owner", "publisher"),
                       lambda: self.manager.remove("task-a", "owner"))
         for name in ("source.txt", "new.txt"):
@@ -140,68 +181,68 @@ class TaskWorktreesTest(unittest.TestCase):
         self.assertFalse(git(common, "for-each-ref", "refs/heads/feature/issue-100"))
 
     def test_detached_missing_registration_and_partial_remove_are_preserved(self):
-        commit = git(self.root / "Common", "rev-parse", "HEAD")
+        commit = git(self.root / "SushiEricDataModel", "rev-parse", "HEAD")
         self.manager.create("task-a", 100, "owner", {"SushiEricServerMod": None},
-                            dependencies={"Common": commit}, fetch=False)
-        plan = next(p for p in self.manager.list()[0]["repos"] if p["name"] == "Common")
+                            dependencies={"SushiEricDataModel": commit}, fetch=False)
+        plan = next(p for p in self.manager.list()[0]["repos"] if p["name"] == "SushiEricDataModel")
         with patch("dev_server.task_worktrees.worktrees", return_value={}):
             with self.assertRaisesRegex(TaskError, "branch"):
                 self.manager.verify("task-a", plan)
         def interrupt(repo, *args):
             result = git(repo, *args)
-            if repo.name == "Common" and "remove" in args:
+            if repo.name == "SushiEricDataModel" and "remove" in args:
                 raise KeyboardInterrupt("fixture interruption")
             return result
         with patch("dev_server.task_worktrees.git", side_effect=interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 self.manager.remove("task-a", "owner")
         self.assertEqual("REMOVED", self.manager.recover_remove("task-a", "owner")[0]["state"])
-        self.assertFalse(git(self.root / "Common", "for-each-ref", "refs/heads/feature/issue-100"))
+        self.assertFalse(git(self.root / "SushiEricDataModel", "for-each-ref", "refs/heads/feature/issue-100"))
 
     def test_dependency_cli_creates_fixed_tree_and_rejects_invalid_requests(self):
         script = Path(__file__).resolve().parents[1] / "setup-worktrees.py"
-        commit = git(self.root / "Common", "rev-parse", "HEAD")
+        commit = git(self.root / "SushiEricDataModel", "rev-parse", "HEAD")
         prefix = [sys.executable, "-B", str(script), "--workspace-root", str(self.root),
                   "--task-id", "cli-task", "--issue", "100", "--owner", "owner"]
         result = subprocess.run([*prefix, "--repos", "SushiEricServerMod",
-                                 "--dependency", f"Common={commit}"], capture_output=True, text=True, encoding="utf-8")
+                                 "--dependency", f"SushiEricDataModel={commit}"], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(0, result.returncode, result.stderr)
         records = json.loads(result.stdout)
         self.assertEqual("dependency", records[0]["repos"][0]["kind"])
         before = self.manager.list()
-        for args in (("--repos", "SushiEricServerMod", "--dependency", "Common=HEAD"),
-                     ("--repos", "SushiEricServerMod", "--dependency", f"Common={commit}",
-                      "--dependency", f"Common={commit}"),
-                     ("--repos", "Common", "--dependency", f"Common={commit}"),
-                     ("--repos", "Common,SushiEricServerMod")):
+        for args in (("--repos", "SushiEricServerMod", "--dependency", "SushiEricDataModel=HEAD"),
+                     ("--repos", "SushiEricServerMod", "--dependency", f"SushiEricDataModel={commit}",
+                      "--dependency", f"SushiEricDataModel={commit}"),
+                     ("--repos", "SushiEricDataModel", "--dependency", f"SushiEricDataModel={commit}"),
+                     ("--repos", "SushiEricDataModel,SushiEricServerMod")):
             with self.subTest(args=args):
                 result = subprocess.run([*prefix, *args], capture_output=True, text=True, encoding="utf-8")
                 self.assertNotEqual(0, result.returncode)
                 self.assertEqual(before, self.manager.list())
 
     def test_dependency_incomplete_record_and_unknown_kind_are_rejected(self):
-        commit = git(self.root / "Common", "rev-parse", "HEAD")
+        commit = git(self.root / "SushiEricDataModel", "rev-parse", "HEAD")
         self.manager.create("task-a", 100, "owner", {"SushiEricServerMod": None},
-                            dependencies={"Common": commit}, fetch=False)
-        for sql, message in (("UPDATE repos SET created=0 WHERE name='Common'", "未確定"),
-                             ("UPDATE repos SET kind='unknown' WHERE name='Common'", "未知")):
+                            dependencies={"SushiEricDataModel": commit}, fetch=False)
+        for sql, message in (("UPDATE repos SET created=0 WHERE name='SushiEricDataModel'", "未確定"),
+                             ("UPDATE repos SET kind='unknown' WHERE name='SushiEricDataModel'", "未知")):
             with self.manager.database() as db:
                 db.execute(sql)
             with self.assertRaisesRegex(TaskError, message):
                 self.manager.handoff("task-a", "owner", "publisher")
-            self.assertTrue(self.manager.target("task-a", "Common").exists())
+            self.assertTrue(self.manager.target("task-a", "SushiEricDataModel").exists())
             with self.manager.database() as db:
-                db.execute("UPDATE repos SET created=1, kind='dependency' WHERE name='Common'")
+                db.execute("UPDATE repos SET created=1, kind='dependency' WHERE name='SushiEricDataModel'")
 
     def test_v2_migration_preserves_legacy_multi_repo_task(self):
-        first = self.create(repos={"Common": None, "SushiEricServerMod": None})
+        first = self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
         with self.manager.database() as db:
             db.execute("ALTER TABLE repos DROP COLUMN kind")
             db.execute("PRAGMA user_version=2")
         migrated = self.manager.list()
         self.assertEqual(first, migrated)
         self.assertTrue(all(p["kind"] == "branch" for p in migrated[0]["repos"]))
-        self.assertEqual(first, self.create(repos={"Common": None, "SushiEricServerMod": None}))
+        self.assertEqual(first, self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None}))
         self.manager.handoff("task-a", "codex-a", "publisher")
         self.assertEqual("REMOVED", self.manager.remove("task-a", "publisher")[0]["state"])
 
@@ -227,11 +268,11 @@ class TaskWorktreesTest(unittest.TestCase):
         self.assertFalse((a / "run").exists())
 
     def test_repo_default_and_explicit_dependency_commit(self):
-        common = self.root / "Common"
+        common = self.root / "SushiEricDataModel"
         base = git(common, "rev-parse", "HEAD")
-        result = self.create(repos={"Common": base, "SushiEricServerMod": None})
+        result = self.create(repos={"SushiEricDataModel": base, "SushiEricServerMod": None})
         self.assertEqual(base, result[0]["repos"][0]["base_commit"])
-        self.assertEqual(base, git(self.manager.target("task-a", "Common"), "rev-parse", "HEAD"))
+        self.assertEqual(base, git(self.manager.target("task-a", "SushiEricDataModel"), "rev-parse", "HEAD"))
         self.assertEqual("develop", git(common, "branch", "--show-current"))
 
     def test_create_is_idempotent_for_same_inputs(self):
@@ -382,9 +423,9 @@ class TaskWorktreesTest(unittest.TestCase):
             self.create()
 
     def test_dirty_handoff_preserves_all_repo_contents_and_git_state(self):
-        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
         before = {}
-        for name in ("Common", "SushiEricServerMod"):
+        for name in ("SushiEricDataModel", "SushiEricServerMod"):
             path = self.manager.target("task-a", name)
             (path / "source.txt").write_text("staged\n", encoding="utf-8")
             git(path, "add", "source.txt")
@@ -430,8 +471,8 @@ class TaskWorktreesTest(unittest.TestCase):
                 self.assertEqual("unsaved", (path / "source.txt").read_text())
 
     def test_handoff_preflights_all_repos_before_changing_owner(self):
-        self.create(repos={"Common": None, "SushiEricServerMod": None})
-        common = self.manager.target("task-a", "Common")
+        self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
+        common = self.manager.target("task-a", "SushiEricDataModel")
         (common / "source.txt").write_text("unsaved", encoding="utf-8")
         mod = self.manager.target("task-a", "SushiEricServerMod")
         git(mod, "checkout", "-b", "different")
@@ -466,26 +507,26 @@ class TaskWorktreesTest(unittest.TestCase):
     def test_all_repos_are_preflighted_before_creation(self):
         git(self.root / "SushiEricServerMod", "branch", "feature/issue-100")
         with self.assertRaises(TaskError):
-            self.create(repos={"Common": None, "SushiEricServerMod": None})
-        self.assertFalse(self.manager.target("task-a", "Common").exists())
-        self.assertFalse(git(self.root / "Common", "for-each-ref", "refs/heads/feature/issue-100"))
+            self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
+        self.assertFalse(self.manager.target("task-a", "SushiEricDataModel").exists())
+        self.assertFalse(git(self.root / "SushiEricDataModel", "for-each-ref", "refs/heads/feature/issue-100"))
 
     def test_primary_outside_paths_and_invalid_names_are_rejected(self):
-        for task in ("../Common", "Common", "", "task/primary"):
+        for task in ("../SushiEricDataModel", "SushiEricDataModel", "", "task/primary"):
             with self.assertRaises(TaskError):
                 self.create(task)
-        for repo in ("../Common", "SushiEricServerMod-codex"):
+        for repo in ("../SushiEricDataModel", "SushiEricServerMod-codex"):
             with self.assertRaises(TaskError):
                 self.create(repos={repo: None})
         self.assertFalse((self.root / "worktrees").exists())
 
     def test_all_repos_are_preflighted_before_removal(self):
-        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
         mod = self.manager.target("task-a", "SushiEricServerMod")
         (mod / "source.txt").write_text("unsaved", encoding="utf-8")
         with self.assertRaises(TaskError):
             self.manager.remove("task-a", "codex-a")
-        self.assertTrue(self.manager.target("task-a", "Common").exists())
+        self.assertTrue(self.manager.target("task-a", "SushiEricDataModel").exists())
 
     def test_ignored_user_data_prevents_removal(self):
         self.create()
@@ -528,11 +569,11 @@ class TaskWorktreesTest(unittest.TestCase):
             return git(repo, *args)
         with patch("dev_server.task_worktrees.git", side_effect=failing_git):
             with self.assertRaisesRegex(TaskError, "synthetic"):
-                self.create(repos={"Common": None, "SushiEricServerMod": None})
+                self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
         self.assertEqual("RECOVERY_REQUIRED", self.manager.list()[0]["state"])
-        self.assertTrue(self.manager.target("task-a", "Common").exists())
+        self.assertTrue(self.manager.target("task-a", "SushiEricDataModel").exists())
         self.manager.remove("task-a", "codex-a")
-        self.assertFalse(self.manager.target("task-a", "Common").exists())
+        self.assertFalse(self.manager.target("task-a", "SushiEricDataModel").exists())
 
     def test_concurrent_owners_do_not_share_same_task(self):
         with self.manager.database():
@@ -553,13 +594,13 @@ class TaskWorktreesTest(unittest.TestCase):
         (path / "build").mkdir()
         target = path / "build/external"
         try:
-            target.symlink_to(self.root / "Common", target_is_directory=True)
+            target.symlink_to(self.root / "SushiEricDataModel", target_is_directory=True)
         except OSError as error:
             self.skipTest(f"このホストにはsymlink作成権限がありません: {error}")
         self.assertFalse(git(path, "status", "--porcelain", "--untracked-files=all"))
         with self.assertRaisesRegex(TaskError, "リンク"):
             self.manager.remove("task-a", "codex-a")
-        self.assertEqual("initial\n", (self.root / "Common/source.txt").read_text())
+        self.assertEqual("initial\n", (self.root / "SushiEricDataModel/source.txt").read_text())
         self.assertTrue(target.is_symlink())
         self.assertEqual("ACTIVE", self.manager.list()[0]["state"])
 
@@ -612,16 +653,16 @@ class TaskWorktreesTest(unittest.TestCase):
                     git(repo, "branch", "-d", "feature/issue-100")
 
     def test_recovery_preserves_nonempty_unregistered_directory(self):
-        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
         path = self.removed_without_record(residue=True)
         with self.assertRaisesRegex(TaskError, "非空"):
             self.manager.recover_remove("task-a", "codex-a")
         self.assertEqual("preserve", (path / "keep.txt").read_text())
-        self.assertTrue(self.manager.target("task-a", "Common").exists())
+        self.assertTrue(self.manager.target("task-a", "SushiEricDataModel").exists())
         self.assertEqual([1, 1], [p["created"] for p in self.manager.list()[0]["repos"]])
 
     def test_multiple_repo_failure_reports_and_resumes(self):
-        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
         def failing_git(repo, *args):
             if repo.name == "SushiEricServerMod" and "remove" in args:
                 raise TaskError("Permission denied: synthetic")
@@ -630,7 +671,7 @@ class TaskWorktreesTest(unittest.TestCase):
             with self.assertRaises(TaskError) as caught:
                 self.manager.remove("task-a", "codex-a")
         message = str(caught.exception)
-        for text in ("Permission denied: synthetic", "処理済みrepo: Common",
+        for text in ("Permission denied: synthetic", "処理済みrepo: SushiEricDataModel",
                      "未処理/要確認repo: SushiEricServerMod", "Git登録=True", ".git=True",
                      "原因は未確定", "sandbox", "--recover-remove"):
             self.assertIn(text, message)
@@ -702,10 +743,10 @@ class TaskWorktreesTest(unittest.TestCase):
             return git(repo, *args)
         with patch("dev_server.task_worktrees.git", side_effect=failing_git):
             with self.assertRaises(TaskError):
-                self.create(repos={"Common": None, "SushiEricServerMod": None})
+                self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
         with self.assertRaisesRegex(TaskError, "削除開始記録"):
             self.manager.recover_remove("task-a", "codex-a")
-        self.assertTrue(self.manager.target("task-a", "Common").exists())
+        self.assertTrue(self.manager.target("task-a", "SushiEricDataModel").exists())
 
     def test_creation_failure_after_branch_creation_is_not_removal_recovery(self):
         repo = self.root / "SushiEricServerMod"
@@ -749,7 +790,7 @@ class TaskWorktreesTest(unittest.TestCase):
             self.assertEqual(3, db.execute("PRAGMA user_version").fetchone()[0])
 
     def test_recovery_rejects_dirty_ignored_data_and_branch_mismatch(self):
-        self.create(repos={"Common": None, "SushiEricServerMod": None})
+        self.create(repos={"SushiEricDataModel": None, "SushiEricServerMod": None})
         self.set_state("RECOVERY_REQUIRED")
         path = self.manager.target("task-a", "SushiEricServerMod")
         new = path / "new.txt"
@@ -767,7 +808,7 @@ class TaskWorktreesTest(unittest.TestCase):
         git(path, "checkout", "-b", "different")
         with self.assertRaisesRegex(TaskError, "branch"):
             self.manager.recover_remove("task-a", "codex-a")
-        self.assertTrue(self.manager.target("task-a", "Common").exists())
+        self.assertTrue(self.manager.target("task-a", "SushiEricDataModel").exists())
         self.assertEqual("RECOVERY_REQUIRED", self.manager.list()[0]["state"])
 
     def test_recovery_rejects_unknown_registry_and_invalid_record(self):
@@ -863,7 +904,7 @@ class TaskWorktreesTest(unittest.TestCase):
     def test_recovery_rejects_symlink_and_special_residual_file(self):
         self.create()
         path = self.removed_without_record(empty=True)
-        outside = self.root / "Common/source.txt"
+        outside = self.root / "SushiEricDataModel/source.txt"
         link = path / "external"
         try:
             link.symlink_to(outside)

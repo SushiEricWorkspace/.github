@@ -36,7 +36,7 @@ def main() -> int:
         manager = TaskWorktrees(args.workspace_root or workspace_for(Path(__file__).resolve().parents[1]))
         if args.list_legacy:
             result = {name: git(manager.primary(name), "worktree", "list")
-                      for name in REPOSITORIES if (manager.workspace / name / ".git").is_dir()}
+                      for name in (*REPOSITORIES, "Common") if (manager.workspace / name / ".git").is_dir()}
         elif args.list:
             result = manager.list(args.task_id)
         else:

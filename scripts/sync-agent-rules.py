@@ -10,7 +10,7 @@ from dev_server.task_worktrees import workspace_for
 START = "<!-- COMMON-RULES:START -->"
 END = "<!-- COMMON-RULES:END -->"
 TARGETS = (
-    "Common/AGENTS.md",
+    "SushiEricDataModel/AGENTS.md",
     "SushiEricServerManager/AGENTS.md",
     "SushiEricServerMod/AGENTS.md",
     "SushiEricCombatCore/AGENTS.md",
@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workspace-root",
         type=Path,
-        help="Common等のリポジトリが配置された親ディレクトリ。省略時は.githubの親を使用する。",
+        help="SushiEricDataModel等のリポジトリが配置された親ディレクトリ。省略時は.githubの親を使用する。",
     )
     parser.add_argument(
         "--check",
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     if not args.check and not args.repo_root:
         parser.error(
             "書き込みには--repo-root REPO=PATHが必要です。"
-            "例: --repo-root Common=worktrees/issue-123/Common"
+            "例: --repo-root SushiEricDataModel=worktrees/issue-123/SushiEricDataModel"
         )
     return args
 

@@ -51,7 +51,7 @@ class SyncAgentRulesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="sushieric-sync-test-") as directory:
             workspace = Path(directory)
             targets = self.make_workspace(workspace)
-            selected = workspace / "worktrees/task-a/Common"
+            selected = workspace / "worktrees/task-a/SushiEricDataModel"
             selected.mkdir(parents=True)
             (selected / "AGENTS.md").write_text(
                 f"before\n{sync.START}\nold\n{sync.END}\nafter\n", encoding="utf-8"
@@ -65,12 +65,12 @@ class SyncAgentRulesTest(unittest.TestCase):
 
             result = self.run_cli(
                 workspace,
-                "--repo-root", "Common=worktrees/task-a/Common",
+                "--repo-root", "SushiEricDataModel=worktrees/task-a/SushiEricDataModel",
                 "--repo-root", "SushiEricServerMod=worktrees/task-a/SushiEricServerMod",
             )
 
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("old", targets["Common"].read_text(encoding="utf-8"))
+            self.assertIn("old", targets["SushiEricDataModel"].read_text(encoding="utf-8"))
             self.assertNotIn("old", (selected / "AGENTS.md").read_text(encoding="utf-8"))
             self.assertIn("Organization共通ルール", (selected / "AGENTS.md").read_text(encoding="utf-8"))
             self.assertNotIn("old", (second / "AGENTS.md").read_text(encoding="utf-8"))
@@ -94,13 +94,13 @@ class SyncAgentRulesTest(unittest.TestCase):
     def test_explicit_roots_do_not_include_primary(self):
         with tempfile.TemporaryDirectory(prefix="sushieric-sync-test-") as directory:
             workspace = Path(directory)
-            target = workspace / "worktrees/task-a/Common/AGENTS.md"
+            target = workspace / "worktrees/task-a/SushiEricDataModel/AGENTS.md"
             self.assertEqual([target.resolve()], sync.target_paths(
-                workspace, ["Common=worktrees/task-a/Common"]))
+                workspace, ["SushiEricDataModel=worktrees/task-a/SushiEricDataModel"]))
 
     def test_invalid_duplicate_and_shared_roots_are_rejected(self):
-        for pairs in (["Unknown=x"], ["Common="], ["Common=x", "Common=y"],
-                      ["Common=x", "SushiEricServerMod=x"]):
+        for pairs in (["Unknown=x"], ["SushiEricDataModel="], ["SushiEricDataModel=x", "SushiEricDataModel=y"],
+                      ["SushiEricDataModel=x", "SushiEricServerMod=x"]):
             with self.assertRaises(ValueError):
                 sync.target_paths(Path.cwd(), pairs)
 
