@@ -1,6 +1,7 @@
 """固定runtime helperが登録taskの入力だけを使うことを検証する。"""
 
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -10,9 +11,11 @@ from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
-from dev_server.build_inputs import capture_sources
+from dev_server.build_inputs import canonical, capture_sources, digest
 from dev_server.contracts import ContractError
 from dev_server.task_worktrees import TaskError, TaskWorktrees, git
+from dev_server.task_maven import write_receipt
+from dev_server.test_task_maven import synthetic_bundle
 
 spec = importlib.util.spec_from_file_location("build_dev_runtime", SCRIPTS / "build-dev-runtime.py")
 build_dev_runtime = importlib.util.module_from_spec(spec)
@@ -122,7 +125,7 @@ class BuildDevRuntimeTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             build_dev_runtime.recorded_exporter(repos[".github"], source_lock)
 
-    def main_fixture(self, extras=()):
+    def main_fixture(self, extras=(), failure=None):
         task = self.root / "worktrees/task-41"
         common = task / "Common"
         mod = task / "SushiEricServerMod"
@@ -148,7 +151,7 @@ class BuildDevRuntimeTests(unittest.TestCase):
         build.mkdir()
         (build / "development-publication.properties").write_text(
             f"mod={mod_coordinate}\neditor={editor_coordinate}\n")
-        build_id = "fixture-build"
+        build_id = "a" * 32
         maven = task / "maven" / build_id
         core_coordinate = editor_coordinate.replace("sushieric-common-editor-dev", "sushieric-combat-core-dev")
         if "SushiEricCombatCore" in extras:
@@ -157,6 +160,12 @@ class BuildDevRuntimeTests(unittest.TestCase):
             (core_build / "development-publication.properties").write_text(f"core={core_coordinate}\n")
 
         def gradle_side_effect(repo, *args):
+            if failure is not None:
+                raise failure
+            if repo == mod:
+                lock_path = Path(next(arg.split("=", 1)[1] for arg in args if arg.startswith("-PruntimeSourceLock=")))
+                bundle = synthetic_bundle(store, json.loads(lock_path.read_bytes()))
+                write_receipt(lock_path, bundle)
             if repo == common or repo.name == "SushiEricCombatCore":
                 coordinates = (mod_coordinate, editor_coordinate) if repo == common else (core_coordinate,)
                 repository = maven if repo == common else maven / "core"
@@ -167,8 +176,11 @@ class BuildDevRuntimeTests(unittest.TestCase):
                     (directory / f"{module}-{version}.jar").write_bytes(b"jar")
                     (directory / f"{module}-{version}.pom").write_bytes(b"pom")
 
-        source_lock = {"sources": [{"root": str(github), "record": {"repo": ".github"},
-                                    "inputs": [{"path": "scripts/export-dev-runtime.py"}]}]}
+        source_lock = {"sourceLockVersion": 1, "sources": [
+            {"root": str(task / name), "record": {"repo": name, "commit": "0" * 40,
+             "dirtyPatchSha256": digest(b""), "untrackedInputs": []},
+             "inputs": [{"path": "scripts/export-dev-runtime.py"}] if name == ".github" else [],
+             "patchBase64": ""} for name in sorted(names)]}
         with patch.object(build_dev_runtime, "__file__", str(github / "scripts/build-dev-runtime.py")), \
                 patch.object(sys, "argv", ["build-dev-runtime.py", "--task-root", str(task),
                                             "--owner", "owner", "--store", str(store)]), \
@@ -179,15 +191,35 @@ class BuildDevRuntimeTests(unittest.TestCase):
                 patch.object(build_dev_runtime, "gradle", side_effect=gradle_side_effect) as gradle:
             build_dev_runtime.main()
 
-        self.assertEqual(2, registered.call_count)
+        self.assertEqual(3, registered.call_count)
         registered.assert_called_with(task.absolute(), "owner", names)
         export_call = next(call for call in gradle.call_args_list if "exportDevRuntime" in call.args)
         self.assertEqual(mod, export_call.args[0])
         self.assertIn(f"-PruntimeExporter={exporter.resolve()}", export_call.args)
+        record = json.loads((task.parent / ".build-records/task-41" / f"{build_id}.json").read_bytes())
+        self.assertEqual("SUCCEEDED", record["state"])
+        self.assertTrue(record["artifactId"])
         return gradle.call_args_list
 
     def test_main_passes_recorded_task_exporter_to_gradle(self):
         self.main_fixture()
+
+    def test_build_failure_is_recorded_and_maven_is_kept(self):
+        with self.assertRaisesRegex(RuntimeError, "fixture Gradle failure"):
+            self.main_fixture(failure=RuntimeError("fixture Gradle failure"))
+        record_path = self.root / "worktrees/.build-records/task-41" / ("a" * 32 + ".json")
+        record = json.loads(record_path.read_bytes())
+        self.assertEqual("FAILED", record["state"])
+        self.assertTrue(Path(record["maven"]).exists())
+        self.assertIsNone(record["artifactId"])
+
+    def test_failure_record_task_error_keeps_original_exception_and_note(self):
+        original = RuntimeError("original build failure")
+        with patch.object(build_dev_runtime.TaskMaven, "fail", side_effect=TaskError("record path changed")):
+            with self.assertRaises(RuntimeError) as raised:
+                self.main_fixture(failure=original)
+        self.assertIs(original, raised.exception)
+        self.assertTrue(any("record path changed" in note for note in original.__notes__))
 
     def test_registered_manager_and_core_are_built_without_extra_flags(self):
         calls = self.main_fixture(("SushiEricServerManager", "SushiEricCombatCore"))
