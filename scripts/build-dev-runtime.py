@@ -31,6 +31,42 @@ def publication(root: Path, key: str, module: str) -> str:
     return coordinate
 
 
+def task_github(root: Path, script: Path) -> Path:
+    root = root.absolute()
+    expected = root / ".github/scripts/build-dev-runtime.py"
+    if root.parent.name != "worktrees":
+        raise ContractError(f"build: task worktreeのrootを指定してください。実行helper: {expected}")
+    github = root / ".github"
+    if script.is_symlink() or script.absolute() != expected.absolute():
+        raise ContractError(f"build: 登録済みtaskの.githubから実行してください: {expected}")
+    return github
+
+
+def registered_task(root: Path, owner: str, names: set[str]):
+    registry = TaskWorktrees(root.parent.parent)
+    if not (registry.root / "registry.sqlite").is_file():
+        raise ContractError("build: worktree registryがありません")
+    with registry.database() as db:
+        plans = {row["name"]: row for row in registry.owned(db, root.name, owner, ("ACTIVE",))}
+        if not names <= plans.keys():
+            raise ContractError("build: 必要なrepoがtaskに登録されていません")
+        for name in names:
+            path = root / name
+            if (registry.target(root.name, name) != path.absolute()
+                    or worktrees(path).get(path.resolve()) != f"refs/heads/{plans[name]['branch']}"):
+                raise ContractError("build: 登録branch/worktreeと一致しません")
+    return plans
+
+
+def recorded_exporter(github: Path, source_lock: dict) -> Path:
+    source = next(item for item in source_lock["sources"] if item["record"]["repo"] == ".github")
+    exporter = (github / "scripts/export-dev-runtime.py").resolve()
+    relative = exporter.relative_to(Path(source["root"]).resolve()).as_posix()
+    if not any(item["path"] == relative and not item.get("deleted") for item in source["inputs"]):
+        raise ContractError("build: task .githubのexporterが入力記録にありません")
+    return exporter
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-root", type=Path, required=True)
@@ -42,28 +78,17 @@ def main():
     root = args.task_root.absolute()
     _directory(root)
     _directory(args.store.absolute())
-    if root.parent.name != "worktrees":
-        raise ContractError("build: 登録済みtaskのrootを指定してください")
-    registry = TaskWorktrees(root.parent.parent)
-    if not (registry.root / "registry.sqlite").is_file():
-        raise ContractError("build: worktree registryがありません")
     names = {"Common", "SushiEricServerMod", ".github"}
     if args.manager:
         names.add("SushiEricServerManager")
     if args.with_core:
         names.add("SushiEricCombatCore")
+    github = task_github(root, Path(__file__))
     with build_lock(root / ".build.lock"):
-        with registry.database() as db:
-            db.execute("BEGIN IMMEDIATE")
-            plans = {row["name"]: row for row in registry.owned(db, root.name, args.owner, ("ACTIVE",))}
-            if not names <= plans.keys():
-                raise ContractError("build: 必要なrepoがtaskに登録されていません")
-            for name in names:
-                path = root / name
-                if worktrees(path).get(path.resolve()) != f"refs/heads/{plans[name]['branch']}":
-                    raise ContractError("build: 登録branch/worktreeと一致しません")
+        registered_task(root, args.owner, names)
         repos = {name: root / name for name in names}
         source_lock = capture_sources(repos)
+        exporter = recorded_exporter(github, source_lock)
         build_id = uuid.uuid4().hex
         maven = root / "maven" / build_id
         _directory(maven)
@@ -99,7 +124,8 @@ def main():
         lock.write_bytes(canonical(source_lock))
         gradle(repos["SushiEricServerMod"], "build", "exportDevRuntime", *mod_args,
                f"-PruntimeSourceLock={lock}", f"-PruntimeArtifactStore={args.store.absolute()}",
-               f"-PruntimePython={sys.executable}", f"-PruntimeExporter={Path(__file__).with_name('export-dev-runtime.py')}")
+               f"-PruntimePython={sys.executable}",
+               f"-PruntimeExporter={exporter}")
         verify_sources(source_lock)
         print(json.dumps({"task": root.name, "commonCoordinate": mod_coordinate, "status": "exported"}))
 
