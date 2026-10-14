@@ -4,12 +4,14 @@ from pathlib import Path
 import os
 import subprocess
 import sys
+import sqlite3
+from threading import Event
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from dev_server.task_worktrees import TaskError, TaskWorktrees, git, worktrees, workspace_for
-from dev_server.build_lock import build_lock
+from dev_server.build_lock import BuildLockError, build_lock
 
 
 class TaskWorktreesTest(unittest.TestCase):
@@ -81,6 +83,106 @@ class TaskWorktreesTest(unittest.TestCase):
                 self.manager.remove("task-a", "codex-a")
             self.manager.handoff("task-b", "codex-a", "claude-b")
         self.manager.handoff("task-a", "codex-a", "claude-b")
+
+    def test_slow_preflight_allows_other_task_and_keeps_own_task_locked(self):
+        self.create()
+        self.create("task-b", 101)
+        entered, resume = Event(), Event()
+        original = self.manager._removal_target
+
+        def paused_target(task_id, *args, **kwargs):
+            result = original(task_id, *args, **kwargs)
+            if task_id == "task-a" and not entered.is_set():
+                entered.set()
+                if not resume.wait(10):
+                    raise TaskError("検査再開の待機期限を超えました")
+            return result
+
+        with patch.object(self.manager, "_removal_target", side_effect=paused_target):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                removing = pool.submit(self.manager.remove, "task-a", "codex-a")
+                try:
+                    self.assertTrue(entered.wait(5))
+                    self.assertEqual("ACTIVE", pool.submit(self.manager.list, "task-b").result(3)[0]["state"])
+                    result = pool.submit(self.manager.handoff, "task-b", "codex-a", "publisher").result(3)
+                    self.assertEqual("publisher", result[0]["owner"])
+                    def build():
+                        with build_lock(self.root / "worktrees/task-a/.build.lock"):
+                            pass
+                    for operation in (lambda: self.create(),
+                                      lambda: self.manager.handoff("task-a", "codex-a", "publisher"),
+                                      lambda: self.manager.remove("task-a", "codex-a"),
+                                      build):
+                        with self.assertRaises((TaskError, BuildLockError)):
+                            operation()
+                finally:
+                    resume.set()
+                self.assertEqual("REMOVED", removing.result(5)[0]["state"])
+
+    def test_preflight_record_changes_are_preserved_and_rejected(self):
+        self.create()
+        path = self.manager.target("task-a", "SushiEricServerMod")
+        original = self.manager.verify
+        changes = (
+            "UPDATE tasks SET owner='other' WHERE task_id='task-a'",
+            "UPDATE tasks SET state='RECOVERY_REQUIRED' WHERE task_id='task-a'",
+            "UPDATE repos SET base_commit='changed' WHERE task_id='task-a'",
+            "UPDATE repos SET created=0 WHERE task_id='task-a'",
+            "INSERT INTO removals VALUES ('task-a')",
+        )
+        operations = (
+            ("create", lambda: self.create()),
+            ("handoff", lambda: self.manager.handoff("task-a", "codex-a", "publisher")),
+            ("remove", lambda: self.manager.remove("task-a", "codex-a")),
+            ("recover", lambda: self.manager.recover_remove("task-a", "codex-a")),
+        )
+        for mode, operation in operations:
+            for sql in changes:
+                with self.subTest(mode=mode, sql=sql):
+                    with self.manager.database() as db:
+                        db.execute("UPDATE tasks SET owner='codex-a', state='ACTIVE' WHERE task_id='task-a'")
+                        db.execute("UPDATE repos SET created=1, base_commit=? WHERE task_id='task-a'",
+                                   (git(path, "rev-parse", "HEAD"),))
+                        db.execute("DELETE FROM removals WHERE task_id='task-a'")
+                        if mode == "recover":
+                            db.execute("UPDATE tasks SET state='REMOVING' WHERE task_id='task-a'")
+                    def changed_record(*args):
+                        result = original(*args)
+                        with self.manager.database() as db:
+                            db.execute(sql)
+                        return result
+                    with patch.object(self.manager, "verify", side_effect=changed_record):
+                        with self.assertRaisesRegex(TaskError, "管理記録が変わりました"):
+                            operation()
+                    self.assertTrue(path.exists())
+                    self.assertIn(path.resolve(), worktrees(self.root / "SushiEricServerMod"))
+                    record = self.manager.list("task-a")[0]
+                    if "owner=" in sql:
+                        self.assertEqual("other", record["owner"])
+                    elif "state=" in sql:
+                        self.assertEqual("RECOVERY_REQUIRED", record["state"])
+                    elif "base_commit=" in sql:
+                        self.assertEqual("changed", record["repos"][0]["base_commit"])
+                    elif "created=" in sql:
+                        self.assertEqual(0, record["repos"][0]["created"])
+                    else:
+                        self.assertTrue(record["removal_started"])
+
+    def test_current_schema_list_does_not_write_or_wait_for_writer(self):
+        self.create()
+        statements = []
+        connect = sqlite3.connect
+        def traced_connect(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+        with self.manager.database() as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            with patch("dev_server.task_worktrees.sqlite3.connect", side_effect=traced_connect):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    self.assertEqual("ACTIVE", pool.submit(self.manager.list).result(3)[0]["state"])
+        self.assertFalse(any(sql.startswith(("CREATE", "INSERT", "UPDATE", "BEGIN IMMEDIATE"))
+                             or "user_version =" in sql for sql in statements), statements)
 
     def test_handoff_reuses_tree_and_rejects_old_owner(self):
         self.create()

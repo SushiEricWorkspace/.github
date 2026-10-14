@@ -107,25 +107,52 @@ class TaskWorktrees:
         db = sqlite3.connect(self.root / "registry.sqlite", timeout=15)
         db.row_factory = sqlite3.Row
         try:
-            require(db.execute("PRAGMA user_version").fetchone()[0] in (0, 1, 2),
-                    "未知のworktree registry形式です")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            require(version in (0, 1, 2), "未知のworktree registry形式です")
             db.execute("PRAGMA foreign_keys = ON")
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id TEXT PRIMARY KEY, issue INTEGER NOT NULL,
-                    owner TEXT NOT NULL, state TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS repos (
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id), name TEXT NOT NULL,
-                    branch TEXT NOT NULL, base_commit TEXT NOT NULL, created INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (task_id, name));
-                CREATE TABLE IF NOT EXISTS removals (
-                    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id));
-                PRAGMA user_version = 2;
-            """)
+            if version != 2:
+                self._initialize_database(db)
             with db:
                 yield db
         finally:
             db.close()
+
+    @staticmethod
+    def _initialize_database(db):
+        """初回作成と既存形式の移行だけを書込みトランザクションで行う。"""
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            require(version in (0, 1, 2), "未知のworktree registry形式です")
+            if version == 2:
+                return
+            db.execute("""CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY, issue INTEGER NOT NULL,
+                owner TEXT NOT NULL, state TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS repos (
+                task_id TEXT NOT NULL REFERENCES tasks(task_id), name TEXT NOT NULL,
+                branch TEXT NOT NULL, base_commit TEXT NOT NULL, created INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (task_id, name))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS removals (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(task_id))""")
+            db.execute("PRAGMA user_version = 2")
+
+    @staticmethod
+    def _snapshot(db, task_id: str):
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        plans = db.execute("SELECT * FROM repos WHERE task_id=? ORDER BY name", (task_id,)).fetchall()
+        removal = db.execute("SELECT 1 FROM removals WHERE task_id=?", (task_id,)).fetchone()
+        return (dict(task) if task is not None else None, [dict(p) for p in plans], removal is not None)
+
+    def _read_snapshot(self, task_id: str, owner: str, states: tuple[str, ...]):
+        with self.database() as db:
+            db.execute("BEGIN")
+            self.owned(db, task_id, owner, states)
+            return self._snapshot(db, task_id)
+
+    def _recheck(self, db, task_id: str, snapshot):
+        require(self._snapshot(db, task_id) == snapshot,
+                f"検査中にtaskの管理記録が変わりました。実体を保全してください: {task_id}")
 
     def target(self, task_id: str, name: str) -> Path:
         require(bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", task_id)),
@@ -166,6 +193,11 @@ class TaskWorktrees:
 
     def create(self, task_id: str, issue: int, owner: str, bases: dict[str, str | None],
                *, fetch: bool = True) -> list[dict]:
+        with self.build_guard(task_id):
+            return self._create(task_id, issue, owner, bases, fetch=fetch)
+
+    def _create(self, task_id: str, issue: int, owner: str, bases: dict[str, str | None],
+                *, fetch: bool) -> list[dict]:
         require(issue > 0 and bool(owner.strip()) and bool(bases), "issue、owner、repoが必要です")
         branch = f"feature/issue-{issue}"
         plans = []
@@ -181,24 +213,30 @@ class TaskWorktrees:
             commit = git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
             plans.append((name, repo, target, commit))
         with self.database() as db:
-            db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            db.execute("BEGIN")
+            snapshot = self._snapshot(db, task_id)
+            existing, saved, _ = snapshot
             if existing is not None:
-                saved = self.owned(db, task_id, owner, ("ACTIVE",))
-                require(existing["issue"] == issue, "同一taskのissueは変更できません")
-                require({(p["name"], p["base_commit"]) for p in saved}
-                        == {(name, commit) for name, _, _, commit in plans},
-                        "同一taskのrepo/基準commitは変更できません")
-                for plan in saved:
-                    _, target = self.verify(task_id, plan)
-                    clean(target)
-            else:
-                for _, repo, target, _ in plans:
-                    require(not target.exists() and target.resolve() not in worktrees(repo),
-                            f"worktreeのパスは既に存在します: {target}")
-                    refs = git(repo, "for-each-ref", "--format=%(refname)",
-                               f"refs/heads/{branch}", f"refs/remotes/origin/{branch}")
-                    require(not refs, f"既存branchは上書きできません: {branch}")
+                self.owned(db, task_id, owner, ("ACTIVE",))
+        if existing is not None:
+            require(existing["issue"] == issue, "同一taskのissueは変更できません")
+            require({(p["name"], p["base_commit"]) for p in saved}
+                    == {(name, commit) for name, _, _, commit in plans},
+                    "同一taskのrepo/基準commitは変更できません")
+            for plan in saved:
+                _, target = self.verify(task_id, plan)
+                clean(target)
+        else:
+            for _, repo, target, _ in plans:
+                require(not target.exists() and target.resolve() not in worktrees(repo),
+                        f"worktreeのパスは既に存在します: {target}")
+                refs = git(repo, "for-each-ref", "--format=%(refname)",
+                           f"refs/heads/{branch}", f"refs/remotes/origin/{branch}")
+                require(not refs, f"既存branchは上書きできません: {branch}")
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._recheck(db, task_id, snapshot)
+            if existing is None:
                 db.execute("INSERT INTO tasks VALUES (?, ?, ?, 'CREATING')", (task_id, issue, owner))
                 db.executemany("INSERT INTO repos (task_id,name,branch,base_commit) VALUES (?,?,?,?)",
                                [(task_id, name, branch, commit) for name, _, _, commit in plans])
@@ -233,11 +271,14 @@ class TaskWorktrees:
 
     def handoff(self, task_id: str, old_owner: str, owner: str) -> list[dict]:
         require(bool(owner.strip()) and owner != old_owner, "新しいownerを指定してください")
-        with self.build_guard(task_id), self.database() as db:
-            db.execute("BEGIN IMMEDIATE")
-            for plan in self.owned(db, task_id, old_owner, ("ACTIVE",)):
+        with self.build_guard(task_id):
+            snapshot = self._read_snapshot(task_id, old_owner, ("ACTIVE",))
+            for plan in snapshot[1]:
                 self.verify(task_id, plan)
-            db.execute("UPDATE tasks SET owner=? WHERE task_id=?", (owner, task_id))
+            with self.database() as db:
+                db.execute("BEGIN IMMEDIATE")
+                self._recheck(db, task_id, snapshot)
+                db.execute("UPDATE tasks SET owner=? WHERE task_id=?", (owner, task_id))
         return self.list(task_id)
 
     def _removal_target(self, task_id: str, plan, *, recovering: bool) -> tuple[Path, Path, str]:
@@ -279,30 +320,30 @@ class TaskWorktrees:
 
     def _remove(self, task_id: str, owner: str, *, recovering: bool) -> list[dict]:
         with self.build_guard(task_id):
+            states = ("RECOVERY_REQUIRED", "REMOVING") if recovering else ("ACTIVE", "RECOVERY_REQUIRED")
+            snapshot = self._read_snapshot(task_id, owner, states)
+            task, plans, removal_started = snapshot
+            if recovering:
+                require(task["state"] == "REMOVING" or removal_started,
+                        "削除開始記録がなく、作成失敗と区別できません。実体を保全して個別確認してください")
+            require(bool(plans), "repoの管理記録がありません")
+            targets = []
+            for plan in plans:
+                require(plan["created"] in (0, 1)
+                        and plan["branch"] == f"feature/issue-{task['issue']}",
+                        f"repoの管理記録が不正です: {plan['name']}")
+                repo, target, kind = self._removal_target(task_id, plan, recovering=recovering)
+                if recovering:
+                    require(git(repo, "for-each-ref", "--format=%(refname)",
+                                f"refs/heads/{plan['branch']}").splitlines()
+                            == [f"refs/heads/{plan['branch']}"],
+                            f"作成未完了またはbranch消失のため復旧できません: {target}")
+                    require(git(repo, "rev-parse", "--verify", f"{plan['base_commit']}^{{commit}}")
+                            == plan["base_commit"], f"基準commitが不正です: {target}")
+                targets.append((plan, repo, target, kind))
             with self.database() as db:
                 db.execute("BEGIN IMMEDIATE")
-                states = ("RECOVERY_REQUIRED", "REMOVING") if recovering else ("ACTIVE", "RECOVERY_REQUIRED")
-                plans = self.owned(db, task_id, owner, states)
-                task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-                if recovering:
-                    require(task["state"] == "REMOVING" or db.execute(
-                        "SELECT 1 FROM removals WHERE task_id=?", (task_id,)).fetchone() is not None,
-                        "削除開始記録がなく、作成失敗と区別できません。実体を保全して個別確認してください")
-                require(bool(plans), "repoの管理記録がありません")
-                targets = []
-                for plan in plans:
-                    require(plan["created"] in (0, 1)
-                            and plan["branch"] == f"feature/issue-{task['issue']}",
-                            f"repoの管理記録が不正です: {plan['name']}")
-                    repo, target, kind = self._removal_target(task_id, plan, recovering=recovering)
-                    if recovering:
-                        require(git(repo, "for-each-ref", "--format=%(refname)",
-                                    f"refs/heads/{plan['branch']}").splitlines()
-                                == [f"refs/heads/{plan['branch']}"],
-                                f"作成未完了またはbranch消失のため復旧できません: {target}")
-                        require(git(repo, "rev-parse", "--verify", f"{plan['base_commit']}^{{commit}}")
-                                == plan["base_commit"], f"基準commitが不正です: {target}")
-                    targets.append((plan, repo, target, kind))
+                self._recheck(db, task_id, snapshot)
                 db.execute("INSERT OR IGNORE INTO removals VALUES (?)", (task_id,))
                 db.execute("UPDATE tasks SET state='REMOVING' WHERE task_id=?", (task_id,))
             completed = []
