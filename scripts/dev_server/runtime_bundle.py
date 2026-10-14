@@ -198,9 +198,17 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path) -> Path:
     """完成したbundleだけをhash名で公開する。失敗stagingは診断用に残す。"""
     recipe = json.loads(regular_bytes(recipe_path))
     lock = json.loads(regular_bytes(source_lock_path))
-    _require(recipe["recipeVersion"] == 1 and recipe["development"] is True, "recipe: 未知の起動レシピです")
+    _require(type(recipe.get("recipeVersion")) is int and recipe["recipeVersion"] == 2
+             and recipe["development"] is True and "dataModelCoordinate" in recipe
+             and "commonCoordinate" not in recipe, "recipe: 未知の起動レシピです")
     _require(recipe["javaVersion"].startswith("21."), "jdk: JDK 21が必要です")
     verify_sources(lock)
+    data_model = [item for item in recipe["artifacts"] if item["coordinate"] == recipe["dataModelCoordinate"]]
+    _require(len(data_model) == 1, "recipe: DataModelの解決済みJARが一意ではありません")
+    data_model_jar = Path(data_model[0]["path"])
+    dependency_paths = {entry["path"] for entry in recipe.get("dependencyInputs", [])}
+    _require({str(data_model_jar), str(data_model_jar.with_suffix(".pom"))} <= dependency_paths,
+             "recipe: DataModelのJAR/POMのコンパイル前lockが必要です")
     store = store.absolute()
     _directory(store)
     _require(not any(store == Path(source["root"]) or Path(source["root"]) in store.parents
@@ -226,8 +234,8 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path) -> Path:
     for artifact in recipe["artifacts"] + recipe["plugins"]:
         path = Path(artifact["path"])
         dependencies.append({"coordinate": artifact["coordinate"], "file": freezer.copy(path)})
-        # 公開したCommonのPOM/JARは双方必須。動的metadataでは代用しない。
-        if artifact["coordinate"] == recipe["commonCoordinate"]:
+        # 公開したSushiEricDataModelのPOM/JARは双方必須。動的metadataでは代用しない。
+        if artifact["coordinate"] == recipe["dataModelCoordinate"]:
             pom = path.with_suffix(".pom")
             dependencies.append({"coordinate": artifact["coordinate"], "file": freezer.copy(pom)})
     freezer.write("inputs/dependencies.json", canonical(dependencies))
@@ -262,8 +270,8 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path) -> Path:
         tools.append({"name": name, "version": version, "sha256": digest(freezer.read(path))})
     freezer.recheck()
     verify_sources(lock)
-    manifest = {"schemaVersion": 1, "artifactId": "0" * 64, "layoutId": LAYOUT_ID, "development": True,
-                "javaVersion": recipe["javaVersion"], "commonCoordinate": recipe["commonCoordinate"],
+    manifest = {"schemaVersion": 2, "artifactId": "0" * 64, "layoutId": LAYOUT_ID, "development": True,
+                "javaVersion": recipe["javaVersion"], "dataModelCoordinate": recipe["dataModelCoordinate"],
                 "files": _files(staging), "sources": [source["record"] for source in lock["sources"]],
                 "tools": tools, "launch": {key: profiles["server"][key] for key in ("mainClass", "classpath", "jvmArgs")}}
     manifest["artifactId"] = digest(canonical({key: value for key, value in manifest.items() if key != "artifactId"}))

@@ -63,11 +63,11 @@ def contract_documents(name: str) -> tuple[dict, dict[str, bytes]]:
                   "minecraftBind": "127.0.0.1", "managementBind": "127.0.0.1",
                   "ports": {"minecraft": 25665 + index, "rcon": 25675 + index, "management": 25680 + index},
                   "queryEnabled": False, "jdwpEnabled": False} for index in range(2)]
-    runtime = {"schemaVersion": 1, "artifactId": artifact_id, "layoutId": LAYOUT_ID, "development": True,
-               "javaVersion": "21.0.8", "commonCoordinate": "io.github.sushiericworkspace:sushieric-common-mod-dev:0.1.0-dev.20261010000000000",
+    runtime = {"schemaVersion": 2, "artifactId": artifact_id, "layoutId": LAYOUT_ID, "development": True,
+               "javaVersion": "21.0.8", "dataModelCoordinate": "io.github.sushiericworkspace:sushieric-datamodel-mod-dev:0.1.0-dev.20261010000000000.12345678-1234-1234-1234-123456789abc",
                "files": file_entries({"synthetic.classpath-entry": b"not-a-runtime"}),
                "sources": [{"repo": repo, "commit": "0" * 40, "dirtyPatchSha256": hashlib.sha256(b"").hexdigest(),
-                            "untrackedInputs": []} for repo in ("Common", "SushiEricServerMod")],
+                            "untrackedInputs": []} for repo in ("SushiEricDataModel", "SushiEricServerMod")],
                "tools": [{"name": name, "version": "synthetic-version", "sha256": artifact_id}
                          for name in ("jdk", "gradle", "loom", "minecraft", "yarn", "fabric-loader", "fabric-api", "kotlin")],
                "launch": {"mainClass": "synthetic.NotLaunchable", "classpath": ["synthetic.classpath-entry"], "jvmArgs": []}}

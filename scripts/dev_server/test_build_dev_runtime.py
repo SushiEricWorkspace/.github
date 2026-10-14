@@ -53,7 +53,7 @@ class BuildDevRuntimeTests(unittest.TestCase):
                 self.assertFalse((task / "maven").exists())
 
     def registered_fixture(self, change="SushiEricServerMod"):
-        names = {"Common", "SushiEricServerMod", ".github", "SushiEricServerManager", "SushiEricCombatCore"}
+        names = {"SushiEricDataModel", "SushiEricServerMod", ".github", "SushiEricServerManager", "SushiEricCombatCore"}
         commits = {}
         for name in names:
             repo = self.root / name
@@ -75,7 +75,7 @@ class BuildDevRuntimeTests(unittest.TestCase):
         return registry, self.root / "worktrees/task-40", names
 
     def test_registered_task_accepts_change_repo_and_fixed_dependencies(self):
-        for change in ("SushiEricServerMod", "Common", "SushiEricServerManager", ".github"):
+        for change in ("SushiEricServerMod", "SushiEricDataModel", "SushiEricServerManager", ".github"):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
                 self.root = Path(temporary)
                 registry, task, names = self.registered_fixture(change)
@@ -90,14 +90,14 @@ class BuildDevRuntimeTests(unittest.TestCase):
                     build_dev_runtime.registered_task(task, "other", names)
                 with self.assertRaisesRegex(ContractError, "必要なrepo"):
                     build_dev_runtime.registered_task(task, "owner", names | {"missing"})
-                dependency = "Common" if change != "Common" else "SushiEricServerMod"
+                dependency = "SushiEricDataModel" if change != "SushiEricDataModel" else "SushiEricServerMod"
                 (task / dependency / "source.txt").write_text("changed")
                 with self.assertRaisesRegex(TaskError, "未コミット"):
                     build_dev_runtime.registered_task(task, "owner", names)
 
     def test_exporter_is_from_and_recorded_in_task_github(self):
         repos = {}
-        for name in ("Common", "SushiEricServerMod", ".github"):
+        for name in ("SushiEricDataModel", "SushiEricServerMod", ".github"):
             repo = self.root / "worktrees/task-41" / name
             repo.mkdir(parents=True)
             for args in (("init", "-q"), ("config", "user.name", "test"),
@@ -127,13 +127,13 @@ class BuildDevRuntimeTests(unittest.TestCase):
 
     def main_fixture(self, extras=(), failure=None):
         task = self.root / "worktrees/task-41"
-        common = task / "Common"
+        data_model = task / "SushiEricDataModel"
         mod = task / "SushiEricServerMod"
         github = task / ".github"
-        names = {"Common", "SushiEricServerMod", ".github"} | set(extras)
+        names = {"SushiEricDataModel", "SushiEricServerMod", ".github"} | set(extras)
         for name in extras:
             (task / name).mkdir(parents=True)
-        common.mkdir(parents=True)
+        data_model.mkdir(parents=True)
         mod.mkdir(parents=True)
         exporter = github / "scripts/export-dev-runtime.py"
         exporter.parent.mkdir(parents=True)
@@ -142,18 +142,18 @@ class BuildDevRuntimeTests(unittest.TestCase):
         store.mkdir()
 
         mod_coordinate = (
-            "io.github.sushiericworkspace:sushieric-common-mod-dev:"
+            "io.github.sushiericworkspace:sushieric-datamodel-mod-dev:"
             "0.1.0-dev.20261010123456789.12345678-1234-1234-1234-123456789abc")
         editor_coordinate = (
-            "io.github.sushiericworkspace:sushieric-common-editor-dev:"
+            "io.github.sushiericworkspace:sushieric-datamodel-editor-dev:"
             "0.1.0-dev.20261010123456789.12345678-1234-1234-1234-123456789abc")
-        build = common / "build"
+        build = data_model / "build"
         build.mkdir()
         (build / "development-publication.properties").write_text(
             f"mod={mod_coordinate}\neditor={editor_coordinate}\n")
         build_id = "a" * 32
         maven = task / "maven" / build_id
-        core_coordinate = editor_coordinate.replace("sushieric-common-editor-dev", "sushieric-combat-core-dev")
+        core_coordinate = editor_coordinate.replace("sushieric-datamodel-editor-dev", "sushieric-combat-core-dev")
         if "SushiEricCombatCore" in extras:
             core_build = task / "SushiEricCombatCore/build"
             core_build.mkdir()
@@ -166,9 +166,9 @@ class BuildDevRuntimeTests(unittest.TestCase):
                 lock_path = Path(next(arg.split("=", 1)[1] for arg in args if arg.startswith("-PruntimeSourceLock=")))
                 bundle = synthetic_bundle(store, json.loads(lock_path.read_bytes()))
                 write_receipt(lock_path, bundle)
-            if repo == common or repo.name == "SushiEricCombatCore":
-                coordinates = (mod_coordinate, editor_coordinate) if repo == common else (core_coordinate,)
-                repository = maven if repo == common else maven / "core"
+            if repo == data_model or repo.name == "SushiEricCombatCore":
+                coordinates = (mod_coordinate, editor_coordinate) if repo == data_model else (core_coordinate,)
+                repository = maven if repo == data_model else maven / "core"
                 for coordinate in coordinates:
                     group, module, version = coordinate.split(":")
                     directory = repository / group.replace(".", "/") / module / version

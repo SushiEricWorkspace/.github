@@ -35,7 +35,7 @@ Windowsでは各パスをdrive付き絶対パスにし、Python 3.12の実行フ
 EULAへの同意と、fixture生成のためのサーバー起動許可が前提です。
 
 1. 空rootを試験用inventoryで初期化し、固定bundleをコピーします。32GiBのquotaと1GiBのreserveはハーネスの試験値であり、正式運用の推奨値ではありません。
-2. 最初の枠を起動し、現在のMod/Common APIでfixtureを生成します。正常停止証跡とwriter不在を照合してprivate snapshotを作成します。
+2. 最初の枠を起動し、現在のMod/SushiEricDataModel APIでfixtureを生成します。正常停止証跡とwriter不在を照合してprivate snapshotを作成します。
 3. supervisorを正常終了させ、その終了と宣言portの非使用を確認します。管理root全体を保存先へ通常コピーし、ファイル集合・size・SHA-256・空directory集合を再照合します。
 4. 元rootを同じFSの`<root名>-before-backup-restore`へ保全移動し、別媒体のコピーから元と同じ絶対パスへ復元します。元データを削除しません。
 5. 復元したrootでsupervisorを起動し、両枠を明示recoverします。正常停止証跡内の絶対パスを維持するため、rootの移設やDBのパス書換えは行いません。

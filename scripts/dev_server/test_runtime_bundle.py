@@ -13,6 +13,42 @@ from dev_server.contracts import ContractError
 from dev_server.runtime_bundle import freeze, launch_command, verify_bundle
 
 
+def saved_v1_bundle(store: Path) -> Path:
+    """旧契約の保存済みbundleを再現する合成fixture。新freezeは使わない。"""
+    import platform
+    from dev_server.contracts import LAYOUT_ID
+    from dev_server.fixtures import file_entries
+    classpath = ["files/legacy-common.jar"]
+    profile = {"mainClass": "synthetic.LegacyMain", "classpath": classpath,
+               "jvmArgs": ["-Dfabric.dli.config=${run}/.launch/server-launch.cfg"], "args": ["nogui"]}
+    profiles = {"server": profile, "gameTest": dict(profile, jvmArgs=profile["jvmArgs"] +
+                                                   ["-Dsushieric.management.disabled=true"])}
+    payload = {"files/legacy-common.jar": b"synthetic legacy Common",
+               "jdk/bin/" + ("java.exe" if os.name == "nt" else "java"): b"synthetic legacy Java",
+               "launch/profiles.json": canonical({"version": 1, "platform": platform.system(),
+                                                   "machine": platform.machine(), "profiles": profiles})}
+    for name in profiles:
+        payload[f"launch/{name}-launch.cfg"] = b"commonProperties\n\tfabric.development=true\n"
+        payload[f"launch/{name}-remap-classpath.txt"] = b"${bundle}/files/legacy-common.jar"
+    manifest = {"schemaVersion": 1, "artifactId": "0" * 64, "layoutId": LAYOUT_ID, "development": True,
+                "javaVersion": "21.0.9", "commonCoordinate":
+                "io.github.sushiericworkspace:sushieric-common-mod-dev:0.1.0-dev.20261010123456789",
+                "files": file_entries(payload), "sources": [{"repo": repo, "commit": "0" * 40,
+                "dirtyPatchSha256": digest(b""), "untrackedInputs": []} for repo in ("Common", "SushiEricServerMod")],
+                "tools": [{"name": name, "version": "synthetic-v1", "sha256": digest(b"legacy")}
+                          for name in ("jdk", "gradle", "loom", "minecraft", "yarn", "fabric-loader", "fabric-api", "kotlin")],
+                "launch": {key: profile[key] for key in ("mainClass", "classpath", "jvmArgs")}}
+    manifest["artifactId"] = digest(canonical({key: value for key, value in manifest.items() if key != "artifactId"}))
+    payload["runtime.json"] = canonical(manifest)
+    payload["COMPLETE"] = manifest["artifactId"].encode()
+    bundle = store / manifest["artifactId"]
+    for name, data in payload.items():
+        path = bundle / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return bundle
+
+
 class RuntimeBundleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -20,7 +56,7 @@ class RuntimeBundleTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.sources = self.root / "sources"
         repos = {}
-        for repo in ("Common", "SushiEricServerMod"):
+        for repo in ("SushiEricDataModel", "SushiEricServerMod"):
             path = self.sources / repo
             path.mkdir(parents=True)
             for args in (("init", "-q"), ("config", "user.name", "test"),
@@ -38,9 +74,9 @@ class RuntimeBundleTests(unittest.TestCase):
         self.classes.mkdir()
         (self.classes / "Test.class").write_bytes(b"synthetic")
         (self.classes / "fabric.mod.json").write_text('{"id":"test"}')
-        self.common_coordinate = "io.github.sushiericworkspace:sushieric-common-mod-dev:0.1.0-dev.20261010123456789"
+        self.data_model_coordinate = "io.github.sushiericworkspace:sushieric-datamodel-mod-dev:0.1.0-dev.20261010123456789.12345678-1234-1234-1234-123456789abc"
         artifacts = []
-        for coordinate, name in ((self.common_coordinate, "common.jar"),
+        for coordinate, name in ((self.data_model_coordinate, "datamodel.jar"),
                                   ("net.minecraft:minecraft:1.21.11", "minecraft.jar"),
                                   ("net.fabricmc:yarn:1.21.11+build.6", "yarn.jar"),
                                   ("net.fabricmc:fabric-loader:0.19.3", "loader.jar"),
@@ -49,7 +85,7 @@ class RuntimeBundleTests(unittest.TestCase):
             path = deps / name
             path.write_text(name)
             artifacts.append({"coordinate": coordinate, "path": str(path)})
-        (deps / "common.pom").write_text("synthetic POM")
+        (deps / "datamodel.pom").write_text("synthetic POM")
         loom = deps / "fabric-loom-1.17.21.jar"
         loom.write_text("synthetic Loom")
         java = deps / "jdk/bin" / ("java.exe" if os.name == "nt" else "java")
@@ -74,14 +110,15 @@ class RuntimeBundleTests(unittest.TestCase):
                    "args": ["nogui"], "environment": {}, "runDirectory": str(self.root / "old-run")}
         game_test = dict(profile, jvmArgs=profile["jvmArgs"] + ["-Dfabric-api.gametest",
                                                               "-Dsushieric.management.disabled=true"])
-        self.recipe = {"recipeVersion": 1, "development": True, "javaHome": str(java.parent.parent),
+        self.recipe = {"recipeVersion": 2, "development": True, "javaHome": str(java.parent.parent),
                        "javaVersion": "21.0.9", "gradleHome": str(gradle.parent), "gradleVersion": "9.5.0",
-                       "commonCoordinate": self.common_coordinate, "loomJar": str(loom),
+                       "dataModelCoordinate": self.data_model_coordinate, "loomJar": str(loom),
                        "minecraftVersion": "1.21.11", "yarnVersion": "1.21.11+build.6", "loaderVersion": "0.19.3",
                        "fabricApiVersion": "0.141.4+1.21.11", "kotlinVersion": "2.2.21",
                        "profiles": {"server": profile, "gameTest": game_test}, "artifacts": artifacts, "plugins": [],
                        "dependencyInputs": [{"path": item["path"], "sha256": digest(Path(item["path"]).read_bytes())}
-                                            for item in artifacts]}
+                                            for item in artifacts] +
+                                            [{"path": str(deps / "datamodel.pom"), "sha256": digest((deps / "datamodel.pom").read_bytes())}]}
         self.recipe_path = self.root / "recipe.json"
         self.store = self.root / "artifacts"
 
@@ -184,8 +221,45 @@ class RuntimeBundleTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             verify_bundle(bundle)
 
+    def test_old_unknown_and_mixed_recipe_versions_are_not_new_output(self):
+        for changes in ({"recipeVersion": 1}, {"recipeVersion": 99}, {"recipeVersion": True},
+                        {"commonCoordinate": self.data_model_coordinate}):
+            original = self.recipe.copy()
+            self.recipe.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ContractError):
+                self.freeze()
+            self.assertFalse(self.store.exists())
+            self.recipe = original
+
+    def test_data_model_jar_pom_and_precompile_hash_are_required(self):
+        from copy import deepcopy
+        original = deepcopy(self.recipe)
+        for count in (0, 2):
+            self.recipe = deepcopy(original)
+            self.recipe["artifacts"] = original["artifacts"][1:] + [original["artifacts"][0]] * count
+            with self.subTest(count=count), self.assertRaises(ContractError):
+                self.freeze()
+        self.recipe = deepcopy(original)
+        self.recipe["dependencyInputs"] = original["dependencyInputs"][:-1]
+        with self.assertRaises(ContractError):
+            self.freeze()
+        self.recipe = original
+        pom = Path(self.recipe["artifacts"][0]["path"]).with_suffix(".pom")
+        before = pom.read_bytes()
+        pom.write_bytes(b"modified POM after compilation")
+        with self.assertRaises(ContractError):
+            self.freeze()
+        pom.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.freeze()
+        pom.write_bytes(before)
+        runtime = verify_bundle(self.freeze())
+        self.assertEqual(2, runtime["schemaVersion"])
+        self.assertEqual(self.data_model_coordinate, runtime["dataModelCoordinate"])
+        self.assertNotIn("commonCoordinate", runtime)
+
     def test_changed_source_refused_before_publication(self):
-        (self.sources / "Common/source.txt").write_text("changed")
+        (self.sources / "SushiEricDataModel/source.txt").write_text("changed")
         with self.assertRaises(ContractError):
             self.freeze()
         self.assertFalse(self.store.exists())
@@ -207,14 +281,14 @@ class RuntimeBundleTests(unittest.TestCase):
         verify_bundle(first)
 
     def test_bundle_under_worktree_is_rejected(self):
-        self.store = self.sources / "Common/artifacts"
+        self.store = self.sources / "SushiEricDataModel/artifacts"
         with self.assertRaises(ContractError):
             self.freeze()
 
     def test_changed_runtime_contract_is_rejected(self):
         bundle = self.freeze()
         manifest = json.loads((bundle / "runtime.json").read_bytes())
-        manifest["commonCoordinate"] = self.common_coordinate + ".modified"
+        manifest["dataModelCoordinate"] = self.data_model_coordinate + ".modified"
         (bundle / "runtime.json").write_bytes(canonical(manifest))
         with self.assertRaises(ContractError):
             verify_bundle(bundle)

@@ -36,6 +36,16 @@
     }},
     "tool": {"type": "object", "properties": {
       "name": {"ref": "text"}, "version": {"ref": "text"}, "sha256": {"ref": "hash"}
+    }},
+    "runtimeV2": {"type": "object", "properties": {
+      "schemaVersion": {"type": "integer", "enum": [2]}, "artifactId": {"ref": "hash"}, "layoutId": {"ref": "text"},
+      "development": {"ref": "true"}, "javaVersion": {"type": "string", "pattern": "^21\\.[0-9]+\\.[0-9]+.*$"},
+      "dataModelCoordinate": {"ref": "text"}, "files": {"ref": "files"},
+      "sources": {"type": "array", "minItems": 1, "items": {"ref": "source"}},
+      "tools": {"type": "array", "minItems": 1, "items": {"ref": "tool"}},
+      "launch": {"type": "object", "properties": {
+        "mainClass": {"ref": "text"}, "classpath": {"ref": "paths"}, "jvmArgs": {"type": "array", "items": {"ref": "text"}}
+      }}
     }}
   },
   "contracts": {

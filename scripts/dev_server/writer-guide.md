@@ -50,7 +50,7 @@ IPCは要求envelope・応答全体とも64KiBまでです。JSON escapeや共�
 編集対象はMod config rootのconfig.yml、item_data、ore_data、shop_data、recipe_dataです。
 manager-compat.json、既知UUIDのplayer_data配下のmoney_history/achievements、shop_historyの日別ファイル、serverのusercache.jsonは読取り専用です。
 秘密設定、任意のserver root、JVM保存データへのFS writeは拒否します。
-moveのtextはCommonで新IDへ再出力した本文です。移動先を排他的に作成・同期してから旧ファイルを削除し、
+moveのtextはSushiEricDataModelで新IDへ再出力した本文です。移動先を排他的に作成・同期してから旧ファイルを削除し、
 途中失敗では両ファイルとpendingを保全します。recipeのようなパス由来IDでは本文を渡しません。
 削除は各階層のlink/reparse検査を列挙・下降より先に行います。
 

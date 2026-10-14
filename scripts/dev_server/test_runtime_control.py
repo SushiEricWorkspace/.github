@@ -133,7 +133,8 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.bundle_fixture = bundle_tests.RuntimeBundleTests("test_launch_has_no_source_cache_or_gradle_dependency")
         self.bundle_fixture.setUp()
         self.addCleanup(self.bundle_fixture.doCleanups)
-        source = self.bundle_fixture.freeze()
+        source = (bundle_tests.saved_v1_bundle(self.bundle_fixture.store)
+                  if getattr(self, "bundle_version", 2) == 1 else self.bundle_fixture.freeze())
         self.artifact = source.name
         shutil.copytree(source, self.root / "artifacts" / self.artifact)
         self.adapter = FakeAdapter(self.inventory)

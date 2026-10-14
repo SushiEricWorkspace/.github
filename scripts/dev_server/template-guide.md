@@ -6,7 +6,7 @@
 
 ## fixtureの新規生成
 
-現行Common/Minecraft APIで生成する`se managedfixture`を含む固定bundleを用意します。
+現行SushiEricDataModel/Minecraft APIで生成する`se managedfixture`を含む固定bundleを用意します。
 このコマンドは管理bundle起動時のコンソール専用です。通常のrunServerでは登録しません。
 生成元instanceを固定seedでprepareし、start後にRCONで次のどちらかを実行します。
 
@@ -16,7 +16,7 @@ se managedfixture create save-roundtrip-v1
 ```
 
 seedはそれぞれ52452501、52452502です。fixtureの既存ファイルがある場合は上書きしません。
-実NBT、Modプロフィール、Commonのアイテム定義、dimension配下のマーカー、未知通常ファイルを
+実NBT、Modプロフィール、SushiEricDataModelのアイテム定義、dimension配下のマーカー、未知通常ファイルを
 生成・再読込し、instance/generation/start nonceとデータhashをdiagnosticsへ記録します。
 マーカーの存在だけではカスタムdimensionのゲーム動作が確認できたとは扱いません。
 

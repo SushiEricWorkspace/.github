@@ -40,8 +40,8 @@ def synthetic_bundle(store: Path, lock: dict) -> Path:
     (staging / "inputs").mkdir()
     (staging / "inputs/publications.json").write_bytes(canonical(copied))
     (staging / "inputs/source-lock.json").write_bytes(canonical(portable_lock(lock)))
-    manifest = {"schemaVersion": 1, "artifactId": "0" * 64, "layoutId": LAYOUT_ID,
-                "development": True, "javaVersion": "21.0.9", "commonCoordinate": lock["publications"][0]["coordinate"],
+    manifest = {"schemaVersion": 2, "artifactId": "0" * 64, "layoutId": LAYOUT_ID,
+                "development": True, "javaVersion": "21.0.9", "dataModelCoordinate": lock["publications"][0]["coordinate"],
                 "files": _files(staging), "sources": [s["record"] for s in lock["sources"]],
                 "tools": [{"name": name, "version": "1", "sha256": digest(b"fixture")}
                           for name in ("jdk", "gradle", "loom", "minecraft", "yarn", "fabric-loader", "fabric-api", "kotlin")],
@@ -77,10 +77,10 @@ class TaskMavenTests(unittest.TestCase):
         maven.mkdir(parents=True)
         publications = []
         for suffix in ("jar", "pom"):
-            target = maven / "group/module/version" / f"common-{build_id}.{suffix}"
+            target = maven / "group/module/version" / f"data_model-{build_id}.{suffix}"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(f"{build_id}-{suffix}".encode())
-            publications.append({"coordinate": "io.github.sushiericworkspace:sushieric-common-mod-dev:0.1.0-dev.20261010123456789",
+            publications.append({"coordinate": "io.github.sushiericworkspace:sushieric-datamodel-mod-dev:0.1.0-dev.20261010123456789.12345678-1234-1234-1234-123456789abc",
                                  "path": str(target), "sha256": digest(target.read_bytes())})
         for name in ("module.claim", "maven-metadata.xml", "module.sha512", "module.module"):
             (maven / name).write_text("generated")
@@ -88,7 +88,7 @@ class TaskMavenTests(unittest.TestCase):
         lock = {"sourceLockVersion": 1, "sources": [{"root": str(self.root / "old-source" / name),
                 "record": {"repo": name, "commit": "0" * 40, "dirtyPatchSha256": digest(b""),
                            "untrackedInputs": []}, "inputs": [], "patchBase64": ""}
-                for name in ("Common", "SushiEricServerMod")], "publications": publications}
+                for name in ("SushiEricDataModel", "SushiEricServerMod")], "publications": publications}
         lock_path.write_bytes(canonical(lock))
         bundle = synthetic_bundle(self.store, lock)
         write_receipt(lock_path, bundle)

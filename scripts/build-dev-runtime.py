@@ -1,4 +1,4 @@
-"""登録済みtaskでCommonを発行し、固定座標でconsumerをビルドしてbundleを出力する。"""
+"""登録済みtaskでSushiEricDataModelを発行し、固定座標でconsumerをビルドしてbundleを出力する。"""
 
 import argparse
 import json
@@ -79,7 +79,7 @@ def main():
     root = args.task_root.absolute()
     _directory(root)
     _directory(args.store.absolute())
-    names = {"Common", "SushiEricServerMod", ".github"}
+    names = {"SushiEricDataModel", "SushiEricServerMod", ".github"}
     if args.manager:
         names.add("SushiEricServerManager")
     if args.with_core:
@@ -101,10 +101,10 @@ def main():
         record = records.start(root.name, build_id, args.owner, lock)
         try:
             maven.mkdir(parents=True, exist_ok=False)
-            common = repos["Common"]
-            gradle(common, "build", "publishDevelopment", f"-PcommonDevelopmentRepository={maven}")
-            mod_coordinate = publication(common, "mod", "sushieric-common-mod-dev")
-            editor_coordinate = publication(common, "editor", "sushieric-common-editor-dev")
+            data_model = repos["SushiEricDataModel"]
+            gradle(data_model, "build", "publishDevelopment", f"-PdataModelDevelopmentRepository={maven}")
+            mod_coordinate = publication(data_model, "mod", "sushieric-datamodel-mod-dev")
+            editor_coordinate = publication(data_model, "editor", "sushieric-datamodel-editor-dev")
             publications = []
 
             def record_publication(coordinate, repository):
@@ -116,15 +116,15 @@ def main():
 
             record_publication(mod_coordinate, maven)
             record_publication(editor_coordinate, maven)
-            mod_args = [f"-PcommonDevelopmentRepository={maven}", f"-PcommonDevelopmentCoordinate={mod_coordinate}"]
+            mod_args = [f"-PdataModelDevelopmentRepository={maven}", f"-PdataModelDevelopmentCoordinate={mod_coordinate}"]
             if core:
                 core_repo = maven / "core"
                 gradle(repos["SushiEricCombatCore"], "build", "publishDevelopment", *mod_args,
                        f"-PcombatCoreDevelopmentRepository={core_repo}")
                 record_publication(publication(repos["SushiEricCombatCore"], "core", "sushieric-combat-core-dev"), core_repo)
             if manager:
-                gradle(repos["SushiEricServerManager"], "build", f"-PcommonDevelopmentRepository={maven}",
-                       f"-PcommonDevelopmentCoordinate={editor_coordinate}")
+                gradle(repos["SushiEricServerManager"], "build", f"-PdataModelDevelopmentRepository={maven}",
+                       f"-PdataModelDevelopmentCoordinate={editor_coordinate}")
             verify_sources(source_lock)
             registered_task(root, args.owner, names)
             source_lock["publications"] = publications
@@ -143,7 +143,7 @@ def main():
             except (TaskError, OSError, ValueError, KeyError, TypeError) as record_error:
                 error.add_note(f"失敗記録を保存できませんでした: {record_error}")
             raise
-        print(json.dumps({"task": root.name, "commonCoordinate": mod_coordinate, "status": "exported",
+        print(json.dumps({"task": root.name, "dataModelCoordinate": mod_coordinate, "status": "exported",
                           "buildId": build_id, "artifactId": record["artifactId"]}))
 
 

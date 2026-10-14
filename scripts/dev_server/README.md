@@ -33,6 +33,8 @@ python3.12 -B -m unittest discover -s scripts -p test_contracts.py -v
 definitions/contractsをrefで参照し、objectのpropertiesは全て必須・未知項目禁止です。
 型、enum、minimum/maximum、minLength、pattern、minItems/maxItems、items、パスformatを
 `contracts.py`で検査し、項目間制約も同じモジュールへ集約します。
+runtimeはschemaVersionでv1/v2を厳密選択します。v1の旧Commonキーは保存済bundleの読取専用、
+v2のdataModelCoordinateとSushiEricDataModel入力記録は新規出力用です。ほかの契約のversionは1を維持します。
 instanceは静的割当の契約です。lease/state/epoch等はRegistryとsupervisorが管理します。
 runtime/manifest/validationのhash・nonceは形式検査だけでは証跡になりません。
 
@@ -40,7 +42,7 @@ runtime/manifest/validationのhash・nonceは形式検査だけでは証跡に�
 `fixtures.py`は架空hash・nonce・ファイル内容から検証文書を作るだけで、
 Minecraftワールド、NBT、独自定義YAML、JARを実生成しません。
 `settings_expectations`も入力・可搬結果・復元先注入の固定期待値であり、実際の変換器ではありません。
-実fixtureは管理bundle専用の`se managedfixture`が現在のCommon/Minecraft APIで生成・再読込します。
+実fixtureは管理bundle専用の`se managedfixture`が現在のSushiEricDataModel/Minecraft APIで生成・再読込します。
 合成文書をruntime登録・snapshot公開・昇格の実証跡に使用しないでください。
 
 契約検証はコピー/削除/設定変換/ポート予約/JVM起動を実行しません。

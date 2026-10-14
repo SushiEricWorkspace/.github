@@ -88,7 +88,13 @@ def _unique_files(files: list[dict], path: str) -> None:
 def validate(kind: str, value: dict) -> None:
     """文書の形と項目間制約を検査する。実際のFS・プロセス状態の証明ではない。"""
     _require(kind in CONTRACT["contracts"], "contract", "未知の契約です")
-    _validate(value, CONTRACT["contracts"][kind], kind)
+    schema = CONTRACT["contracts"][kind]
+    if kind == "runtime":
+        _require(type(value) is dict and type(value.get("schemaVersion")) is int
+                 and value["schemaVersion"] in (1, 2), kind, "未知のruntime versionです")
+        if value["schemaVersion"] == 2:
+            schema = CONTRACT["definitions"]["runtimeV2"]
+    _validate(value, schema, kind)
     if kind == "inventory":
         _require(value["reserveBytes"] < value["quotaBytes"], kind, "reserveBytesはquotaBytesより小さくしてください")
         backup = value["backup"]
@@ -120,13 +126,20 @@ def validate(kind: str, value: dict) -> None:
         _unique_files(value["files"], kind)
     if kind == "runtime":
         _require(value["layoutId"] == LAYOUT_ID, kind, "未知のdata-layoutです")
-        coordinate = value["commonCoordinate"]
-        _require(re.fullmatch(r"io\.github\.sushiericworkspace:sushieric-common-mod-dev:0\.1\.0-dev\.[0-9]{17}(?:\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?", coordinate) is not None, kind, "Commonの完全な開発座標が必要です")
+        version = value["schemaVersion"]
+        coordinate = value["commonCoordinate" if version == 1 else "dataModelCoordinate"]
+        module = "common" if version == 1 else "datamodel"
+        _require(re.fullmatch(r"io\.github\.sushiericworkspace:sushieric-" + module + r"-mod-dev:0\.1\.0-dev\.[0-9]{17}"
+                             + r"(?:\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})" + ("?" if version == 1 else ""), coordinate) is not None, kind, "提供元の完全なMod開発座標が必要です")
         files = {entry["path"] for entry in value["files"]}
         _require(bool(value["launch"]["classpath"]) and all(
             entry in files or any(file.startswith(entry + "/") for file in files)
             for entry in value["launch"]["classpath"]), kind, "classpathはbundle内の記録済みファイル/ディレクトリに限定します")
-        _require({entry["repo"] for entry in value["sources"]} >= {"Common", "SushiEricServerMod"}, kind, "CommonとModの入力記録が必要です")
+        source_repos = {entry["repo"] for entry in value["sources"]}
+        provider = "Common" if version == 1 else "SushiEricDataModel"
+        _require(source_repos >= {provider, "SushiEricServerMod"}, kind, "提供元とModの入力記録が必要です")
+        if version == 2:
+            _require("Common" not in source_repos, kind, "v2へ旧提供元名を混在させられません")
         _require({entry["name"] for entry in value["tools"]} >= {"jdk", "gradle", "loom", "minecraft", "yarn", "fabric-loader", "fabric-api", "kotlin"}, kind, "実行・ビルドツールの固定記録が必要です")
         for key, name in (("sources", "repo"), ("tools", "name")):
             _require(len({entry[name] for entry in value[key]}) == len(value[key]), kind, "入力またはツール記録が重複しています")

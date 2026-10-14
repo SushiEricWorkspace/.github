@@ -65,8 +65,8 @@ def capture_source(root: Path, repo: str) -> dict:
 
 
 def capture_sources(repos: dict[str, Path]) -> dict:
-    if not {"Common", "SushiEricServerMod"} <= repos.keys():
-        raise ContractError("source: CommonとModの入力指定が必要です")
+    if not {"SushiEricDataModel", "SushiEricServerMod"} <= repos.keys():
+        raise ContractError("source: SushiEricDataModelとModの入力指定が必要です")
     return {"sourceLockVersion": 1, "sources": [capture_source(path, repo) for repo, path in sorted(repos.items())]}
 
 
