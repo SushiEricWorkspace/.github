@@ -9,7 +9,7 @@ Python 3.12とGitを使用し、primary repositoryは同じworkspaceに配置し
 `.github` repositoryから実行します。ownerにはAI名だけでなく同時書込担当のセッションを識別できる値を指定します。
 
 ```bash
-python3.12 -B scripts/setup-worktrees.py --task-id issue-123-a --issue 123 --owner codex-session-a --repos Common,SushiEricServerMod
+python3.12 -B scripts/setup-worktrees.py --task-id issue-123-a --issue 123 --owner codex-session-a --repos SushiEricServerMod
 python3.12 -B scripts/setup-worktrees.py --list
 python3.12 -B scripts/setup-worktrees.py --list --task-id issue-123-a
 python3.12 -B scripts/setup-worktrees.py --task-id issue-123-a --handoff-from codex-session-a --owner claude-session-b
@@ -21,6 +21,12 @@ originをfetchし、repoごとの開発基準commitを記録します。Common�
 origin/HEADがリリースbranchを指していても、開発基準から起点を変えません。
 依存commitを使うrepoでは`--base Common=<commit>`のように指定します。複数repoの起点を個別に指定できます。
 既存のlocal/remote branchやworktreeは取り込んだり上書きしたりせず拒否します。
+
+Issueの変更範囲はそのrepo内だけです。他repoも変更する場合は、そちらに別Issueを作り、`owner/repo#番号`で相互参照します。
+例えばModのIssueでCommonのAPI変更も必要になったら、Common側の別IssueでAPI・完成条件・検証を定め、その確定commitをModの前提にします。
+既存Commonソースの読み取りや確定成果物の利用だけなら、Commonの変更Issueは不要です。
+異なるrepoの同番号Issueは別の作業として扱い、依存repoへ元Issue番号の変更branchを作りません。
+現在のCLIは列挙した全repoへ同じIssue番号のbranchを作るため、変更しない依存repoをその目的で`--repos`へ含めないでください。確定依存worktreeの専用登録は[#40](https://github.com/SushiEricWorkspace/.github/issues/40)で対応します。
 
 登録は`worktrees/registry.sqlite`（形式2）で管理します。同一taskへの同じ入力の再実行は実体を確認して結果を返します。
 異なるowner、repo、起点commit、Issueで同一taskを再利用しません。
