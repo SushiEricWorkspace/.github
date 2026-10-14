@@ -17,21 +17,21 @@ python3.12 -B scripts/setup-worktrees.py --task-id issue-123-a --handoff-from co
 
 作成先は`<workspace>/worktrees/issue-123-a/<repo>/`、branchは`feature/issue-123`です。
 `--workspace-root PATH`でworkspaceを明示できます。primaryのbranch・index・作業ファイルは変更しません。
-originをfetchし、repoごとの開発基準commitを記録します。Common・ServerManager・CombatCoreはdevelop、Mod・.githubはmainです。
+originをfetchし、repoごとの開発基準commitを記録します。SushiEricDataModel・ServerManager・CombatCoreはdevelop、Mod・.githubはmainです。
 origin/HEADがリリースbranchを指していても、開発基準から起点を変えません。
 変更repoの起点だけを`--base SushiEricServerMod=<commit>`で指定できます。確定した依存ソースは反復可能な`--dependency REPO=COMMIT`で指定します。
 依存には完全commit hashを指定し、branch名・HEAD・短縮hashは使用しません。変更repoとの重複や依存repoの二重指定は拒否します。
 既存のlocal/remote branchやworktreeは取り込んだり上書きしたりせず拒否します。
 
 Issueの変更範囲はそのrepo内だけです。他repoも変更する場合は、そちらに別Issueを作り、`owner/repo#番号`で相互参照します。
-例えばModのIssueでCommonのAPI変更も必要になったら、Common側の別IssueでAPI・完成条件・検証を定め、その確定commitをModの前提にします。
-既存Commonソースの読み取りや確定成果物の利用だけなら、Commonの変更Issueは不要です。
+例えばModのIssueでSushiEricDataModelのAPI変更も必要になったら、SushiEricDataModel側の別IssueでAPI・完成条件・検証を定め、その確定commitをModの前提にします。
+既存SushiEricDataModelソースの読み取りや確定成果物の利用だけなら、SushiEricDataModelの変更Issueは不要です。
 異なるrepoの同番号Issueは別の作業として扱い、依存repoへ元Issue番号の変更branchを作りません。
 新規taskの`--repos`はIssueが属する単一の変更repoです。依存repoは`--dependency`で同じtask配下のdetached HEADとして作り、変更branchを作りません。
 例えばModだけを変更して固定runtimeをビルドする場合、次のcommitプレースホルダーを各repoの確定した完全hashへ置き換えます。
 
 ```bash
-python3.12 -B scripts/setup-worktrees.py --task-id mod-123 --issue 123 --owner codex-session-a --repos SushiEricServerMod --dependency "Common=<Commonの確定commit>" --dependency ".github=<.githubの確定commit>"
+python3.12 -B scripts/setup-worktrees.py --task-id mod-123 --issue 123 --owner codex-session-a --repos SushiEricServerMod --dependency "SushiEricDataModel=<SushiEricDataModelの確定commit>" --dependency ".github=<.githubの確定commit>"
 ```
 
 依存worktreeのHEADとGit登録・detached状態・tracked/未追跡のcleanを作成再実行・引継ぎ・ビルド・削除で照合します。
@@ -68,6 +68,12 @@ HEAD、branch、index、ファイルは変更せず、自動commit・stash・res
 
 承認付き実行が利用不可、承認レビューで拒否、または再試行後も失敗した場合は状態を保全し、実行方法、エラー原文、管理登録、未実行操作を報告します。
 ACL変更、sandbox全体の無効化、owner奪取、別worktreeへの複製、Git管理情報の修復を回避策にしません。
+
+新規taskは`SushiEricDataModel`を指定し、primaryも同名の通常ディレクトリに配置します。
+primaryのディレクトリ移動やorigin URL更新は人間が行い、管理スクリプトは自動移動しません。
+改名前の`Common`を含む登録済みtaskは、同じ名前・path・branch・owner記録を保持して現在のスクリプトで一覧・同一入力の再実行・引継ぎ・削除・削除復旧を行えます。
+新規taskの変更repoや依存repoとして`Common`を指定することは拒否します。旧登録をDataModelへ書き換えたり、別ownerの進行中worktreeを移動したりしません。
+旧登録が残る間は`Common` primaryを保全し、担当ownerが正規の管理手順で作業を完了してから配置を切り替えます。
 
 ## 削除と途中失敗
 
@@ -146,8 +152,8 @@ Maven出力はworktree削除後も残します。成功ビルドの記録と完�
 共通ルールの書き込みでは担当worktreeを`--repo-root REPO=PATH`で明示します。省略時は同期を拒否し、`--workspace-root`だけでは同期先になりません。指定したrepoだけが対象になります。`--check`は`--repo-root`を省略するとworkspace全体を読み取り確認します。
 
 ```bash
-python3.12 -B scripts/sync-agent-rules.py --repo-root Common=worktrees/issue-123-a/Common --repo-root SushiEricServerMod=worktrees/issue-123-a/SushiEricServerMod
-python3.12 -B scripts/sync-agent-rules.py --check --repo-root Common=worktrees/issue-123-a/Common
+python3.12 -B scripts/sync-agent-rules.py --repo-root SushiEricDataModel=worktrees/issue-123-a/SushiEricDataModel --repo-root SushiEricServerMod=worktrees/issue-123-a/SushiEricServerMod
+python3.12 -B scripts/sync-agent-rules.py --check --repo-root SushiEricDataModel=worktrees/issue-123-a/SushiEricDataModel
 ```
 
 ## 検証範囲

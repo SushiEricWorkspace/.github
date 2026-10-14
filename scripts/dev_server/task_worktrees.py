@@ -11,9 +11,9 @@ import subprocess
 
 from .build_lock import BuildLockError, build_lock
 
-REPOSITORIES = ("Common", "SushiEricServerManager", "SushiEricServerMod",
+REPOSITORIES = ("SushiEricDataModel", "SushiEricServerManager", "SushiEricServerMod",
                 "SushiEricCombatCore", ".github")
-DEVELOPMENT_BRANCHES = {"Common": "develop", "SushiEricServerManager": "develop",
+DEVELOPMENT_BRANCHES = {"SushiEricDataModel": "develop", "SushiEricServerManager": "develop",
                         "SushiEricCombatCore": "develop", "SushiEricServerMod": "main",
                         ".github": "main"}
 
@@ -159,14 +159,14 @@ class TaskWorktrees:
     def target(self, task_id: str, name: str) -> Path:
         require(bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", task_id)),
                 "task-idは小文字英数字と区切りのハイフンで指定してください")
-        require(name in REPOSITORIES, f"対象外のrepoです: {name}")
+        require(name in REPOSITORIES or name == "Common", f"対象外のrepoです: {name}")
         target = self.root / task_id / name
         plain_path(target)
         require(target.resolve().parents[1] == self.root.resolve(), "管理範囲外のパスです")
         return target
 
     def primary(self, name: str) -> Path:
-        require(name in REPOSITORIES, f"対象外のrepoです: {name}")
+        require(name in REPOSITORIES or name == "Common", f"対象外のrepoです: {name}")
         repo = self.workspace / name
         plain_path(repo)
         plain_path(repo / ".git")
@@ -211,6 +211,19 @@ class TaskWorktrees:
                 dependencies: dict[str, str], *, fetch: bool) -> list[dict]:
         require(issue > 0 and bool(owner.strip()) and bool(bases), "issue、owner、repoが必要です")
         require(not bases.keys() & dependencies.keys(), "変更repoと依存repoを重複指定できません")
+        snapshot = (None, [], False)
+        if (self.root / "registry.sqlite").exists():
+            with self.database() as db:
+                db.execute("BEGIN")
+                snapshot = self._snapshot(db, task_id)
+                if snapshot[0] is not None:
+                    self.owned(db, task_id, owner, ("ACTIVE",))
+        existing, saved, _ = snapshot
+        # 旧Common名は登録済みtaskだけで扱い、名前や配置を書き換えない。
+        for name in bases.keys() | dependencies.keys():
+            require(name in REPOSITORIES or (name == "Common" and existing is not None
+                    and any(plan["name"] == name for plan in saved)),
+                    f"新規taskの対象外のrepoです: {name}")
         branch = f"feature/issue-{issue}"
         plans = []
         for name, ref in (bases | dependencies).items():
@@ -224,18 +237,12 @@ class TaskWorktrees:
                 git(repo, "fetch", "origin")
             if ref is None:
                 # origin/HEADがリリースbranchでも、AGENTS.mdの開発基準を使う。
-                ref = "origin/" + DEVELOPMENT_BRANCHES[name]
+                ref = "origin/" + ("develop" if name == "Common" else DEVELOPMENT_BRANCHES[name])
             require(not ref.startswith("-"), "不正な基準refです")
             commit = git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
             if kind == "dependency":
                 require(commit == ref, "依存repoはcommitを指定してください")
             plans.append((name, repo, target, commit, kind))
-        with self.database() as db:
-            db.execute("BEGIN")
-            snapshot = self._snapshot(db, task_id)
-            existing, saved, _ = snapshot
-            if existing is not None:
-                self.owned(db, task_id, owner, ("ACTIVE",))
         if existing is not None:
             require(existing["issue"] == issue, "同一taskのissueは変更できません")
             require({(p["name"], p["base_commit"], p["kind"]) for p in saved}
