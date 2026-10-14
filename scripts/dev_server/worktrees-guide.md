@@ -105,7 +105,7 @@ python3.12 -B scripts/setup-worktrees.py --recover-remove --task-id issue-123-a 
 旧`--agents`・`--no-copy`・`--install-skill`は使用しません。スキル原本は`skills/worktree/SKILL.md`です。
 ローカルに配置する場合は原本を使い、配置先をコミットしません。
 
-共通ルールはprimaryではなく担当worktreeを明示して同期します。指定したrepoだけが対象になります。
+共通ルールの書き込みでは担当worktreeを`--repo-root REPO=PATH`で明示します。省略時は同期を拒否し、`--workspace-root`だけでは同期先になりません。指定したrepoだけが対象になります。`--check`は`--repo-root`を省略するとworkspace全体を読み取り確認します。
 
 ```bash
 python3.12 -B scripts/sync-agent-rules.py --repo-root Common=worktrees/issue-123-a/Common --repo-root SushiEricServerMod=worktrees/issue-123-a/SushiEricServerMod
