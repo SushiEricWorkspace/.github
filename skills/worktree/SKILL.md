@@ -10,6 +10,14 @@ task-idは作業を一意にする小文字英数字とハイフン、ownerは�
 既に登録されたタスクへの参加では、同じworktreeのownerを引き継ぐ。
 primary、人間、別ownerの作業ディレクトリを使わない。
 
+## Issueと依存repo
+
+変更範囲はIssueが属するrepo内に限定する。他repoの変更にはそのrepoの別Issue・branch・worktree・PRを用意する。
+関連Issueは`owner/repo#番号`で相互参照し、共有契約・前提commit・実施順を記載する。同番号でもrepoが異なれば別Issueである。
+依存ソースの読み取りや確定成果物の利用だけなら変更Issueは不要であり、元Issue番号のbranchを依存repoに作らない。
+現行CLIの`--repos`は全repoへ同番号のbranchを作るため、変更しない依存repoの登録に流用しない。
+オーケストレーターは変更対象・読み取り対象と依存・競合を確認して独立作業を並列化し、前提commitが必要な実装はその確定を待つ。
+
 ## 手順
 
 1. `scripts/setup-worktrees.py --list`で登録を確認する。既存固定worktreeは`--list-legacy`で読み取れる。
