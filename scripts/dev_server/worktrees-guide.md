@@ -25,6 +25,7 @@ origin/HEADがリリースbranchを指していても、開発基準から起点
 登録は`worktrees/registry.sqlite`（形式2）で管理します。同一taskへの同じ入力の再実行は実体を確認して結果を返します。
 異なるowner、repo、起点commit、Issueで同一taskを再利用しません。
 形式1の既存task・repo・owner・state・created記録を保持して、形式2の削除開始記録を追加します。
+形式2の通常接続・一覧はスキーマや形式番号を書き直しません。初回作成・旧形式の移行だけを書込みトランザクションで行います。
 形式2に未対応の旧スクリプトは使用せず、現在のスクリプトを使ってください。未知のregistry形式は拒否します。
 ownerの更新はSQLiteトランザクションで排他します。Gitのref操作はGit自身のlockを使用します。
 ownerは同一ユーザーの協調契約であり、OSのアクセス制御ではありません。手作業のGit操作も同じownerが行います。
@@ -56,7 +57,10 @@ primary、共有・固定AI用、他branch用のworktreeは対象外です。
 
 Windowsの削除前検査（`status`・`ls-files`）とGit削除はコマンド単位で`-c core.longpaths=true`を指定します。
 local/global設定は変更せず、dirty検査を無効化する`--force`も使用しません。
-全repoの事前検査から削除完了までbuild lockを保持します。
+全repoの事前検査から削除完了までtask別build lockを保持します。
+作成再実行・引継ぎ・削除のGit/FS検査は共有DBの書込みトランザクション外で行い、別taskの一覧・引継ぎを止めません。
+状態やownerを変更する直前の短いトランザクションで、検査前のowner・state・repo・削除開始記録と再照合します。
+登録が変わった場合は実体を保全して拒否します。同一taskのbuild・作成再実行・引継ぎ・削除はlock競合を待たず拒否します。
 
 途中失敗は`RECOVERY_REQUIRED`となり、失敗時のエラー原文、対象パス、Git登録・実体・`.git`の有無、処理済みrepoと未処理/要確認repoを表示します。
 Git削除前の`REMOVING`遷移と同じトランザクションで削除開始を記録し、一覧の`removal_started`で確認できます。
