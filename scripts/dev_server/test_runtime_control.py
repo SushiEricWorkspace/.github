@@ -200,6 +200,118 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.token = self.acquire(operation="acquire-next-owner")
         self.assert_code("INVALID_STATE", lambda: self.start("start-next-owner"))
 
+    def test_expired_stop_preserves_lease_and_replay_then_explicit_recover_renews(self):
+        self.prepare()
+        self.start()
+        before = self.state()
+        self.now = before["expires"]
+        dry = self.command("stop", dict(self.token, timeoutSeconds=2), "stop-dry", True)
+        self.assertTrue(dry["dryRun"])
+        self.assertEqual("RUNNING", self.state()["state"])
+        self.assertEqual(0, self.rcon_calls)
+        result = self.stop()
+        self.assertTrue(result["jvmAndChildrenExited"])
+        self.assertTrue(result["modSaveCompleted"])
+        after = self.state()
+        self.assertEqual("LEASED_STOPPED", after["state"])
+        for key in ("expires", "owner", "lease", "epoch", "generation"):
+            self.assertEqual(before[key], after[key], key)
+        self.assertTrue(self.stop()["replayed"])
+        self.assertEqual(1, self.rcon_calls)
+        for command, payload in (("start", dict(self.token, timeoutSeconds=2)),
+                                 ("renew", dict(self.token, ttlSeconds=60)), ("release", self.token)):
+            with self.subTest(command=command):
+                self.assert_code("LEASE_EXPIRED", lambda: self.command(command, payload, command + "-expired"))
+        recovered = self.command("recover", dict(self.token, action="resume", targetOperationId=None, ttlSeconds=60), "recover-expired")
+        self.assertTrue(recovered["recovered"])
+        self.assertEqual(self.now + 60, self.state()["expires"])
+        self.assertEqual(before["epoch"], self.state()["epoch"])
+        self.assertEqual(before["owner"], self.state()["owner"])
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM endpoint_reservations").fetchone()[0])
+        self.start("next-start")
+        self.assert_code("STALE_OPERATION", self.stop)
+        self.assertEqual(1, self.rcon_calls)
+        self.stop("next-stop")
+
+    def test_stop_can_cross_expiration_before_registration_and_during_shutdown(self):
+        self.prepare()
+        self.start()
+        expires = self.state()["expires"]
+        original = self.registry.runtime._active
+        def expire_after_initial_check(row):
+            result = original(row)
+            self.now = expires
+            return result
+        self.stop_fault = lambda process: setattr(self, "now", expires + 1)
+        with patch.object(self.registry.runtime, "_active", side_effect=expire_after_initial_check):
+            self.stop()
+        self.assertEqual("LEASED_STOPPED", self.state()["state"])
+        self.assertEqual(expires, self.state()["expires"])
+        self.assertTrue(self.state()["runtime_proof"])
+
+    def test_expired_stop_rejects_stale_tokens_without_operation_or_rcon(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        for key, value, code in (("leaseId", "old", "STALE_LEASE"), ("epoch", 0, "STALE_LEASE"),
+                                 ("expectedGeneration", "old", "STALE_GENERATION")):
+            with self.subTest(key=key):
+                self.assert_code(code, lambda: self.command("stop", dict(self.token, timeoutSeconds=2, **{key: value}), "stale-" + key.lower()))
+        self.assertEqual(0, self.rcon_calls)
+        self.assertEqual("RUNNING", self.state()["state"])
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM runtime_operations WHERE command='stop'").fetchone()[0])
+
+    def test_expired_stop_identity_mismatch_requires_recovery(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        self.adapter.identity_fault = lambda identity: identity.update(bootId="different-boot")
+        self.assert_code("RECOVERY_REQUIRED", self.stop)
+        self.assertEqual(0, self.rcon_calls)
+        self.assertIsNone(self.adapter.created[0].poll())
+        self.assertFalse(self.adapter.created[0].closed)
+
+    def test_expired_stop_socket_mismatch_does_not_send_rcon(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        self.adapter.socket_fault = lambda values: values.clear()
+        self.assert_code("RECOVERY_REQUIRED", self.stop)
+        self.assertEqual(0, self.rcon_calls)
+        self.assertIsNone(self.adapter.created[0].poll())
+        self.assertFalse(self.adapter.created[0].closed)
+
+    def test_expired_stop_save_failure_keeps_recovery_and_no_success_proof(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        def failed(process):
+            process.proof["saves"]["results"]["player-data"] = False
+            process.save_proof()
+        self.stop_fault = failed
+        self.assert_code("SAVE_FAILED", self.stop)
+        self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
+        self.assertIsNone(self.state()["runtime_proof"])
+        with self.registry.transaction(read_only=True) as connection:
+            operation = connection.execute("SELECT status FROM runtime_operations WHERE id='stop-01'").fetchone()
+            self.assertEqual("RECOVERY_REQUIRED", operation[0])
+            self.assertEqual(1, connection.execute("SELECT count(*) FROM reservations WHERE operation='stop-01'").fetchone()[0])
+
+    def test_expired_stop_child_timeout_preserves_owned_group_and_reservations(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        self.stop_fault = lambda process: process.children.append(22001)
+        with patch("dev_server.runtime_control.time.monotonic", side_effect=[0, 3]):
+            self.assert_code("STOP_TIMEOUT", self.stop)
+        self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
+        self.assertFalse(self.adapter.created[0].closed)
+        self.assertFalse(self.registry.runtime._load_run(self.state())["jvmAndChildrenExited"])
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(3, connection.execute("SELECT count(*) FROM endpoint_reservations").fetchone()[0])
+
     def test_prepare_preserves_existing_data_and_requires_empty_slot(self):
         root = self.root / "instances/persistent-01"
         root.mkdir()
