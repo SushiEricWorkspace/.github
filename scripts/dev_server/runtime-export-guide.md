@@ -20,7 +20,10 @@ SushiEricDataModelをtask専用Mavenへ発行し、取得した完全座標でMo
 登録全repoを入力集合に含め、exporterもtask `.github`の入力として固定します。
 登録にManagerがあればManagerもビルドし、CombatCoreがあれば検証・発行します。変更repoとして登録した場合も同じです。
 `--manager`・`--with-core`で追加検証を要求する場合も、対応するrepoの登録が必要です。
-Modが実際にCombatCoreへ依存していない状態ではCoreをModの依存へ追加しません。
+Coreが登録されていれば、発行した完全座標と同じbuild UUID内のMaven/coreを、
+Modの`combatCoreDevelopmentCoordinate`と`combatCoreDevelopmentRepository`へ渡します。
+Core未登録時は両propertyを渡しません。Modが実際にCombatCoreへ依存していない状態では、
+helperからModの依存宣言を追加しません。
 通常の開発ビルドは共有開発SushiEricDataModelの動的参照を維持します。正式版を開発bundleへ使用はできません。
 
 ## Gradleとの境界

@@ -196,6 +196,18 @@ class BuildDevRuntimeTests(unittest.TestCase):
         export_call = next(call for call in gradle.call_args_list if "exportDevRuntime" in call.args)
         self.assertEqual(mod, export_call.args[0])
         self.assertIn(f"-PruntimeExporter={exporter.resolve()}", export_call.args)
+        core_arguments = [arg for arg in export_call.args[1:] if arg.startswith("-PcombatCoreDevelopment")]
+        if "SushiEricCombatCore" in extras:
+            self.assertEqual([f"-PcombatCoreDevelopmentRepository={maven / 'core'}",
+                              f"-PcombatCoreDevelopmentCoordinate={core_coordinate}"], core_arguments)
+            recorded_core = [item for item in source_lock["publications"] if item["coordinate"] == core_coordinate]
+            self.assertEqual(2, len(recorded_core))
+            self.assertTrue(all(Path(item["path"]).is_relative_to(maven / "core") for item in recorded_core))
+        else:
+            self.assertEqual([], core_arguments)
+        for call in gradle.call_args_list:
+            if call.args[0] != mod:
+                self.assertFalse(any(arg.startswith("-PcombatCoreDevelopmentCoordinate=") for arg in call.args[1:]))
         record = json.loads((task.parent / ".build-records/task-41" / f"{build_id}.json").read_bytes())
         self.assertEqual("SUCCEEDED", record["state"])
         self.assertTrue(record["artifactId"])
@@ -220,6 +232,9 @@ class BuildDevRuntimeTests(unittest.TestCase):
                 self.main_fixture(failure=original)
         self.assertIs(original, raised.exception)
         self.assertTrue(any("record path changed" in note for note in original.__notes__))
+
+    def test_registered_core_is_passed_to_mod_without_manager(self):
+        self.main_fixture(("SushiEricCombatCore",))
 
     def test_registered_manager_and_core_are_built_without_extra_flags(self):
         calls = self.main_fixture(("SushiEricServerManager", "SushiEricCombatCore"))
