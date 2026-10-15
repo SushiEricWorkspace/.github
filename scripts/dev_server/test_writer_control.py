@@ -337,6 +337,19 @@ class WriterControlTests(unittest.TestCase):
             self.assertEqual("PROCESS_MISMATCH", self.io(text="late")["error"]["code"])
         self.assertEqual(1, self.status()["writers"])
 
+    def test_expired_stop_keeps_pending_writer_fence_and_writer_operations_expired(self):
+        self.open()
+        with self.registry.transaction() as connection:
+            connection.execute("UPDATE writer_sessions SET pending=1 WHERE id=?", (self.binding["sessionId"],))
+        self.fixture.now = self.fixture.state()["expires"]
+        self.fixture.assert_code("WRITER_PENDING", self.fixture.stop)
+        self.assertEqual(0, self.fixture.rcon_calls)
+        self.assertEqual("RUNNING", self.fixture.state()["state"])
+        for command, payload in (("writer-check", self.binding), ("writer-close", dict(self.binding, drained=True, disconnected=True))):
+            with self.subTest(command=command):
+                self.assertEqual("LEASE_EXPIRED", self.command(command, payload)["error"]["code"])
+        self.assertEqual(1, self.status()["writers"])
+
     def test_stale_generation_epoch_nonce_and_secret_paths_are_rejected(self):
         self.open()
         for key, value in (("leaseId", "old-lease"), ("epoch", 2), ("expectedGeneration", "generation-old"), ("nonce", "old-nonce"), ("runId", "old-run")):

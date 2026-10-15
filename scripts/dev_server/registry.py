@@ -253,12 +253,12 @@ class Registry:
         require(row is not None, "NOT_FOUND", "instanceが登録されていません")
         return row
 
-    def _token(self, row, payload):
+    def _token(self, row, payload, *, allow_expired=False):
         require(type(payload["epoch"]) is int and payload["epoch"] == row["epoch"]
                 and type(payload["leaseId"]) is str and payload["leaseId"] == row["lease"]
                 and row["lease"] is not None, "STALE_LEASE", "leaseIdまたはepochが古いです")
         require(row["state"] != "RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "復旧照合が必要です")
-        require(row["expires"] > self.clock(), "LEASE_EXPIRED", "期限切れは自動回収しません。復旧・引継ぎを確認してください")
+        require(allow_expired or row["expires"] > self.clock(), "LEASE_EXPIRED", "期限切れは自動回収しません。復旧・引継ぎを確認してください")
         require(payload["expectedGeneration"] == row["generation"], "STALE_GENERATION", "期待世代が一致しません")
 
     def _safe_release(self, connection, row):

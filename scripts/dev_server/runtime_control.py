@@ -72,10 +72,10 @@ class RuntimeControl:
         require_private(staging, directory=True)
         return generation
 
-    def _row(self, payload):
+    def _row(self, payload, *, allow_expired=False):
         with self.registry.transaction(read_only=True) as connection:
             row = dict(self.registry._instance(connection, payload["instanceId"]))
-            self.registry._token(row, payload)
+            self.registry._token(row, payload, allow_expired=allow_expired)
             return row
 
     def _space(self, required_bytes=0):
@@ -139,7 +139,7 @@ class RuntimeControl:
             if cached:
                 require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "operationIdに異なる要求を指定できません")
                 row = self.registry._instance(connection, payload["instanceId"])
-                self.registry._token(row, payload)
+                self.registry._token(row, payload, allow_expired=command == "stop")
                 require(cached["status"] == "COMPLETED", "RECOVERY_REQUIRED", "未確定の操作は自動再実行しません")
                 response = json.loads(cached["response"])
                 require(row["run_id"] == response["runId"] and row["state"] == ("RUNNING" if command == "start" else "LEASED_STOPPED"),
@@ -151,7 +151,7 @@ class RuntimeControl:
                 self._active(row)
                 self._running(row)
             return dict(response, replayed=True, dryRun=dry_run)
-        row = self._row(payload)
+        row = self._row(payload, allow_expired=command == "stop")
         require(row["generation_bound"] and row["generation"] is not None and not row["pending"],
                 "INVALID_STATE", "このleaseへ完成generationが結び付いていません")
         generation = self._active(row)
@@ -179,7 +179,7 @@ class RuntimeControl:
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが他の操作で使用されています")
             current = self.registry._instance(connection, row["id"])
-            self.registry._token(current, payload)
+            self.registry._token(current, payload, allow_expired=command == "stop")
             require(current["state"] == row["state"] and not current["pending"], "BUSY", "枠の状態が変更されました")
             require(not connection.execute("SELECT 1 FROM writer_sessions WHERE instance=? AND pending!=0", (row["id"],)).fetchone(),
                     "WRITER_PENDING", "writer保存の完了が不明なため停止・再起動を開始できません")
@@ -199,7 +199,7 @@ class RuntimeControl:
                 result = self._stop(row, payload, generation)
             with self.registry.transaction() as connection:
                 current = self.registry._instance(connection, row["id"])
-                self.registry._token(current, payload)
+                self.registry._token(current, payload, allow_expired=command == "stop")
                 if command == "start":
                     connection.execute("UPDATE instances SET state='RUNNING',pending=0 WHERE id=?", (row["id"],))
                 else:
