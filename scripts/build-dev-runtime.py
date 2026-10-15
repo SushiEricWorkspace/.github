@@ -121,7 +121,10 @@ def main():
                 core_repo = maven / "core"
                 gradle(repos["SushiEricCombatCore"], "build", "publishDevelopment", *mod_args,
                        f"-PcombatCoreDevelopmentRepository={core_repo}")
-                record_publication(publication(repos["SushiEricCombatCore"], "core", "sushieric-combat-core-dev"), core_repo)
+                core_coordinate = publication(repos["SushiEricCombatCore"], "core", "sushieric-combat-core-dev")
+                record_publication(core_coordinate, core_repo)
+                mod_args.extend([f"-PcombatCoreDevelopmentRepository={core_repo}",
+                                 f"-PcombatCoreDevelopmentCoordinate={core_coordinate}"])
             if manager:
                 gradle(repos["SushiEricServerManager"], "build", f"-PdataModelDevelopmentRepository={maven}",
                        f"-PdataModelDevelopmentCoordinate={editor_coordinate}")
