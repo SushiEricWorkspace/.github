@@ -25,6 +25,14 @@ lease tokenはinstanceId、leaseId、epoch、expectedGenerationです。初回�
 prepare成功後は返却されたgenerationを指定します。acceptEulaは運用者が同意した場合だけtrueにします。
 runtime操作のCLIは`--operation-id`を必須にし、結果不明でも新IDで再送しません。
 
+stopだけは、同じleaseId・epoch・expectedGenerationの一致を条件に貸出期限切れを許容します。
+監督が所有するRUNNING run、世代結合、未完了操作・writer、プロセス・待受・保存・終了の照合は維持します。
+停止途中で期限を越えた場合も同じ照合で完了し、完了済みの同一stop要求は再実行せず結果を返します。
+stopはexpires・owner・epochを変更しません。停止後に[世代ガイド](generation-guide.md)のrecoverで照合し、明示的にTTLを更新します。
+start・renew・release・writer操作などは期限切れのまま拒否します。owner入力は追加せず、現行のlease能力トークンで認可します。
+稼働中の監督は起動時に読み込んだ実装を使用します。CLIやソースを更新しても、既存監督の期限判定は更新されません。
+監督の再起動は全枠を復旧待ちにするため、期限切れRUNNINGを自動解消する目的で再起動せず、既存runの対応を別途確認します。
+
 ```bash
 python3.12 -B scripts/dev-server.py prepare --root /absolute/minecraft-dev --operation-id prepare-01 --payload-file /absolute/prepare.json --timeout-seconds 600
 python3.12 -B scripts/dev-server.py start --root /absolute/minecraft-dev --operation-id start-01 --payload-file /absolute/start.json --timeout-seconds 600
