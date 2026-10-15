@@ -12,6 +12,7 @@ from .local_ipc import make_private, plain_path, require_private
 from .registry import RegistryError, fields, identifier, require, ttl
 from .runtime_bundle import verify_bundle, _files
 from .runtime_control import TOKEN, read_json
+from .runtime_ports import instance_endpoints
 from .snapshot_control import verify_snapshot
 from .snapshot_data import entry, properties, collect, transform
 from .template_data import shared_data
@@ -28,7 +29,7 @@ class GenerationControl:
     def __init__(self, registry):
         self.registry = registry
 
-    def _row(self, payload, *, recovery=False):
+    def _row(self, payload, *, recovery=False, observe_stop=False):
         with self.registry.transaction(read_only=True) as connection:
             row = dict(self.registry._instance(connection, payload["instanceId"]))
             if recovery:
@@ -41,7 +42,7 @@ class GenerationControl:
             require(self.registry.writer.summary(connection, row)["externalWritersVerified"]
                     and not row["children"]
                     and not connection.execute("SELECT 1 FROM writer_sessions WHERE instance=? AND pending!=0", (row["id"],)).fetchone()
-                    and not connection.execute("SELECT 1 FROM endpoint_reservations WHERE instance=?", (row["id"],)).fetchone(),
+                    and (observe_stop or not connection.execute("SELECT 1 FROM endpoint_reservations WHERE instance=?", (row["id"],)).fetchone()),
                     "PROOF_REQUIRED", "writer・child・待受予約の不在が必要です。結果不明は解除しません")
         return row
 
@@ -361,6 +362,8 @@ class GenerationControl:
                     "RECOVERY_REQUIRED", "世代のjournal・Registryが一致しません")
 
     def recover(self, payload, *, operation_id, dry_run=False):
+        if type(payload) is dict and payload.get("action") == "observe-stop":
+            return self._observe_stop(payload, operation_id=operation_id, dry_run=dry_run)
         identifier(operation_id, "operationId")
         fields(payload, TOKEN | {"action", "targetOperationId", "ttlSeconds"})
         ttl(payload["ttlSeconds"])
@@ -483,6 +486,106 @@ class GenerationControl:
                                 self.registry.clock() + payload["ttlSeconds"] if current["lease"] else None, row["id"]))
             connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (json.dumps(result), operation_id))
         return result
+
+    def _observe_stop(self, payload, *, operation_id, dry_run):
+        identifier(operation_id, "operationId")
+        fields(payload, TOKEN | {"action", "targetOperationId", "ttlSeconds", "expectedRunId", "expectedProofHash"})
+        identifier(payload["expectedRunId"], "expectedRunId")
+        ttl(payload["ttlSeconds"])
+        require(payload["targetOperationId"] is None and type(payload["expectedProofHash"]) is str
+                and re.fullmatch("[0-9a-f]{64}", payload["expectedProofHash"]),
+                "INVALID_INPUT", "対象操作なしと固定proof hashが必要です")
+        row = self._row(payload, recovery=True, observe_stop=True)
+        fingerprint = digest(canonical({"command": "recover", "payload": payload}))
+        with self.registry.transaction(read_only=True) as connection:
+            cached = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (operation_id,)).fetchone()
+            if cached:
+                require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "同じ復旧IDに異なる要求は指定できません")
+                require(cached["status"] == "COMPLETED", "RECOVERY_REQUIRED", "未確定の復旧を再実行しません")
+            self._observe_bound(connection, row, payload, operation_id)
+        run = self.registry.runtime._load_run(row)
+        require(type(run.get("identity")) is dict and type(run.get("creation")) is dict,
+                "PROCESS_UNVERIFIED", "生成・開始識別の記録がありません")
+        require(run["runId"] == row["run_id"] and run["instanceId"] == row["id"]
+                and run["generationId"] == row["generation"] and run["artifactId"] == row["artifact"],
+                "PROOF_MISMATCH", "起動記録の世代・artifactが一致しません")
+        generation = self.registry.runtime._active_generation(row)
+        expected_path = self.registry.runtime._paths(row["id"]) / "diagnostics" / row["run_id"] / "proof.json"
+        require(Path(run["proofPath"]) == expected_path
+                and digest(regular_bytes(expected_path)) == payload["expectedProofHash"]
+                and digest(regular_bytes(generation / "runtime/runtime.json")) == run["manifestHash"],
+                "PROOF_MISMATCH", "固定proofまたはruntime manifestが一致しません")
+        if cached:
+            require(row["state"] == "LEASED_STOPPED", "STALE_OPERATION", "復旧後の状態が変わっています")
+            with self.registry.transaction(read_only=True) as connection:
+                require(not connection.execute("SELECT 1 FROM endpoint_reservations WHERE instance=? OR run=?", (row["id"], row["run_id"])).fetchone(),
+                        "PROOF_MISMATCH", "復旧後に待受予約が残っています")
+            self._stopped(row)
+            return dict(json.loads(cached["response"]), replayed=True, dryRun=dry_run)
+        require(row["state"] in {"RUNNING", "RECOVERY_REQUIRED"} and run.get("observedStop") is None,
+                "INVALID_STATE", "未記録の停止だけを観測復旧できます")
+        require(run["endpoints"] == instance_endpoints(next(item for item in self.registry.inventory["instances"]
+                if item["instanceId"] == row["id"])), "PROOF_MISMATCH", "起動記録とinventoryの待受が一致しません")
+        with self.registry.transaction(read_only=True) as connection:
+            self._observe_endpoints(connection, row, run)
+        with self.registry.runtime.process_adapter.observe_exit(run["identity"], run["creation"], run["nonce"]) as observed:
+            self.registry.runtime._proof(run, generation, stopped=True)
+            require(digest(regular_bytes(expected_path)) == payload["expectedProofHash"], "PROOF_MISMATCH", "保存proofが変更されました")
+            if dry_run:
+                return {"dryRun": True, "wouldExecute": "recover-observe-stop", "instanceId": row["id"]}
+            updated = dict(run, observedStop=dict(observed, observedAt=self.registry.clock()), exitCode=0,
+                           jvmAndChildrenExited=True, runtimeSaveCompleted=True, proofHash=payload["expectedProofHash"])
+            proof = {"instanceId": row["id"], "generation": row["generation"], "runId": row["run_id"],
+                     "nonce": run["nonce"], "runtimeStopped": True, "modSaveCompleted": True, "exitCode": 0,
+                     "jvmAndChildrenExited": True, "observedStop": updated["observedStop"],
+                     "proofHash": payload["expectedProofHash"], "snapshotClean": False}
+            result = {"instanceId": row["id"], "generation": row["generation"], "runId": row["run_id"],
+                      "recovered": True, "action": "observe-stop", "snapshotClean": False}
+            with self.registry.transaction() as connection:
+                current = dict(self.registry._instance(connection, row["id"]))
+                self._observe_bound(connection, current, payload, operation_id)
+                require(current["state"] == row["state"] and current["artifact"] == row["artifact"],
+                        "RECOVERY_REQUIRED", "観測中に枠の状態が変わりました")
+                stored = json.loads(connection.execute("SELECT record FROM runs WHERE id=?", (row["run_id"],)).fetchone()[0])
+                require(stored == run, "PROOF_MISMATCH", "観測中に起動記録が変わりました")
+                self._observe_endpoints(connection, current, run)
+                require(not connection.execute("SELECT 1 FROM runtime_operations WHERE id=?", (operation_id,)).fetchone(),
+                        "OPERATION_CONFLICT", "観測中にoperationIdが使用されました")
+                require(digest(regular_bytes(expected_path)) == payload["expectedProofHash"], "PROOF_MISMATCH", "保存proofが変更されました")
+                connection.execute("UPDATE runs SET record=? WHERE id=?", (json.dumps(updated), row["run_id"]))
+                connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=?,clean_proof=NULL,expires=? WHERE id=?",
+                                   (json.dumps(proof), self.registry.clock() + payload["ttlSeconds"], row["id"]))
+                connection.execute("DELETE FROM endpoint_reservations WHERE instance=? AND run=?", (row["id"], row["run_id"]))
+                connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
+                                   (operation_id, fingerprint, "recover", row["id"], "COMPLETED", json.dumps(result)))
+                connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,?)",
+                                   (self.registry.clock(), operation_id, "recover-observe-stop"))
+            return result
+
+    def _observe_bound(self, connection, row, payload, operation_id):
+        for table in TABLES[:-1]:
+            require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
+                    "OPERATION_CONFLICT", "operationIdが使用されています")
+        require(type(payload["leaseId"]) is str and row["lease"] == payload["leaseId"]
+                and type(payload["epoch"]) is int and row["epoch"] == payload["epoch"],
+                "STALE_LEASE", "観測復旧する貸出が一致しません")
+        require(row["generation"] == payload["expectedGeneration"] and row["generation_bound"],
+                "STALE_GENERATION", "観測復旧する世代が一致しません")
+        require(row["run_id"] == payload["expectedRunId"], "STALE_RUN", "観測復旧するrunが一致しません")
+        require(not row["pending"] and not row["children"]
+                and self.registry.writer.summary(connection, row)["externalWritersVerified"]
+                and not connection.execute("SELECT 1 FROM writer_sessions WHERE instance=? AND pending!=0", (row["id"],)).fetchone()
+                and not connection.execute("SELECT 1 FROM reservations WHERE instance=?", (row["id"],)).fetchone()
+                and not connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND status!='COMPLETED' AND id!=?", (row["id"], operation_id)).fetchone()
+                and not connection.execute("SELECT 1 FROM snapshot_operations WHERE instance=? AND status!='COMPLETED'", (row["id"],)).fetchone(),
+                "RECOVERY_REQUIRED", "未照合のwriter・child・操作・参照予約があります")
+
+    def _observe_endpoints(self, connection, row, run):
+        actual = [dict(value) for value in connection.execute("SELECT * FROM endpoint_reservations WHERE instance=? OR run=?", (row["id"], row["run_id"]))]
+        expected = [{"run": row["run_id"], "instance": row["id"], "service": service, **value}
+                    for service, value in run["endpoints"].items()]
+        require(sorted(actual, key=lambda value: value["service"]) == sorted(expected, key=lambda value: value["service"]),
+                "PROOF_MISMATCH", "当該runの待受予約と記録が一致しません")
 
     def _snapshot_recovery(self, row, operation, action, *, dry_run):
         if (self.registry.root / "manager/operations" / ("template-" + operation)).exists():
