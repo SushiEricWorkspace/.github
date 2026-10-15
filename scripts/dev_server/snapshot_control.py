@@ -61,8 +61,18 @@ class SnapshotControl:
         proof = json.loads(row["runtime_proof"])
         expected_proof = runtime._paths(row["id"]) / "diagnostics" / row["run_id"] / "proof.json"
         plain_path(expected_proof)
-        require(run.get("stopRequested") is True and run.get("stopAcknowledged") is True
-                and run.get("jvmAndChildrenExited") is True and run.get("runtimeSaveCompleted") is True
+        observed = proof.get("observedStop")
+        if observed is not None:
+            require(type(observed) is dict and observed == run.get("observedStop")
+                    and observed.get("pid") == run["identity"]["pid"]
+                    and observed.get("startId") == run["identity"]["startId"]
+                    and observed.get("bootId") == run["identity"]["bootId"] and observed.get("exitCode") == 0,
+                    "PROOF_MISMATCH", "観測した正常終了の識別が一致しません")
+        else:
+            require(run.get("observedStop") is None and run.get("stopRequested") is True
+                    and run.get("stopAcknowledged") is True,
+                    "PROOF_MISMATCH", "通常RCON停止の要求・応答を確認できません")
+        require(run.get("jvmAndChildrenExited") is True and run.get("runtimeSaveCompleted") is True
                 and run.get("exitCode") == 0 and run["runId"] == proof.get("runId")
                 and run["nonce"] == proof.get("nonce") and run["generationId"] == row["generation"]
                 and run["artifactId"] == row["artifact"] and run["instanceId"] == row["id"]

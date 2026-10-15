@@ -1,5 +1,6 @@
 """OS開始識別・boot・cwd・socket所有と、killしない子プロセス所有adapter。"""
 import ctypes
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
@@ -375,6 +376,40 @@ def recorded_members(creation: dict, nonce: str) -> list[int]:
     require(creation.get("ownerGroup") == creation["pid"], "PROCESS_MISMATCH", "所有group識別が一致しません")
     probe.pid = creation["pid"]
     return probe.members()
+
+
+@contextmanager
+def observe_exit(expected: dict, creation: dict, nonce: str):
+    """Windowsの終了objectとnamed Jobを読取handleで保持する。終了後のフルidentity取得ではない。"""
+    require(os.name == "nt", "UNSUPPORTED_PROCESS", "終了objectの観測はWindowsだけに対応しています")
+    require(type(expected.get("pid")) is int and expected["pid"] > 0
+            and creation.get("pid") == expected["pid"] and expected.get("bootId") == boot_id(),
+            "PROCESS_MISMATCH", "記録PIDまたはOS bootが一致しません")
+    name = "Local\\sushieric-runtime-" + nonce
+    require(creation.get("ownerGroup") == name, "PROCESS_MISMATCH", "所有job識別が一致しません")
+    handle = kernel.OpenProcess(0x1000 | 0x100000, False, expected["pid"])
+    require(bool(handle), "PROCESS_UNVERIFIED", "終了process objectを読み取れません")
+    job = None
+    try:
+        times = [w.FILETIME() for _ in range(4)]
+        _check(kernel.GetProcessTimes(handle, *[ctypes.byref(value) for value in times]))
+        started = str(times[0].dwLowDateTime | (times[0].dwHighDateTime << 32))
+        require(started == expected.get("startId"), "PROCESS_MISMATCH", "process objectの開始FILETIMEが一致しません")
+        require(_winapi.WaitForSingleObject(int(handle), 0) == _winapi.WAIT_OBJECT_0,
+                "PROCESS_MISMATCH", "process objectが終了していません")
+        code = _winapi.GetExitCodeProcess(int(handle))
+        require(code == 0, "SAVE_FAILED", "process objectが正常終了していません")
+        function(kernel, "OpenJobObjectW", [w.DWORD, w.BOOL, w.LPCWSTR], w.HANDLE)
+        job = kernel.OpenJobObjectW(4, False, name)
+        require(bool(job), "PROCESS_UNVERIFIED", "保持されたnamed Jobを読み取れません")
+        probe = OwnedProcess()
+        probe.job = job
+        require(not probe.members(), "PROCESS_MISMATCH", "所有jobに子プロセスが残っています")
+        yield {"pid": expected["pid"], "startId": started, "bootId": expected["bootId"], "exitCode": code}
+    finally:
+        if job:
+            kernel.CloseHandle(job)
+        kernel.CloseHandle(handle)
 
 
 def require_identity(expected: dict, actual: dict | None) -> None:
