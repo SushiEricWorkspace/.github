@@ -43,12 +43,13 @@
 
 ### ビルド環境
 
-- JDK 21を使用する。他のバージョンではビルドが失敗する。
-- Gradle daemonのJVMは各リポジトリの`gradle/gradle-daemon-jvm.properties`で21に固定している。`JAVA_HOME`が別バージョンを指していても、daemonはJDK 21で起動する。このファイルを削除・変更しない。
-- 上記はJDK 21がインストール済みであることを前提とする。未インストールの環境では`No matching toolchains`で失敗するため、JDK 21を導入する。
-- 新しいJDKでビルドすると次の失敗が起きるため、原因を切り分ける手がかりとする。
-  - `Inconsistent JVM-target compatibility detected for tasks 'compileJava' and 'compileKotlin'` … Javaのtoolchain指定が効いておらず、KotlinがGradleのJVMを使っている。
-  - `IllegalArgumentException: <バージョン>` が`org.jetbrains.kotlin.com.intellij.util.lang.JavaVersion.parse`で発生 … KotlinコンパイラがそのJDKに未対応。daemonのJVMを21へ固定して回避する。
+- JDK 21を対象とするJava repoはJDK 21を使用する。SushiEricDataModelとSushiEricServerModのJava 21互換性を維持する。
+- SushiEricServerManagerのルートプロジェクトと`development`サブプロジェクトはJDK 25／JavaFX 27を使用する。Gradle daemonのJVMもJDK 21に固定せず、ManagerのGradle・Kotlinが対応するJDK 25で動かす。
+- Gradle daemonのJVMは各リポジトリの`gradle/gradle-daemon-jvm.properties`に定める。JDK 21対象repoの設定を削除・変更しない。ManagerにはJDK 21固定の共通指示を適用しない。
+- 対象JDKが導入されていない環境では`No matching toolchains`で失敗するため、そのリポジトリの対象JDKを導入する。
+- 次の失敗は原因を切り分ける手がかりとする。
+  - `Inconsistent JVM-target compatibility detected for tasks 'compileJava' and 'compileKotlin'` … Javaのtoolchain指定が効いていないか、JavaとKotlinのJVM targetが一致していない。
+  - `IllegalArgumentException: <バージョン>` が`org.jetbrains.kotlin.com.intellij.util.lang.JavaVersion.parse`で発生 … KotlinコンパイラがGradle daemonのJDKに未対応。対象リポジトリのJDK要件に合うGradle・Kotlinを使用し、daemonを一律JDK 21へ固定して回避しない。
 - Javaのtoolchain指定を実行中のJVMバージョンで条件分岐させない。条件付きにすると、新しいJDKでGradleを動かしたときにtoolchainが未設定となり、JavaとKotlinのJVM targetが食い違う。
 
 ### Git操作
