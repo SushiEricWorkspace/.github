@@ -105,17 +105,19 @@ def main():
             gradle(data_model, "build", "publishDevelopment", f"-PdataModelDevelopmentRepository={maven}")
             mod_coordinate = publication(data_model, "mod", "sushieric-datamodel-mod-dev")
             editor_coordinate = publication(data_model, "editor", "sushieric-datamodel-editor-dev")
+            host_coordinate = publication(data_model, "host", "sushieric-datamodel-host-adapter-dev")
             publications = []
 
-            def record_publication(coordinate, repository):
+            def record_publication(coordinate, repository, suffixes=(".jar", ".pom")):
                 group, module, version = coordinate.split(":")
-                for suffix in ("jar", "pom"):
-                    path = repository / group.replace(".", "/") / module / version / f"{module}-{version}.{suffix}"
+                for suffix in suffixes:
+                    path = repository / group.replace(".", "/") / module / version / f"{module}-{version}{suffix}"
                     publications.append({"coordinate": coordinate, "path": str(path),
                                          "sha256": digest(regular_bytes(path))})
 
             record_publication(mod_coordinate, maven)
             record_publication(editor_coordinate, maven)
+            record_publication(host_coordinate, maven, ("-runtime.zip", ".pom"))
             mod_args = [f"-PdataModelDevelopmentRepository={maven}", f"-PdataModelDevelopmentCoordinate={mod_coordinate}"]
             if core:
                 core_repo = maven / "core"
@@ -133,7 +135,7 @@ def main():
             source_lock["publications"] = publications
             lock.parent.mkdir(parents=True, exist_ok=True)
             lock.write_bytes(canonical(source_lock))
-            gradle(repos["SushiEricServerMod"], "build", "exportDevRuntime", *mod_args,
+            gradle(repos["SushiEricServerMod"], "build", "exportDevRuntime", "-x", "runGameTest", "-x", "runServer", *mod_args,
                    f"-PruntimeSourceLock={lock}", f"-PruntimeArtifactStore={args.store.absolute()}",
                    f"-PruntimePython={sys.executable}",
                    f"-PruntimeExporter={exporter}")

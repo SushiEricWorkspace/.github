@@ -245,6 +245,10 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path) -> Path:
         _require(digest(freezer.read(path)) == item["sha256"], "publication: 発行直後から変更されています")
         publications.append({"coordinate": item["coordinate"], "sha256": item["sha256"], "file": freezer.copy(path)})
     freezer.write("inputs/publications.json", canonical(publications))
+    from .database_adapter import freeze_host_adapter
+    freeze_host_adapter(freezer, lock, recipe["dataModelCoordinate"], data_model_jar)
+    from .database_proxy_bundle import freeze_proxy
+    freeze_proxy(freezer, lock, recipe, profiles)
     tools = [{"name": "jdk", "version": recipe["javaVersion"],
               "sha256": freezer.copy_tree(Path(recipe["javaHome"]), "jdk")},
              {"name": "gradle", "version": recipe["gradleVersion"],
@@ -295,6 +299,12 @@ def verify_bundle(root: Path) -> dict:
              "runtime: artifactIdまたはCOMPLETEが一致しません")
     observed = [entry for entry in _files(root) if entry["path"] not in {"runtime.json", "COMPLETE"}]
     _require(observed == manifest["files"], "runtime: ファイル集合・サイズ・hashが一致しません")
+    from .database_adapter import DESCRIPTOR, verify_host_adapter
+    if (root / DESCRIPTOR).exists():
+        verify_host_adapter(root)
+    from .database_proxy_bundle import DESCRIPTOR as PROXY_DESCRIPTOR, DIRECTORY as PROXY_DIRECTORY, verify_proxy
+    if (root / PROXY_DIRECTORY).exists() or (root / PROXY_DESCRIPTOR).exists():
+        verify_proxy(root)
     return manifest
 
 

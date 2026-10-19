@@ -161,7 +161,7 @@ if os.name == "nt":
             self.group = None
             self.stage = "NOT_CREATED"
 
-        def start(self, arguments, cwd, log, name, created):
+        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None):
             self.group = "Local\\sushieric-runtime-" + name
             with security_descriptor() as descriptor:
                 attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
@@ -175,9 +175,10 @@ if os.name == "nt":
             with open(os.devnull, "rb") as empty:
                 start = subprocess.STARTUPINFO()
                 start.dwFlags = subprocess.STARTF_USESTDHANDLES
-                start.hStdInput = msvcrt.get_osfhandle(empty.fileno())
-                start.hStdOutput = start.hStdError = msvcrt.get_osfhandle(log.fileno())
-                start.lpAttributeList = {"handle_list": [start.hStdInput, start.hStdOutput]}
+                start.hStdInput = msvcrt.get_osfhandle(empty.fileno() if input_fd is None else input_fd)
+                start.hStdOutput = msvcrt.get_osfhandle(log.fileno() if output_fd is None else output_fd)
+                start.hStdError = msvcrt.get_osfhandle(log.fileno())
+                start.lpAttributeList = {"handle_list": list(dict.fromkeys([start.hStdInput, start.hStdOutput, start.hStdError]))}
                 for handle in start.lpAttributeList["handle_list"]:
                     os.set_handle_inheritable(handle, True)
                 try:
@@ -277,8 +278,13 @@ else:
         lib = library()
         executable = ctypes.create_string_buffer(4096)
         require(lib.proc_pidpath(pid, executable, len(executable)) > 0, "PROCESS_UNVERIFIED", "実行元を取得できません")
-        output = subprocess.run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-F0pn"],
-                                capture_output=True, check=True).stdout
+        try:
+            output = subprocess.run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-F0pn"],
+                                    capture_output=True, check=True).stdout
+        except subprocess.CalledProcessError as error:
+            if error.returncode != 1:
+                raise
+            raise OSError("プロセスの実cwdを照合できません") from error
         names = [os.fsdecode(part.lstrip(b"\n")[1:]) for part in output.split(b"\0") if part.lstrip(b"\n").startswith(b"n")]
         require(len(names) == 1, "PROCESS_UNVERIFIED", "実cwdを一意に取得できません")
         return {"pid": pid, "startId": f"{value.seconds}:{value.micros}",
@@ -320,8 +326,9 @@ else:
             self.process = self.pid = self.group = None
             self.stage = "NOT_CREATED"
 
-        def start(self, arguments, cwd, log, name, created):
-            self.process = subprocess.Popen(arguments, cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None):
+            self.process = subprocess.Popen(arguments, cwd=cwd, stdin=subprocess.DEVNULL if input_fd is None else input_fd,
+                                            stdout=log if output_fd is None else output_fd, stderr=log, start_new_session=True)
             self.pid = self.process.pid
             self.group = self.pid
             self.stage = "CREATED"

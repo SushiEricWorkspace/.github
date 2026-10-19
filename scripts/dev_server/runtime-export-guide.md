@@ -109,3 +109,15 @@ build helperの試験は、変更repoと固定依存の検査、未登録依存�
 `test_gradle_publication.py`を実行します。二つの独立コピーへ異なるresourceを追加し、並列発行後に両consumerの完全座標と内容を確認します。
 通常の単体試験ではこの重いGradle試験をスキップします。
 Windowsでの結果はmacOS 15の運用適合・停電耐久性の証明ではありません。
+
+## 固定DB Host配布
+
+新規bundleは同じDataModel発行版のHost runtime ZIPとPOMを発行lockへ記録し、`adapter/host.json`と全展開fileをartifact hashへ含めます。配布内DataModel JARはModの固定入力JARとbyte一致を必要とし、公開entrypointは`HostAdapterCli`だけです。`host_adapter_command`はbundle内JDKとclasspathだけを選び、作成OS/architectureの不一致、未同梱、差替えを拒否します。本文や秘密をcommand lineへ追加しません。
+
+保存済みruntimeの通常検証契約は維持しますが、Host配布がないbundleからDB adapterを実行する代替探索は行いません。Host CLIの管理root拒否は維持し、稼働管理DBは所有Mod JVMの型付きManagement要求へ仲介します。停止中OFFLINE ownerとrun-state/snapshotの接続は後続#64の責務です。
+
+## 固定DB proxy配布
+
+現在の`.github`を入力に含む新規bundleは`adapter/proxy.json`と専用Java helperを収録します。公開Data/Mod DTO・serializer・codecをJDK 21でコンパイルし、Java source、生成JAR、コンパイラー、Modの解決済みKotlin/serialization/Data依存GAV、codec classdirの全classfileを既存artifact collectionへ固定します。Host CLI用classpathは分離し、proxyへ混在させません。同一DataModel JARのbyte一致、依存の一意性、作成OS/architecture、全classpathのhashを作用前に検証します。JAR manifestの外部Class-Pathと、classpath区切り文字を含む要素は拒否します。
+
+`proxy_command`はbundle内JDKと固定main/classpathだけを使います。未同梱の古いbundleは通常の検証・API/FS動作を維持しますが、新DB入口で代替helperを探索しません。1writer/1socket、本人登録、要求上限、UNKNOWNと終了証明は[writer契約](writer-guide.md#db専用writer)に従います。固定helperの生成・公開codec互換・自己所有loopback試験と、実Mod/DBへの結合は別の検証です。

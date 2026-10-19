@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import importlib.util
 import os
 import socket
+import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -193,6 +194,42 @@ class MacAdapterFaultTests(unittest.TestCase):
         cls.adapter = importlib.util.module_from_spec(spec)
         with patch("os.name", "posix"):
             spec.loader.exec_module(cls.adapter)
+
+    def identity_with_lsof(self, result):
+        adapter = self.adapter
+        def pidpath(pid, buffer, size):
+            buffer.value = b"/fixture/python"
+            return len(buffer.value)
+        native = Mock(status=1, seconds=2, micros=3, uid=501)
+        arguments = struct.pack("i", 1) + b"/fixture/python\0\0/fixture/python\0"
+        with patch.object(adapter, "bsd", return_value=native), \
+                patch.object(adapter, "sysctl", return_value=arguments), \
+                patch.object(adapter, "library", return_value=Mock(proc_pidpath=pidpath)), \
+                patch.object(adapter, "boot_id", return_value="fixture-boot"), \
+                patch.object(adapter.subprocess, "run", side_effect=[result]):
+            return adapter.identity(123)
+
+    def test_lsof_cwd_return_one_is_unknown_oserror_with_cause(self):
+        failure = self.adapter.subprocess.CalledProcessError(1, ["/usr/sbin/lsof"])
+        with self.assertRaises(OSError) as raised:
+            self.identity_with_lsof(failure)
+        self.assertIsNone(raised.exception.errno)
+        self.assertIs(failure, raised.exception.__cause__)
+
+    def test_lsof_cwd_other_failure_is_not_hidden(self):
+        failure = self.adapter.subprocess.CalledProcessError(2, ["/usr/sbin/lsof"])
+        with self.assertRaises(self.adapter.subprocess.CalledProcessError) as raised:
+            self.identity_with_lsof(failure)
+        self.assertIs(failure, raised.exception)
+
+    def test_lsof_cwd_success_keeps_native_identity(self):
+        completed = self.adapter.subprocess.CompletedProcess(["/usr/sbin/lsof"], 0, b"p123\0n/fixture/world\0")
+        actual = self.identity_with_lsof(completed)
+        self.assertEqual({"pid": 123, "startId": "2:3", "startMillis": 2000,
+                          "bootId": "fixture-boot", "owner": "501",
+                          "cwd": str(Path("/fixture/world").resolve()),
+                          "executable": str(Path("/fixture/python").resolve()),
+                          "commandHash": self.adapter.command_hash(["/fixture/python"])}, actual)
 
     def test_listpids_errno_failure_never_proves_empty_children(self):
         adapter = self.adapter

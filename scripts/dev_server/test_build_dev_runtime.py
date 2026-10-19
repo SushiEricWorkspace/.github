@@ -147,10 +147,11 @@ class BuildDevRuntimeTests(unittest.TestCase):
         editor_coordinate = (
             "io.github.sushiericworkspace:sushieric-datamodel-editor-dev:"
             "0.1.0-dev.20261010123456789.12345678-1234-1234-1234-123456789abc")
+        host_coordinate = mod_coordinate.replace("sushieric-datamodel-mod-dev", "sushieric-datamodel-host-adapter-dev")
         build = data_model / "build"
         build.mkdir()
         (build / "development-publication.properties").write_text(
-            f"mod={mod_coordinate}\neditor={editor_coordinate}\n")
+            f"mod={mod_coordinate}\neditor={editor_coordinate}\nhost={host_coordinate}\n")
         build_id = "a" * 32
         maven = task / "maven" / build_id
         core_coordinate = editor_coordinate.replace("sushieric-datamodel-editor-dev", "sushieric-combat-core-dev")
@@ -167,13 +168,14 @@ class BuildDevRuntimeTests(unittest.TestCase):
                 bundle = synthetic_bundle(store, json.loads(lock_path.read_bytes()))
                 write_receipt(lock_path, bundle)
             if repo == data_model or repo.name == "SushiEricCombatCore":
-                coordinates = (mod_coordinate, editor_coordinate) if repo == data_model else (core_coordinate,)
+                coordinates = (mod_coordinate, editor_coordinate, host_coordinate) if repo == data_model else (core_coordinate,)
                 repository = maven if repo == data_model else maven / "core"
                 for coordinate in coordinates:
                     group, module, version = coordinate.split(":")
                     directory = repository / group.replace(".", "/") / module / version
                     directory.mkdir(parents=True)
-                    (directory / f"{module}-{version}.jar").write_bytes(b"jar")
+                    artifact = f"{module}-{version}-runtime.zip" if coordinate == host_coordinate else f"{module}-{version}.jar"
+                    (directory / artifact).write_bytes(b"artifact")
                     (directory / f"{module}-{version}.pom").write_bytes(b"pom")
 
         source_lock = {"sourceLockVersion": 1, "sources": [
@@ -196,6 +198,12 @@ class BuildDevRuntimeTests(unittest.TestCase):
         export_call = next(call for call in gradle.call_args_list if "exportDevRuntime" in call.args)
         self.assertEqual(mod, export_call.args[0])
         self.assertIn(f"-PruntimeExporter={exporter.resolve()}", export_call.args)
+        self.assertIn("runGameTest", export_call.args)
+        self.assertIn("runServer", export_call.args)
+        self.assertEqual(2, export_call.args.count("-x"))
+        host_publications = [item for item in source_lock["publications"] if item["coordinate"] == host_coordinate]
+        self.assertEqual(2, len(host_publications))
+        self.assertEqual({".zip", ".pom"}, {Path(item["path"]).suffix for item in host_publications})
         core_arguments = [arg for arg in export_call.args[1:] if arg.startswith("-PcombatCoreDevelopment")]
         if "SushiEricCombatCore" in extras:
             self.assertEqual([f"-PcombatCoreDevelopmentRepository={maven / 'core'}",
