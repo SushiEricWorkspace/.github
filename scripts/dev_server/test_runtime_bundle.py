@@ -1,5 +1,6 @@
 """小さな合成runtimeでコピー・パス除去・改変拒否を検証する。Minecraft起動試験とは区別する。"""
 
+import io
 import json
 import os
 import shutil
@@ -119,6 +120,32 @@ class RuntimeBundleTests(unittest.TestCase):
                        "dependencyInputs": [{"path": item["path"], "sha256": digest(Path(item["path"]).read_bytes())}
                                             for item in artifacts] +
                                             [{"path": str(deps / "datamodel.pom"), "sha256": digest((deps / "datamodel.pom").read_bytes())}]}
+        import zipfile
+        from .database_adapter import HOST_MAIN, HOST_MODULE
+        model = Path(self.recipe["artifacts"][0]["path"])
+        with zipfile.ZipFile(model, "w") as jar:
+            jar.writestr(HOST_MAIN.replace(".", "/") + ".class", b"synthetic Host CLI")
+        self.recipe["dependencyInputs"][0]["sha256"] = digest(model.read_bytes())
+        self.host_coordinate = HOST_MODULE + ":" + self.data_model_coordinate.split(":")[2]
+        module = HOST_MODULE.split(":")[1]
+        version = self.host_coordinate.split(":")[2]
+        self.host_zip = deps / f"{module}-{version}-runtime.zip"
+        self.host_pom = deps / f"{module}-{version}.pom"
+        self.host_pom.write_text('<project xmlns="http://maven.apache.org/POM/4.0.0"><groupId>'
+                                 'io.github.sushiericworkspace</groupId><artifactId>' + module +
+                                 '</artifactId><version>' + version + '</version></project>')
+        with zipfile.ZipFile(self.host_zip, "w") as archive:
+            archive.writestr("lib/datamodel.jar", model.read_bytes())
+            library = io.BytesIO()
+            with zipfile.ZipFile(library, "w") as jar:
+                jar.writestr("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\r\n\r\n")
+            archive.writestr("lib/kotlin.jar", library.getvalue())
+            archive.writestr("README.md", b"synthetic Host guide")
+        source_lock = json.loads(self.lock.read_bytes())
+        source_lock["publications"] = [{"coordinate": self.host_coordinate, "path": str(path),
+                                       "sha256": digest(path.read_bytes())}
+                                      for path in (self.host_zip, self.host_pom)]
+        self.lock.write_bytes(canonical(source_lock))
         self.recipe_path = self.root / "recipe.json"
         self.store = self.root / "artifacts"
 

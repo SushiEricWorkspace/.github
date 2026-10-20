@@ -69,7 +69,7 @@ class TaskMavenTests(unittest.TestCase):
         self.store = self.root / "artifacts"
         self.build_id = "a" * 32
 
-    def completed(self, build_id=None):
+    def completed(self, build_id=None, host_zip=False):
         build_id = build_id or self.build_id
         maven, path = self.manager.paths("task-a", build_id)
         lock_path = self.root / f"source-lock-{build_id}.json"
@@ -82,6 +82,13 @@ class TaskMavenTests(unittest.TestCase):
             target.write_bytes(f"{build_id}-{suffix}".encode())
             publications.append({"coordinate": "io.github.sushiericworkspace:sushieric-datamodel-mod-dev:0.1.0-dev.20261010123456789.12345678-1234-1234-1234-123456789abc",
                                  "path": str(target), "sha256": digest(target.read_bytes())})
+        if host_zip:
+            coordinate = publications[0]["coordinate"].replace("sushieric-datamodel-mod-dev", "sushieric-datamodel-host-adapter-dev")
+            version = coordinate.split(":")[2]
+            target = maven / "host" / f"sushieric-datamodel-host-adapter-dev-{version}-runtime.zip"
+            target.parent.mkdir()
+            target.write_bytes(b"synthetic fixed Host ZIP")
+            publications.append({"coordinate": coordinate, "path": str(target), "sha256": digest(target.read_bytes())})
         for name in ("module.claim", "maven-metadata.xml", "module.sha512", "module.module"):
             (maven / name).write_text("generated")
         (maven / "empty").mkdir()
@@ -98,6 +105,15 @@ class TaskMavenTests(unittest.TestCase):
     def candidate(self, build_id=None):
         build_id = build_id or self.build_id
         return next(row for row in self.manager.dry_run("task-a", "publisher") if row["buildId"] == build_id)
+
+    def test_fixed_host_zip_is_kept_in_publication_copy_and_inventory(self):
+        _, maven, _, bundle, lock = self.completed(host_zip=True)
+        self.assertTrue(self.candidate()["eligible"])
+        copies = json.loads((bundle / "inputs/publications.json").read_bytes())
+        host = [item for item in copies if "sushieric-datamodel-host-adapter-dev" in item["coordinate"]]
+        self.assertEqual(1, len(host))
+        self.assertEqual(lock["publications"][-1]["sha256"], host[0]["sha256"])
+        self.assertTrue(maven.exists())
 
     def test_only_selected_success_uuid_is_collected_after_handoff(self):
         first, maven, path, bundle, _ = self.completed()
