@@ -405,7 +405,7 @@ class Registry:
                 identifier(payload["owner"], "owner")
                 lifetime = ttl(payload["ttlSeconds"])
                 require(row["state"] == "AVAILABLE" and row["lease"] is None, "UNAVAILABLE", "枠は貸出中または復旧待ちです。期限切れでも自動回収しません")
-                result = {"instanceId": row["id"], "leaseId": uuid.uuid4().hex, "epoch": row["epoch"] + 1,
+                result = {"instanceId": row["id"], "leaseId": str(uuid.uuid4()), "epoch": row["epoch"] + 1,
                           "generation": row["generation"], "expiresAt": self.clock() + lifetime, "generationBound": False}
                 if not dry_run:
                     connection.execute("UPDATE instances SET state='LEASED_STOPPED',lease=?,owner=?,epoch=?,expires=?,generation_bound=0 WHERE id=?",

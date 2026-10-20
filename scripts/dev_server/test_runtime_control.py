@@ -140,7 +140,8 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.adapter = FakeAdapter(self.inventory)
         self.registry.runtime = RuntimeControl(self.registry, process_adapter=self.adapter)
         self.token = self.acquire()
-        self.prepare_payload = dict(self.token, artifactId=self.artifact, generationId="generation-01", seed=17, acceptEula=True)
+        self.prepare_payload = dict(self.token, artifactId=self.artifact, generationId=("generation-01" if getattr(self, "bundle_version", 2) == 1
+                                                                 else "00000000-0000-4000-8000-000000000001"), seed=17, acceptEula=True)
         self.stop_fault = None
         self.rcon_calls = 0
         self.rcon = patch("dev_server.runtime_control.runtime_rcon.stop", side_effect=self.rcon_stop)
@@ -163,7 +164,7 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
     def prepare(self):
         result = self.command("prepare", self.prepare_payload, "prepare-01")
         self.token["expectedGeneration"] = result["generation"]
-        return self.root / "instances/persistent-01/generations/generation-01"
+        return self.root / "instances/persistent-01/generations" / self.prepare_payload["generationId"]
 
     def start(self, operation="start-01"):
         return self.command("start", dict(self.token, timeoutSeconds=2), operation)
@@ -661,7 +662,7 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
                 busy = dispatch(self.registry, new_request("prepare", self.prepare_payload, operation_id="prepare-other"))
                 self.assertEqual("LOCK_BUSY", busy["error"]["code"])
                 second_token = self.acquire("persistent-02", "acquire-second-slot")
-                second = dict(second_token, artifactId=self.artifact, generationId="generation-02", seed=17, acceptEula=True)
+                second = dict(second_token, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000002", seed=17, acceptEula=True)
                 competing = dispatch(self.registry, new_request("prepare", second, operation_id="prepare-second-slot"))
                 self.assertEqual("LOCK_BUSY", competing["error"]["code"])
                 self.assertEqual("BUSY", dispatch(self.registry, new_request("shutdown", {}))["error"]["code"])

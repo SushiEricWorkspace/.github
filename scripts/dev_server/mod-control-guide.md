@@ -135,3 +135,10 @@ py -3.12 -B -m unittest discover -s scripts -p test_mod_control_wire.py -v
 start/stop待機が保持するinstance OS lockと4 worker poolへこのcontrolを共有すると
 handshakeが進まないため、別bounded受付を用意する必要があります。
 未接続の予約table・新daemon・汎用SQL/path・認証fallbackはこの先行成果に含めません。
+
+## 原bytes正本とUUIDの先行接続
+
+既runtime_operationsを使う未接続のMod専用readbackと、
+検証済みData runtimeだけに適用するUUID境界は
+[正本・UUIDガイド](mod-control-operations-guide.md)を参照してください。
+native受付・台帳最新性・停止成功は引き続き未接続です。
