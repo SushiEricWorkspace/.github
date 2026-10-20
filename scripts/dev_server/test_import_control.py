@@ -51,7 +51,7 @@ class ImportTests(unittest.TestCase):
             path.write_bytes(value)
         (self.source / "resources").mkdir()
         self.original = self.source_bytes()
-        self.payload = dict(self.token, artifactId=self.artifact, generationId="imported-01", acceptEula=True,
+        self.payload = dict(self.token, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000011", acceptEula=True,
                             sourceDirectory=str(self.source), sourceHash=None, sourceStopped=True,
                             approvedBy=self.inventory["operator"], taskId="issue-31-test", purpose="持込データの合成試験")
         self.template = next(name for name, system in IMPORTED_TEMPLATES.items() if system == platform.system())
@@ -64,7 +64,7 @@ class ImportTests(unittest.TestCase):
         self.payload["sourceHash"] = result["sourceHash"]
         result = self.command("import", self.payload, "import-source")
         self.token["expectedGeneration"] = result["generation"]
-        self.generation = self.root / "instances/persistent-01/generations/imported-01"
+        self.generation = self.root / "instances/persistent-01/generations/00000000-0000-4000-8000-000000000011"
         return result
 
     def validated(self):
@@ -74,9 +74,9 @@ class ImportTests(unittest.TestCase):
         self.command("snapshot", dict(self.token, action="create", snapshotId="private-01"), "snapshot-source")
         self.command("snapshot", dict(self.token, action="candidate", snapshotId="candidate-01", sourceSnapshotId="private-01"), "candidate-source")
         self.other = self.acquire("persistent-02", "acquire-other")
-        self.command("restore", dict(self.other, artifactId=self.artifact, generationId="restored-01", acceptEula=True,
+        self.command("restore", dict(self.other, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000012", acceptEula=True,
                                      snapshotId="candidate-01"), "restore-other")
-        self.other["expectedGeneration"] = "restored-01"
+        self.other["expectedGeneration"] = "00000000-0000-4000-8000-000000000012"
         self.command("start", dict(self.other, timeoutSeconds=2), "start-other")
         self.command("stop", dict(self.other, timeoutSeconds=2), "stop-other")
         self.validation = dict(self.other, action="validate", snapshotId="candidate-01", fixture=self.template, validationId="validation-01")
@@ -196,7 +196,7 @@ sys.stdin.readline()
         source_file.write_bytes(original_data)
         self.command("recover", recovery, "recover-import", True)
         result = self.command("recover", recovery, "recover-import")
-        self.assertEqual("imported-01", result["generation"])
+        self.assertEqual("00000000-0000-4000-8000-000000000011", result["generation"])
         self.assertEqual(self.original, self.source_bytes())
 
     def test_committed_import_recovery_completes_journal(self):
@@ -208,7 +208,7 @@ sys.stdin.readline()
             original(path, data, **kwargs)
         with patch("dev_server.generation_control.storage.write", side_effect=fail):
             self.assert_code("GENERATION_FAILED", lambda: self.command("import", self.payload, "import-source"))
-        self.token["expectedGeneration"] = "imported-01"
+        self.token["expectedGeneration"] = "00000000-0000-4000-8000-000000000011"
         recovery = dict(self.token, action="resume", targetOperationId="import-source", ttlSeconds=120)
         self.command("recover", recovery, "recover-import", True)
         self.command("recover", recovery, "recover-import")
@@ -222,9 +222,9 @@ sys.stdin.readline()
         promotion = dict(self.other, action="promote", snapshotId="candidate-01", templateId=self.template,
                          validationId="validation-01", approvedBy=self.inventory["operator"], taskId="issue-31-test", purpose="resetの初期world")
         self.command("snapshot", promotion, "promote-import")
-        self.command("reset", dict(self.other, artifactId=self.artifact, generationId="reset-01", acceptEula=True,
+        self.command("reset", dict(self.other, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000013", acceptEula=True,
                                    templateId=self.template), "reset-import")
-        reset = self.root / "instances/persistent-02/generations/reset-01"
+        reset = self.root / "instances/persistent-02/generations/00000000-0000-4000-8000-000000000013"
         self.assertEqual(b"existing-progress", (reset / "world/playerdata/player.dat").read_bytes())
         self.assertEqual(self.original, self.source_bytes())
 

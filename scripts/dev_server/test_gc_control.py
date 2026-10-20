@@ -100,14 +100,14 @@ class GcTests(unittest.TestCase):
     def test_immediate_previous_generation_is_always_protected(self):
         self.now = 104
         for index in (2, 3):
-            generation = "generation-0" + str(index)
+            generation = "00000000-0000-4000-8000-" + f"{index:012d}"
             payload = dict(self.token, artifactId=self.artifact, generationId=generation,
                            acceptEula=True, snapshotId="snapshot-4")
             self.command("restore", payload, "restore-" + str(index))
             self.token["expectedGeneration"] = generation
         references = [c["reference"] for c in self.plan()["candidates"]]
-        self.assertNotIn("generation:persistent-01/generation-02", references)
-        self.assertNotIn("generation:persistent-01/generation-03", references)
+        self.assertNotIn("generation:persistent-01/00000000-0000-4000-8000-000000000002", references)
+        self.assertNotIn("generation:persistent-01/00000000-0000-4000-8000-000000000003", references)
 
     def test_partial_unlink_failure_preserves_quarantine_and_blocks_new_gc(self):
         self.plan()

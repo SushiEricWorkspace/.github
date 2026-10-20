@@ -11,7 +11,7 @@ from .build_inputs import canonical, digest
 from .contracts import LAYOUT_ID
 from .local_ipc import decode, make_private, plain_path, require_private
 from .registry import RegistryError, fields, identifier, require, ttl
-from .runtime_bundle import launch_command, verify_bundle
+from .runtime_bundle import launch_command, verify_bundle, require_data_generation
 from .runtime_ports import instance_endpoints, reserve, prebind, require_listeners, socket_keys
 from . import runtime_process, runtime_rcon
 
@@ -164,7 +164,8 @@ class RuntimeControl:
                         "PROOF_REQUIRED", "前runの正常停止・保存終了を確認できません")
                 require(self.process_adapter.identity(previous["identity"]["pid"]) is None,
                         "PROCESS_MISMATCH", "前runのPIDが存在します。PID再利用も自動許可しません")
-            verify_bundle(generation / "runtime")
+            manifest = verify_bundle(generation / "runtime")
+            require_data_generation(manifest, row["generation"])
             self._space()
         else:
             require(row["state"] == "RUNNING" and row["run_id"] in self.processes,

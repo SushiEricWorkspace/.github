@@ -364,7 +364,7 @@ class HumanServer:
                             "ARTIFACT_MISMATCH", "保持する世代と指定artifactが一致しません")
             if mode != "keep":
                 require(options["acceptEula"] is True, "EULA_REQUIRED", "世代準備には--accept-eulaが必要です")
-                payload = {"artifactId": options["artifactId"], "generationId": uuid.uuid4().hex, "acceptEula": True}
+                payload = {"artifactId": options["artifactId"], "generationId": str(uuid.uuid4()), "acceptEula": True}
                 payload.update({"seed": options["seed"]} if mode == "prepare" else
                                {"templateId": options["templateId"]} if mode == "reset" else {"snapshotId": options["snapshotId"]})
                 steps.append((mode, payload, False))

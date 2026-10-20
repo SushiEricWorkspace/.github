@@ -204,8 +204,9 @@ class TaskWorktreesTest(unittest.TestCase):
         commit = git(self.root / "SushiEricDataModel", "rev-parse", "HEAD")
         prefix = [sys.executable, "-B", str(script), "--workspace-root", str(self.root),
                   "--task-id", "cli-task", "--issue", "100", "--owner", "owner"]
+        environment = dict(os.environ, PYTHONIOENCODING="utf-8")
         result = subprocess.run([*prefix, "--repos", "SushiEricServerMod",
-                                 "--dependency", f"SushiEricDataModel={commit}"], capture_output=True, text=True, encoding="utf-8")
+                                 "--dependency", f"SushiEricDataModel={commit}"], capture_output=True, text=True, encoding="utf-8", env=environment)
         self.assertEqual(0, result.returncode, result.stderr)
         records = json.loads(result.stdout)
         self.assertEqual("dependency", records[0]["repos"][0]["kind"])
@@ -216,7 +217,7 @@ class TaskWorktreesTest(unittest.TestCase):
                      ("--repos", "SushiEricDataModel", "--dependency", f"SushiEricDataModel={commit}"),
                      ("--repos", "SushiEricDataModel,SushiEricServerMod")):
             with self.subTest(args=args):
-                result = subprocess.run([*prefix, *args], capture_output=True, text=True, encoding="utf-8")
+                result = subprocess.run([*prefix, *args], capture_output=True, text=True, encoding="utf-8", env=environment)
                 self.assertNotEqual(0, result.returncode)
                 self.assertEqual(before, self.manager.list())
 

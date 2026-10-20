@@ -10,7 +10,7 @@ from .build_inputs import canonical, digest, regular_bytes
 from .contracts import LAYOUT_ID, absolute_path, require_compatible
 from .local_ipc import make_private, plain_path, require_private
 from .registry import RegistryError, fields, identifier, require, ttl
-from .runtime_bundle import verify_bundle, _files
+from .runtime_bundle import verify_bundle, require_data_generation, _files
 from .runtime_control import TOKEN, read_json
 from .runtime_ports import instance_endpoints
 from .snapshot_control import verify_snapshot
@@ -152,6 +152,7 @@ class GenerationControl:
                 "EXISTING_DATA", "prepare/template-initは初回の空枠だけに使用します")
         bundle = self.registry.root / "artifacts" / payload["artifactId"]
         artifact = verify_bundle(bundle)
+        require_data_generation(artifact, payload["generationId"])
         require(artifact["artifactId"] == payload["artifactId"] and artifact["layoutId"] == LAYOUT_ID,
                 "ARTIFACT_MISMATCH", "artifactまたはlayoutが一致しません")
         manifest = self._source(command, payload)

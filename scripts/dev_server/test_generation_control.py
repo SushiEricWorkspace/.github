@@ -29,8 +29,11 @@ class GenerationTests(unittest.TestCase):
     def setUp(self):
         snapshot_tests.SnapshotTests.setUp(self)
         self.create()
-        self.restore = dict(self.token, artifactId=self.artifact, generationId="generation-02", acceptEula=True, snapshotId="snapshot-01")
-        self.new = self.generation.parent / "generation-02"
+        generation = ("generation-02" if getattr(self, "bundle_version", 2) == 1
+                      else "00000000-0000-4000-8000-000000000002")
+        self.restore = dict(self.token, artifactId=self.artifact, generationId=generation,
+                            acceptEula=True, snapshotId="snapshot-01")
+        self.new = self.generation.parent / self.restore["generationId"]
 
     def recover(self, target="restore-01", action="resume", dry=False, operation="recover-01"):
         payload = dict(self.token, action=action, targetOperationId=target, ttlSeconds=120)
@@ -44,9 +47,9 @@ class GenerationTests(unittest.TestCase):
         self.assertNotEqual((self.new / "server.properties").read_bytes(), (self.generation / "server.properties").read_bytes())
         self.assertFalse((self.new / "world/session.lock").exists())
         self.assertEqual(1, len(self.adapter.created))
-        self.assertEqual("generation-02", self.state()["generation"])
+        self.assertEqual(self.restore["generationId"], self.state()["generation"])
         self.assertTrue(self.command("restore", self.restore, "restore-01")["replayed"])
-        self.token["expectedGeneration"] = "generation-02"
+        self.token["expectedGeneration"] = self.restore["generationId"]
         self.start("new-start")
         self.stop("new-stop")
 
@@ -71,7 +74,7 @@ class GenerationTests(unittest.TestCase):
         payload["templateId"] = "smoke-v1"
         with self.assertRaises((OSError, RegistryError)):
             self.command("reset", payload, "reset-01")
-        self.assertEqual("generation-01", self.state()["generation"])
+        self.assertEqual(self.prepare_payload["generationId"], self.state()["generation"])
         self.assertFalse(self.new.exists())
 
     def test_reset_unregistered_reference_is_not_operator_approval(self):
@@ -83,7 +86,7 @@ class GenerationTests(unittest.TestCase):
         del payload["snapshotId"]
         payload["templateId"] = "smoke-v1"
         self.assert_code("INVALID_INPUT", lambda: self.command("reset", payload, "reset-01"))
-        self.assertEqual("generation-01", self.state()["generation"])
+        self.assertEqual(self.prepare_payload["generationId"], self.state()["generation"])
         self.assertFalse(self.new.exists())
 
     def test_expiry_during_copy_is_fenced_and_explicit_recovery_renews(self):
@@ -94,12 +97,12 @@ class GenerationTests(unittest.TestCase):
         with patch.object(self.registry.generation, "_build", side_effect=expire):
             self.assert_code("LEASE_EXPIRED", lambda: self.command("restore", self.restore, "restore-01"))
         self.recover()
-        self.assertEqual("generation-02", self.state()["generation"])
+        self.assertEqual(self.restore["generationId"], self.state()["generation"])
 
     def test_old_expected_generation_and_changed_recovery_action_rejected(self):
         self.command("restore", self.restore, "restore-01")
-        self.assert_code("STALE_GENERATION", lambda: self.command("restore", dict(self.restore, generationId="generation-03"), "restore-stale"))
-        self.token["expectedGeneration"] = "generation-02"
+        self.assert_code("STALE_GENERATION", lambda: self.command("restore", dict(self.restore, generationId="00000000-0000-4000-8000-000000000003"), "restore-stale"))
+        self.token["expectedGeneration"] = self.restore["generationId"]
         self.registry.begin_supervision()
         self.registry.begin_supervision()
         self.recover(target=None)
@@ -123,7 +126,7 @@ class GenerationTests(unittest.TestCase):
                 self.token["expectedGeneration"] = current
                 self.recover(dry=True)
                 result = self.recover()
-                self.assertEqual("generation-02", result["generation"])
+                self.assertEqual(self.restore["generationId"], result["generation"])
                 self.assertTrue(self.recover()["replayed"])
                 self.assertTrue(self.generation.exists())
                 self.assertTrue(self.new.exists())
@@ -136,8 +139,8 @@ class GenerationTests(unittest.TestCase):
             return original(source, destination, replace=replace)
         with patch.object(storage, "move", side_effect=fail):
             self.assert_code("GENERATION_FAILED", lambda: self.command("restore", self.restore, "restore-01"))
-        self.assertEqual("generation-01", read_json(self.generation.parent.parent / "active.json")["generationId"])
-        self.assertEqual("generation-02", self.recover()["generation"])
+        self.assertEqual(self.prepare_payload["generationId"], read_json(self.generation.parent.parent / "active.json")["generationId"])
+        self.assertEqual(self.restore["generationId"], self.recover()["generation"])
 
     def test_partial_copy_can_only_rollback_and_keeps_bytes(self):
         original = self.registry.generation._write_tree
@@ -156,7 +159,7 @@ class GenerationTests(unittest.TestCase):
         files = list(stage.rglob("*"))
         self.recover(action="rollback")
         self.assertEqual(files, list(stage.rglob("*")))
-        self.assertEqual("generation-01", self.state()["generation"])
+        self.assertEqual(self.prepare_payload["generationId"], self.state()["generation"])
 
     def test_corrupt_new_generation_cannot_resume(self):
         with patch.object(self.registry.generation, "_commit", side_effect=OSError("切替前停止")):
@@ -205,7 +208,7 @@ class GenerationTests(unittest.TestCase):
             return original(path, data, **kwargs)
         with patch.object(storage, "write", side_effect=fail):
             self.assert_code("GENERATION_FAILED", lambda: self.command("restore", self.restore, "restore-01"))
-        self.token["expectedGeneration"] = "generation-02"
+        self.token["expectedGeneration"] = self.restore["generationId"]
         self.recover()
         journal = self.root / "manager/operations/generation-restore-01"
         self.assertTrue((journal / "committed.json.writing").exists())
@@ -213,7 +216,7 @@ class GenerationTests(unittest.TestCase):
 
     def test_initial_partial_prepare_rollback_preserves_and_reuses_slot(self):
         token = self.acquire("persistent-02", "acquire-second")
-        payload = dict(token, artifactId=self.artifact, generationId="initial-02", seed=1, acceptEula=True)
+        payload = dict(token, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000004", seed=1, acceptEula=True)
         with patch.object(self.registry.generation, "_write_tree", side_effect=OSError("初回コピー障害")):
             self.assert_code("GENERATION_FAILED", lambda: self.command("prepare", payload, "initial-prepare"))
         self.command("recover", dict(token, action="rollback", targetOperationId="initial-prepare", ttlSeconds=120), "initial-rollback")
@@ -222,7 +225,7 @@ class GenerationTests(unittest.TestCase):
 
     def test_initial_journal_failure_before_root_can_rollback(self):
         token = self.acquire("persistent-02", "acquire-second")
-        payload = dict(token, artifactId=self.artifact, generationId="initial-02", seed=1, acceptEula=True)
+        payload = dict(token, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000004", seed=1, acceptEula=True)
         with patch.object(storage, "mkdir", side_effect=OSError("journal作成前")):
             self.assert_code("GENERATION_FAILED", lambda: self.command("prepare", payload, "initial-prepare"))
         self.command("recover", dict(token, action="rollback", targetOperationId="initial-prepare", ttlSeconds=120), "initial-rollback")
@@ -244,7 +247,7 @@ class GenerationTests(unittest.TestCase):
 
     def test_initial_rollback_database_gap_keeps_request_for_replay(self):
         token = self.acquire("persistent-02", "acquire-second")
-        payload = dict(token, artifactId=self.artifact, generationId="initial-02", seed=1, acceptEula=True)
+        payload = dict(token, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000004", seed=1, acceptEula=True)
         with patch.object(storage, "mkdir", side_effect=OSError("journal作成前")):
             self.assert_code("GENERATION_FAILED", lambda: self.command("prepare", payload, "initial-prepare"))
         original = self.registry.transaction

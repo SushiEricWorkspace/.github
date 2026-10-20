@@ -32,7 +32,7 @@ class TemplateInitializationTests(unittest.TestCase):
         self.target.bundle_fixture.classes.joinpath("Test.class").write_bytes(b"new-mod-build")
         bundle = self.target.bundle_fixture.freeze()
         shutil.copytree(bundle, self.target.root / "artifacts" / bundle.name)
-        self.payload = dict(self.target.token, artifactId=bundle.name, generationId="initial-35", acceptEula=True,
+        self.payload = dict(self.target.token, artifactId=bundle.name, generationId="00000000-0000-4000-8000-000000000035", acceptEula=True,
                             sourceRoot=str(self.source.root), templateId=self.source.template, templateHash=None,
                             approvedBy=self.target.inventory["operator"], taskId="issue-35-test", purpose="新ビルドの実機確認")
 
@@ -49,8 +49,8 @@ class TemplateInitializationTests(unittest.TestCase):
         self.assertNotEqual(self.source.artifact, self.payload["artifactId"])
         manifest = (self.source.root / "snapshots/candidate-01/manifest.json").read_bytes()
         self.initialize()
-        self.target.token["expectedGeneration"] = "initial-35"
-        generation = self.target.root / "instances/persistent-01/generations/initial-35"
+        self.target.token["expectedGeneration"] = "00000000-0000-4000-8000-000000000035"
+        generation = self.target.root / "instances/persistent-01/generations/00000000-0000-4000-8000-000000000035"
         self.assertEqual(b"existing-progress", (generation / "world/playerdata/player.dat").read_bytes())
         self.assertEqual(self.source.original, self.source.source_bytes())
         self.assertEqual(manifest, (self.source.root / "snapshots/candidate-01/manifest.json").read_bytes())
@@ -114,7 +114,7 @@ class TemplateInitializationTests(unittest.TestCase):
         recovery = dict(self.target.token, action="resume", targetOperationId="template-init-35", ttlSeconds=120)
         self.assertTrue(self.target.command("recover", recovery, "resume-35", True)["dryRun"])
         self.target.command("recover", recovery, "resume-35")
-        self.assertEqual("initial-35", self.target.state()["generation"])
+        self.assertEqual("00000000-0000-4000-8000-000000000035", self.target.state()["generation"])
 
     def test_reset_still_rejects_new_artifact(self):
         self.payload["sourceRoot"] = str(self.target.root)
@@ -123,7 +123,7 @@ class TemplateInitializationTests(unittest.TestCase):
                         self.source.root / "artifacts" / self.payload["artifactId"])
         with self.assertRaisesRegex(ContractError, "compatibility"):
             self.source.command("reset", dict(
-                self.source.other, artifactId=self.payload["artifactId"], generationId="invalid-reset", acceptEula=True,
+                self.source.other, artifactId=self.payload["artifactId"], generationId="00000000-0000-4000-8000-000000000036", acceptEula=True,
                 templateId=self.source.template), "reset-35")
 
     def test_wrong_os_bundle_is_rejected_before_copy(self):

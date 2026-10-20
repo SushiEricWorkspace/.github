@@ -36,7 +36,7 @@ class LegacyRuntimeTests(unittest.TestCase):
         self.command("restore", self.restore, "legacy-restore")
         self.assertEqual((self.generation / "world/level.dat").read_bytes(), (self.new / "world/level.dat").read_bytes())
         self.assertEqual(self.artifact, verify_bundle(self.new / "runtime")["artifactId"])
-        self.token["expectedGeneration"] = "generation-02"
+        self.token["expectedGeneration"] = self.restore["generationId"]
         self.start("legacy-start")
         self.stop("legacy-stop")
         self.assertEqual(before, self.bundle_hashes())
@@ -47,7 +47,8 @@ class LegacyRuntimeTests(unittest.TestCase):
         newer = self.bundle_fixture.freeze()
         shutil.copytree(newer, self.root / "artifacts" / newer.name)
         self.assertEqual(2, verify_bundle(newer)["schemaVersion"])
+        request = dict(self.restore, artifactId=newer.name, generationId="00000000-0000-4000-8000-000000000002")
         with self.assertRaisesRegex(ContractError, "compatibility"):
-            self.command("restore", dict(self.restore, artifactId=newer.name), "wrong-artifact")
-        self.assertFalse(self.new.exists())
+            self.command("restore", request, "wrong-artifact")
+        self.assertFalse((self.generation.parent / request["generationId"]).exists())
         self.assertEqual(before, self.bundle_hashes())

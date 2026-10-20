@@ -7,6 +7,7 @@ import re
 import shutil
 import stat
 import tempfile
+import uuid
 from pathlib import Path
 
 from .build_inputs import canonical, digest, portable_lock, regular_bytes, verify_sources
@@ -16,6 +17,22 @@ from .contracts import ContractError, LAYOUT_ID, validate, validate_relative_pat
 def _require(condition: bool, message: str):
     if not condition:
         raise ContractError(message)
+
+
+def require_data_generation(manifest: dict, generation: str) -> None:
+    """verify_bundle済みDataModel runtime（v2）の管理世代だけをcanonical UUIDへ限定する。
+
+    旧Common runtime（v1）やtemplateId等の名前は対象にせず、既存値を変換しない。
+    """
+    if manifest["schemaVersion"] != 2:
+        return
+    message = "DataModel runtimeの管理世代はcanonical UUIDで指定してください"
+    _require(type(generation) is str, message)
+    try:
+        canonical = str(uuid.UUID(generation))
+    except ValueError:
+        raise ContractError(message) from None
+    _require(canonical == generation, message)
 
 
 def _directory(path: Path):

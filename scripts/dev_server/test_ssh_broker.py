@@ -362,7 +362,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_two_connections_two_slots_do_not_mix_save_or_response(self):
         token = self.fixture.acquire("persistent-02", "second-acquire")
-        prepared = self.fixture.command("prepare", dict(token, artifactId=self.fixture.artifact, generationId="generation-02", seed=18, acceptEula=True), "second-prepare")
+        prepared = self.fixture.command("prepare", dict(token, artifactId=self.fixture.artifact, generationId="00000000-0000-4000-8000-000000000002", seed=18, acceptEula=True), "second-prepare")
         token["expectedGeneration"] = prepared["generation"]
         self.fixture.command("start", dict(token, timeoutSeconds=2), "second-start")
         started = self.fixture.command("status", {"instanceId": "persistent-02"})["instances"][0]
