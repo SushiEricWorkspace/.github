@@ -142,3 +142,18 @@ handshakeが進まないため、別bounded受付を用意する必要があり�
 検証済みData runtimeだけに適用するUUID境界は
 [正本・UUIDガイド](mod-control-operations-guide.md)を参照してください。
 native受付・台帳最新性・停止成功は引き続き未接続です。
+
+
+## wire2 pure契約（未接続）
+
+`decode_frame_v2`、`correlate_response_v2`、`correlate_grant_v2`、`correlate_binding_v2`、`same_request_v2`は外wire2専用です。descriptorは既version1、profile証拠はinner version1であり、v1や異版errorへのfallbackはありません。v1の関数・vectorは維持します。通常launch、native本人/peer/実ロード元、Data begin、journal、Management受付には接続していません。
+
+Pが検証済み原本から作るcontextはexact `{descriptorJson, owner, management, expectedEvidence}`。descriptorJsonは元UTF-8文字列、expectedEvidenceはexact `{platform,jdk,profileSha256,codeSources,mods,nativeSources}`です。Mから受けた証拠をexpectedへコピーして承認してはいけません。管理Data境界のlease/generationはcanonical UUIDを要求し、旧32桁値を自動変換しません。
+
+EvidenceのTextNは非空・NUL禁止・UTF8 byte上限（whitespace単独可）、既identity/binding/Data抽出のnotBlankとは区別します。各source/native/mod idとsourceIdsはstrict昇順で重複を拒否し、承認集合とorigin/identityを完全一致させます。Darwin OS_CACHE_IMAGEは同OS buildの承認cache/image UUIDを必要とします。
+
+GRANTは元HELLOの証拠hash、ACKは元BOUNDの証拠hashをechoし、各応答/errorは元body全bytesのhashへ相関します。BOUNDの`pre_evidence_json`はcallerが元HELLOから保持した原文です。PREとBOUNDはcheckpoint以外の構造・集合・originが同一で、rawhash同一は要求しません。意味同でも別rawのrequestは同要求readbackではありません。
+
+完成frameは4byteBE込み65536以下、body1..65532。innerの二重escapeとBOUNDのData status原文も含めて検査し、切捨て/分割/外部参照をしません。共有`mod-control-vectors-v2.json`と別境界vectorは合成値です。Data全モデル・serializer hash・最大status・実candidate収容・native/OS受入を証明しません。Data原文へEvidenceのexact-field/null拒否を再帰適用せず、既相関抽出とData側最終検証を維持します。
+
+共有vectorのbodyHex/frameHexが元bytesです。表示用bodyUtf8やcandidate metadataはAPIのcontextへ渡しません。両言語のencoderをcanonical化する契約はなく、それぞれの原bytesをhashし相互decodeします。native/実profile/peer/台帳耐久性/停止成功/各OS受入は後続の結合・明示許可検証まで未完です。
