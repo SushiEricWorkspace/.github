@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "purpose": "managed-argfile-byte-vectors",
+  "status": "design static expected bytes; no validator/native execution",
+  "cases": [
+    {
+      "id": "utf8-japanese-space-backslash",
+      "platform": "Darwin",
+      "argfileEncoding": "utf-8",
+      "arguments": [
+        "-Dfixture=日本語",
+        "C:\\a b\\lib.jar",
+        "example.Main",
+        "nogui"
+      ],
+      "expectedHex": "222d44666978747572653de697a5e69cace8aa9e220a22433a5c5c6120625c5c6c69622e6a6172220a226578616d706c652e4d61696e220a226e6f677569220a"
+    },
+    {
+      "id": "windows31j-japanese-space-backslash",
+      "platform": "Windows",
+      "argfileEncoding": "windows-31j",
+      "arguments": [
+        "-Dfixture=日本語",
+        "C:\\a b\\lib.jar",
+        "example.Main",
+        "nogui"
+      ],
+      "expectedHex": "222d44666978747572653d93fa967b8cea220a22433a5c5c6120625c5c6c69622e6a6172220a226578616d706c652e4d61696e220a226e6f677569220a"
+    },
+    {
+      "id": "utf8-quote-trailing-backslash",
+      "platform": "Windows",
+      "argfileEncoding": "utf-8",
+      "arguments": [
+        "a\"b",
+        "tail\\"
+      ],
+      "expectedHex": "22615c2262220a227461696c5c5c220a"
+    }
+  ]
+}
