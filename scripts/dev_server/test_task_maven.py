@@ -440,6 +440,8 @@ class TaskMavenTests(unittest.TestCase):
         receipt_path = fixture.lock.with_suffix(".receipt.json")
         receipt = json.loads(receipt_path.read_bytes())
         self.assertEqual(output["artifactId"], receipt["artifactId"])
+        self.assertIsNone(output["managedCandidate"])
+        self.assertEqual("--managed-profile未指定", output["managedCandidateReason"])
         verify_bundle(Path(output["bundle"]))
         first = receipt_path.read_bytes()
         result = subprocess.run(arguments, capture_output=True, text=True, encoding="utf-8", env=environment)
