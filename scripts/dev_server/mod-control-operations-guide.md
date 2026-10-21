@@ -1,6 +1,6 @@
 # Mod control原bytes正本とData UUID境界（先行実装）
 
-Refs #64。mod_control_operations.pyはMod専用wire v1の要求/応答原文を、
+Refs #64。mod_control_operations.pyはMod専用wire v2の要求/応答原文を、
 既runtime_operations内へ保存する未接続の先行成果です。
 既start/stop/writerのfingerprint・replayed応答契約を横断変更していません。
 native endpoint、peer認証、instance/run/lease/世代の受付排他、
@@ -8,7 +8,7 @@ writer台帳・native作用・停止成功・observer起動へは接続してい
 
 ## 原bytesと同要求readback
 
-既wire parser/correlate_responseを使用し、schemaやData型を再定義しません。
+既wire2 parser/correlate_response_v2を使用し、schemaやData型を再定義しません。
 commandはmod-control/<元request phase>、fingerprintは元request bodyのSHA-256です。
 既response TEXTのJSON内部へrequestBodyUtf8/responseBodyUtf8を保持し、
 schema/table/columnは追加していません。
@@ -91,3 +91,14 @@ argfileの共有encoding名はutf-8/windows-31jだけ。DLI/remapはUTF-8で、a
 この関数はfile/OS/環境を読まずprocessも起動しません。通常launch_commandへは未接続です。profile自体の承認、実contextの本人/descriptor実体、native origin、wire2、台帳、Mac artifact/運用受入を検証した扱いにしません。実接続時はP正本/承認profileを先に確定する必要があります。
 
 引数・context・env値のASCII control（U+0000–U+001FとDEL U+007F）も拒否します。DLIだけは仕様上のLF/TABを許可し、DELは許可しません。
+
+
+## wire2保存入口と旧行の保全
+
+保存入口はwire2専用です。wire1 codecと原vector自体は維持しますが、このmoduleでは版の自動選択やv1 fallbackをしません。旧v1要求は更新前に拒否し、同IDの旧行はfingerprint/原要求bytes不一致で拒否します。保存応答がv1ならwire2相関検証で拒否し、旧行を変換・削除・再生成しません。未リリースの旧開発記録は保全対象であり、新要求への移行処理はありません。
+
+API引数・戻り値、runtime_operationsの6列、command/status、requestBodyUtf8/responseBodyUtf8の保存形式は変更しません。原bodyのversionもhashとbytes全体へ含まれ、同構造でも別rawの要求は同要求readbackではありません。HELLO/BOUNDの証拠hash echo等は既wire2へ委譲し、Data全モデルやP正本contextの新validatorを増やしません。
+
+P正本context/native本人/run/lease/世代の確認は将来callerの責務です。保存入口が確認するinstance/command/operationId/元body SHA/raw一致だけで認証済みと扱いません。現在の製品callerは未接続で、start/stop・writer close・別phase間の最新台帳排他は今回の範囲外です。
+
+同operationのPENDING/UNKNOWN再提示は再作用0。unknown先行後のcompleteは拒否し、complete先行後のunknownは確定応答を保持します。異なる終端bytesは拒否します。新IDによる自動再送を許可するものではありません。SQLite接続close時の未commit予約rollback、commit済みPENDING/UNKNOWNの再open後readbackは局所試験で確認しますが、writer実終了・実FS停電耐久・OS/native受入は証明しません。

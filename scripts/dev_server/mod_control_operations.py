@@ -1,9 +1,9 @@
-"""Mod専用要求の原bytesを既runtime_operationsへ保持する。native受付には未接続。"""
+"""Mod wire2専用要求の原bytesを既runtime_operationsへ保持する。native受付には未接続。"""
 import json
 import struct
 
 from .local_ipc import decode
-from .mod_control_wire import correlate_response, decode_frame, sha256
+from .mod_control_wire import correlate_response_v2, decode_frame_v2, sha256
 from .registry import fields, identifier, require
 
 COMMAND = "mod-control/"
@@ -17,7 +17,7 @@ def _frame(body):
 def _entry(connection, instance_id, request_frame):
     require(connection.in_transaction, "INVALID_STATE", "呼出元の短いtransactionが必要です")
     identifier(instance_id, "instanceId")
-    request = decode_frame(request_frame)
+    request = decode_frame_v2(request_frame)
     require(request["type"] == "request", "INVALID_INPUT", "Mod control requestが必要です")
     row = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (request["operationId"],)).fetchone()
     if row is None:
@@ -32,7 +32,7 @@ def _entry(connection, instance_id, request_frame):
     require(record["requestBodyUtf8"].encode("utf-8") == request_frame[4:],
             "OPERATION_CONFLICT", "同じoperationIdへ異なる原bytesを指定できません")
     response = _frame(record["responseBodyUtf8"])
-    decoded = correlate_response(request_frame, response)
+    decoded = correlate_response_v2(request_frame, response)
     if row["status"] == "COMPLETED":
         require(decoded["type"] == "response" or decoded["payload"]["outcome"] == "REJECTED_BEFORE_EFFECT",
                 "RECOVERY_REQUIRED", "完了したcontrol応答が不正です")
@@ -69,7 +69,7 @@ def reserve(connection, instance_id: str, request_frame: bytes) -> bytes | None:
     pending = dict(request, type="error", payload={
         "requestBodySha256": sha256(request_frame[4:]), "code": "CONTROL_PENDING", "outcome": "PENDING"})
     body = json.dumps(pending, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    correlate_response(request_frame, _frame(body))
+    correlate_response_v2(request_frame, _frame(body))
     record = {"requestBodyUtf8": request_frame[4:].decode("utf-8"), "responseBodyUtf8": body}
     connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
                        (request["operationId"], sha256(request_frame[4:]), COMMAND + request["phase"], instance_id,
@@ -81,7 +81,7 @@ def complete(connection, instance_id: str, request_frame: bytes, response_frame:
     """PENDINGへ相関済み終端応答を保存する。完了済みは同bytesだけ許可し、不明状態へ再作用しない。"""
     request, row, saved = _entry(connection, instance_id, request_frame)
     require(row is not None, "INVALID_STATE", "元control予約がありません")
-    result = correlate_response(request_frame, response_frame)
+    result = correlate_response_v2(request_frame, response_frame)
     require(result["type"] == "response" or result["payload"]["outcome"] == "REJECTED_BEFORE_EFFECT",
             "INVALID_INPUT", "完了には成功または作用前拒否の終端応答が必要です")
     if row["status"] == "COMPLETED":
@@ -104,7 +104,7 @@ def unknown(connection, instance_id: str, request_frame: bytes) -> bytes:
         "requestBodySha256": sha256(request_frame[4:]), "code": "CONTROL_UNKNOWN", "outcome": "UNKNOWN"})
     body = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     response = _frame(body)
-    correlate_response(request_frame, response)
+    correlate_response_v2(request_frame, response)
     record = {"requestBodyUtf8": request_frame[4:].decode("utf-8"), "responseBodyUtf8": body}
     connection.execute("UPDATE runtime_operations SET status='RECOVERY_REQUIRED',response=? WHERE id=?",
                        (json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")), request["operationId"]))
