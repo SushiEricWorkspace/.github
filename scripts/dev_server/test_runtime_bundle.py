@@ -1,17 +1,20 @@
 """小さな合成runtimeでコピー・パス除去・改変拒否を検証する。Minecraft起動試験とは区別する。"""
 
+from copy import deepcopy
 import io
 import json
 import os
+import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from dev_server.build_inputs import canonical, capture_sources, digest
 from dev_server.contracts import ContractError
-from dev_server.runtime_bundle import freeze, launch_command, verify_bundle
+from dev_server.runtime_bundle import freeze, launch_command, verify_bundle, validate_bundle_managed_launch
 
 
 def saved_v1_bundle(store: Path) -> Path:
@@ -319,3 +322,171 @@ class RuntimeBundleTests(unittest.TestCase):
         (bundle / "runtime.json").write_bytes(canonical(manifest))
         with self.assertRaises(ContractError):
             verify_bundle(bundle)
+
+    def managed_candidate(self):
+        base = self.freeze()
+        source = json.loads((base / "launch/profiles.json").read_bytes())["profiles"]["server"]
+        names = ("instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest",
+                 "controlDescriptor", "controlDescriptorSha256")
+        self.managed_additions = ["-Dsushieric.managed." + key + "=${" + key + "}" for key in names]
+        self.managed_additions += ["-XX:+DisableAttachMechanism", "-Djava.io.tmpdir=${privateTmp}",
+                                   "-Dorg.sqlite.tmpdir=${privateTmp}"]
+        profile = {"version": 1, "purpose": "managed-launch-exact", "role": "M", "platform": platform.system(),
+                   "argfileEncoding": "utf-8", "mainClass": source["mainClass"], "classpath": source["classpath"],
+                   "jvmArgs": [value.replace("${run}/.launch", "${auxiliary}") for value in source["jvmArgs"]]
+                              + self.managed_additions,
+                   "args": source["args"], "environment": {"TMPDIR": "${privateTmp}"},
+                   "dliText": (base / "launch/server-launch.cfg").read_bytes().decode("utf-8")
+                              .replace("${run}/.launch", "${auxiliary}"),
+                   "remapClasspath": [value[len("${bundle}/"):] for value in
+                                      (base / "launch/server-remap-classpath.txt").read_text().split(os.pathsep)]}
+        path = self.root / "explicit-profile.json"
+        path.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return base, profile, path
+
+    def freeze_managed(self, path):
+        self.recipe_path.write_bytes(canonical(self.recipe))
+        return freeze(self.recipe_path, self.lock, self.store, managed_profile_path=path)
+
+    def independent_launch_inputs(self, base, bundle):
+        # candidateを読まず、元exportと呼出側の明示設定から別の起動入力を生成する。
+        source = json.loads((base / "launch/profiles.json").read_bytes())["profiles"]["server"]
+        run, auxiliary, private = [self.root / name for name in ("generation", "auxiliary", "private-tmp")]
+        context = {"bundle": str(bundle), "run": str(run), "auxiliary": str(auxiliary), "privateTmp": str(private),
+                   "controlDescriptor": str(self.root / "control/mod-control.json"),
+                   "runtimeManifest": str(bundle / "runtime.json"), "proofPath": str(self.root / "proof.json"),
+                   "instanceId": "slot-a", "generationId": "00000000-0000-4000-8000-000000000001",
+                   "startNonce": "nonce-a", "controlDescriptorSha256": "a" * 64}
+        import re
+        expand = lambda value: re.sub(r"\$\{([^{}]+)\}", lambda match: context[match[1]], value)
+        original = [value.replace("${run}/.launch", str(auxiliary)).replace("${bundle}", str(bundle))
+                    for value in source["jvmArgs"]]
+        arguments = [*original, *map(expand, self.managed_additions), "-cp",
+                     os.pathsep.join(str(bundle / value) for value in source["classpath"]),
+                     source["mainClass"], *source["args"]]
+        argfile = b"\n".join(json.dumps(value.encode("utf-8").decode("latin-1"), ensure_ascii=False).encode("latin-1")
+                              for value in arguments) + b"\n"
+        dli = (base / "launch/server-launch.cfg").read_bytes().decode("utf-8")
+        dli = dli.replace("${run}/.launch", str(auxiliary)).replace("${bundle}", str(bundle))
+        if os.name == "nt":
+            dli = dli.replace("\n", "\r\n")
+        remap = (base / "launch/server-remap-classpath.txt").read_bytes().decode("utf-8")
+        remap = remap.replace("${bundle}/", str(bundle) + os.sep)
+        if os.name == "nt":
+            remap = remap.replace("/", "\\")
+        auxiliary.mkdir()
+        for name, data in {"java.args": argfile, "server-launch.cfg": dli.encode("utf-8"),
+                           "server-remap-classpath.txt": remap.encode("utf-8")}.items():
+            (auxiliary / name).write_bytes(data)
+        observed = {"argv": [str(bundle / "jdk/bin" / ("java.exe" if os.name == "nt" else "java")),
+                             "@" + str(auxiliary / "java.args")], "cwd": str(run),
+                    "environment": {"TMPDIR": str(private)},
+                    "auxiliaryFiles": {name: (auxiliary / name).read_bytes() for name in
+                                       ("java.args", "server-launch.cfg", "server-remap-classpath.txt")}}
+        return context, observed
+
+    def test_explicit_candidate_raw_binding_and_independent_readback(self):
+        base, _, path = self.managed_candidate()
+        original = path.read_bytes()
+        bundle = self.freeze_managed(path)
+        candidate = bundle / "launch/managed-server-candidate.json"
+        self.assertEqual(original, candidate.read_bytes())
+        self.assertNotEqual(base, bundle)
+        self.assertFalse((base / candidate.relative_to(bundle)).exists())
+        entry = next(e for e in verify_bundle(bundle)["files"] if e["path"] == candidate.relative_to(bundle).as_posix())
+        self.assertEqual(digest(original), entry["sha256"])
+        context, observed = self.independent_launch_inputs(base, bundle)
+        before = deepcopy((context, observed))
+        self.assertIsNone(validate_bundle_managed_launch(bundle, context, observed))
+        self.assertEqual(before, (context, observed))
+        observed["auxiliaryFiles"]["java.args"] += b"\n"
+        with self.assertRaises(ContractError):
+            validate_bundle_managed_launch(bundle, context, observed)
+
+    def test_candidate_rejects_source_mismatch_and_unapproved_jvm_delta(self):
+        _, profile, path = self.managed_candidate()
+        changes = {"main": lambda p: p.update(mainClass="different.Main"),
+                   "classpath": lambda p: p["classpath"].reverse(),
+                   "args": lambda p: p.update(args=["different"]),
+                   "dli": lambda p: p.update(dliText=p["dliText"] + "\n"),
+                   "remap": lambda p: p["remapClasspath"].reverse(),
+                   "missing-original": lambda p: p["jvmArgs"].remove("-Dfabric.dli.env=server"),
+                   "overridden-original": lambda p: p["jvmArgs"].__setitem__(1, "-Dfabric.dli.env=client"),
+                   "extra-native": lambda p: p["jvmArgs"].append("-Djna.nosys=true"),
+                   "extra-heap": lambda p: p["jvmArgs"].append("-Xmx8g"),
+                   "missing-managed": lambda p: p["jvmArgs"].remove("-Dsushieric.managed.startNonce=${startNonce}"),
+                   "implicit-encoding": lambda p: p.update(argfileEncoding="mbcs"),
+                   "implicit-env": lambda p: p.pop("environment")}
+        for name, change in changes.items():
+            with self.subTest(name=name):
+                value = deepcopy(profile)
+                change(value)
+                path.write_bytes(canonical(value))
+                with self.assertRaises(ContractError):
+                    self.freeze_managed(path)
+
+    def test_candidate_input_json_rejects_duplicate_and_invalid_utf8(self):
+        _, profile, path = self.managed_candidate()
+        for raw in (b'{"version":1,"version":1}', b'\xff', canonical(dict(profile, version=True))):
+            with self.subTest(raw=raw[:30]):
+                path.write_bytes(raw)
+                with self.assertRaises(ContractError):
+                    self.freeze_managed(path)
+
+    def test_absent_candidate_keeps_bundle_valid_but_readback_refuses(self):
+        bundle = self.freeze()
+        self.assertFalse((bundle / "launch/managed-server-candidate.json").exists())
+        verify_bundle(bundle)
+        with self.assertRaises(ContractError):
+            validate_bundle_managed_launch(bundle, {}, {})
+        legacy = saved_v1_bundle(self.root / "legacy")
+        verify_bundle(legacy)
+        with self.assertRaises(ContractError):
+            validate_bundle_managed_launch(legacy, {}, {})
+
+    def test_candidate_tampering_and_wrong_context_are_rejected(self):
+        base, _, path = self.managed_candidate()
+        bundle = self.freeze_managed(path)
+        context, observed = self.independent_launch_inputs(base, bundle)
+        for key in ("bundle", "runtimeManifest"):
+            with self.subTest(key=key), self.assertRaises(ContractError):
+                validate_bundle_managed_launch(bundle, dict(context, **{key: str(self.root / "wrong")}), observed)
+        candidate = bundle / "launch/managed-server-candidate.json"
+        candidate.write_bytes(candidate.read_bytes() + b" ")
+        with self.assertRaises(ContractError):
+            verify_bundle(bundle)
+
+    def test_candidate_static_mismatch_is_rejected_after_manifest_rehash(self):
+        _, _, path = self.managed_candidate()
+        bundle = self.freeze_managed(path)
+        candidate = bundle / "launch/managed-server-candidate.json"
+        profile = json.loads(candidate.read_bytes())
+        profile["args"] = ["changed"]
+        candidate.write_bytes(canonical(profile))
+        manifest = json.loads((bundle / "runtime.json").read_bytes())
+        entry = next(e for e in manifest["files"] if e["path"] == candidate.relative_to(bundle).as_posix())
+        entry.update(size=candidate.stat().st_size, sha256=digest(candidate.read_bytes()))
+        manifest["artifactId"] = digest(canonical({k: v for k, v in manifest.items() if k != "artifactId"}))
+        (bundle / "runtime.json").write_bytes(canonical(manifest))
+        (bundle / "COMPLETE").write_text(manifest["artifactId"])
+        with self.assertRaises(ContractError):
+            verify_bundle(bundle)
+
+    def test_export_cli_reports_candidate_presence_without_approval(self):
+        _, _, path = self.managed_candidate()
+        arguments = [sys.executable, "-B", str(Path(__file__).resolve().parents[1] / "export-dev-runtime.py"),
+                     "--recipe", str(self.recipe_path), "--source-lock", str(self.lock), "--store", str(self.store),
+                     "--managed-profile", str(path)]
+        result = subprocess.run(arguments, capture_output=True, text=True, encoding="utf-8",
+                                env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(str(Path(output["bundle"]) / "launch/managed-server-candidate.json"), output["managedCandidate"])
+        self.assertEqual("未承認候補", output["managedCandidateReason"])
+
+    def test_candidate_missing_actual_remap_is_not_synthesized(self):
+        _, _, path = self.managed_candidate()
+        config = Path(self.recipe["profiles"]["server"]["jvmArgs"][0].split("=", 1)[1])
+        config.write_text("commonProperties\n\tfabric.development=true\n", encoding="utf-8")
+        with self.assertRaises(ContractError):
+            self.freeze_managed(path)

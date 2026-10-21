@@ -121,3 +121,39 @@ Windowsでの結果はmacOS 15の運用適合・停電耐久性の証明では�
 現在の`.github`を入力に含む新規bundleは`adapter/proxy.json`と専用Java helperを収録します。公開Data/Mod DTO・serializer・codecをJDK 21でコンパイルし、Java source、生成JAR、コンパイラー、Modの解決済みKotlin/serialization/Data依存GAV、codec classdirの全classfileを既存artifact collectionへ固定します。Host CLI用classpathは分離し、proxyへ混在させません。同一DataModel JARのbyte一致、依存の一意性、作成OS/architecture、全classpathのhashを作用前に検証します。JAR manifestの外部Class-Pathと、classpath区切り文字を含む要素は拒否します。
 
 `proxy_command`はbundle内JDKと固定main/classpathだけを使います。未同梱の古いbundleは通常の検証・API/FS動作を維持しますが、新DB入口で代替helperを探索しません。1writer/1socket、本人登録、要求上限、UNKNOWNと終了証明は[writer契約](writer-guide.md#db専用writer)に従います。固定helperの生成・公開codec互換・自己所有loopback試験と、実Mod/DBへの結合は別の検証です。
+
+## M/serverの明示候補
+
+`export-dev-runtime.py`の任意引数`--managed-profile PATH`には、既exact Profile v1の完全なUTF-8 JSONを指定します。
+encoding、完全environment、管理property等を含む明示入力で、部分設定からの補完や承認済みprofileの生成は行いません。
+Windowsの通常launchが使う`mbcs`は実ACP依存であり、候補の`utf-8`又は`windows-31j`を自動選択する根拠にはしません。
+exportのLoom明示envと候補の完全envは別の入力です。候補で明示した空mappingも、実process環境の監査結果を意味しません。
+
+```text
+python3.12 -B scripts/export-dev-runtime.py --recipe RECIPE --source-lock LOCK --store STORE --managed-profile PROFILE
+```
+
+既存receiptを再利用・上書きしません。ビルド前lockと現在の実recipeに一致する候補を用意してください。
+ModのGradle taskや`build-dev-runtime.py`への新しいproperty転送は追加していません。
+未指定時は通常freezeのbundle内容を維持し、CLI出力は`managedCandidate: null`と未指定理由を示します。
+指定したProfileの不足・不整合はfreeze失敗となり、候補なしの正常出力へ切り替えません。
+旧bundleへ候補を後付けせず、候補を含むbundleは別artifact IDになります。候補不在の保存済みv1/v2 bundleの通常検証・launchは維持します。
+
+候補は`launch/managed-server-candidate.json`へ元JSON bytesのまま保存し、既`runtime.files`のsize/SHA-256とartifact IDに束縛します。
+候補へartifact IDや新しいmetadata fieldは加えません。native/archive由来が未対応でも値を推測して埋めません。
+main/classpath/argsはexportと同一、DLIとremapはFreezerが実際に保存したUTF-8 bytesの内容だけを使います。
+DLIの`${run}/.launch`から`${auxiliary}`への置換以外に本文を生成せず、remap欠落をclasspathから補いません。
+
+元JVM列は順序と値を維持し、DLI補助pathのslot置換だけを行います。
+追加可能なのはProfileに明示した7管理property、`-XX:+DisableAttachMechanism`、`java.io.tmpdir`、任意の`org.sqlite.tmpdir`の既tokenだけです。
+元引数の欠落・上書き・順序変更や、それ以外のheap/native設定等の追加は未対応として拒否します。
+元recipeに含まれる引数がこの照合に通ることは、意味上の許可やnative閉包の承認ではありません。
+
+`validate_bundle_managed_launch(bundle, context, observed)`はbundle全検証と候補の元bytes照合後、callerが独立に渡す既Context/Observedを`validate_managed_launch`へ渡します。
+Observedのargv/cwd/envと3補助file bytesを候補自身から作るAPIではありません。Contextのbundle/runtimeManifestは指定bundleへ束縛します。
+候補が存在しなければこの候補専用入口を拒否し、通常launchへfallbackしません。
+P正本Context/native本人、profile承認、Fabric追加code閉包、JNA/SQLiteの実load由来、管理受付と正常停止の受入は未接続です。
+診断のCOMCTL/conhost例外を製品へ流用せず、通常launch・startgate・Data-v2世代拒否の条件は変更しません。
+
+関連確認は`test_runtime_bundle.py`、`test_managed_profile.py`、`test_task_maven.py`で行います。
+合成bundle/独立入力/CLIの確認であり、実JVM・native・OS受入の成功とは区別します。
