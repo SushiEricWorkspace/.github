@@ -78,3 +78,16 @@ native/server/writer実結合、Java observer、実root、SSH、公開は未実�
 既Registry._tokenは旧32桁hexのleaseも既値として受理します。今回の新規UUID生成は、その旧値をData管理に使用できる保証ではありません。
 後続の実GRANT受付では作用前にgenerationとleaseIdの両方がDataのUUID条件を満たすことを確認し、満たさない旧値は保全して拒否する必要があります。
 既tokenの受理だけからDataManagementBindingを発行せず、別名投影や自動変換も行いません。このGRANT境界は未接続・未実装です。
+
+
+## M/server exact launchのpure検証（未接続）
+
+runtime_bundle.validate_managed_launch(profile, context, observed)は、承認済みM/server列とP生成context11値からargv/cwd/envと3補助file原bytesの完全一致を確認します。versionはintの1だけでboolを拒否し、未知field/token/slot、必須property欠落、重複、encoding不一致をContractErrorで拒否します。
+
+profileはversion/purpose/role/platform/argfileEncoding/mainClass/classpath/jvmArgs/args/environment/dliText/remapClasspath、observedはargv/cwd/environment/auxiliaryFilesのexact objectです。contextはbundle/run/auxiliary/privateTmp/controlDescriptor/runtimeManifest/proofPath/instanceId/generationId/startNonce/controlDescriptorSha256だけです。observedPidやproxy/O/C/Wは対象外です。
+
+argfileの共有encoding名はutf-8/windows-31jだけ。DLI/remapはUTF-8で、argfileは指定codecのroundtripを必須とします。共有静的期待bytesはmanaged-argfile-vectors-v1.jsonです。
+
+この関数はfile/OS/環境を読まずprocessも起動しません。通常launch_commandへは未接続です。profile自体の承認、実contextの本人/descriptor実体、native origin、wire2、台帳、Mac artifact/運用受入を検証した扱いにしません。実接続時はP正本/承認profileを先に確定する必要があります。
+
+引数・context・env値のASCII control（U+0000–U+001FとDEL U+007F）も拒否します。DLIだけは仕様上のLF/TABを許可し、DELは許可しません。

@@ -8,7 +8,7 @@ import shutil
 import stat
 import tempfile
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .build_inputs import canonical, digest, portable_lock, regular_bytes, verify_sources
 from .contracts import ContractError, LAYOUT_ID, validate, validate_relative_path
@@ -33,6 +33,163 @@ def require_data_generation(manifest: dict, generation: str) -> None:
     except ValueError:
         raise ContractError(message) from None
     _require(canonical == generation, message)
+
+
+def _managed_argfile(arguments: list[str], encoding: str) -> bytes:
+    codec = {"utf-8": "utf-8", "windows-31j": "cp932"}.get(encoding)
+    _require(codec is not None, "managed launch: 未対応のencodingです")
+    lines = []
+    for argument in arguments:
+        _require(type(argument) is str and argument and not any((ord(c) < 32 or ord(c) == 127) for c in argument),
+                 "managed launch: 引数が不正です")
+        try:
+            raw = argument.encode(codec)
+            _require(raw.decode(codec) == argument, "managed launch: encodingが往復一致しません")
+        except UnicodeError:
+            raise ContractError("managed launch: 引数をencodingで表現できません") from None
+        lines.append(json.dumps(raw.decode("latin-1"), ensure_ascii=False).encode("latin-1"))
+    return b"\n".join(lines) + b"\n"
+
+
+def validate_managed_launch(profile: dict, context: dict, observed: dict) -> None:
+    """承認済みM/server templateとP正本値から展開済み起動入力の完全一致を純粋に検査する。
+
+    file/OS/環境を読み取らず、引数も変更しない。不一致はContractError。
+    profile承認・native本人・実起動の検証ではなく、通常launchには未接続。
+    """
+    def fields(value, names):
+        _require(type(value) is dict and value.keys() == set(names), "managed launch: field集合が不正です")
+
+    def text(value, multiline=False):
+        _require(type(value) is str and bool(value) and not any(
+            (ord(c) < 32 or ord(c) == 127) and not (multiline and c in "\n\t") for c in value), "managed launch: textが不正です")
+        try:
+            value.encode("utf-8")
+        except UnicodeError:
+            raise ContractError("managed launch: UTF-8 textが不正です") from None
+
+    def expand(value, allowed):
+        text(value, multiline=True)
+        tokens = re.findall(r"\$\{([^{}]+)\}", value)
+        _require(all(name in allowed for name in tokens), "managed launch: tokenのslotが不正です")
+        _require("${" not in re.sub(r"\$\{[^{}]+\}", "", value), "managed launch: token構文が不正です")
+        return re.sub(r"\$\{([^{}]+)\}", lambda match: context[match[1]], value)
+
+    fields(profile, ("version", "purpose", "role", "platform", "argfileEncoding", "mainClass", "classpath",
+                     "jvmArgs", "args", "environment", "dliText", "remapClasspath"))
+    _require(type(profile["version"]) is int and profile["version"] == 1
+             and profile["purpose"] == "managed-launch-exact" and profile["role"] == "M",
+             "managed launch: version/purpose/roleが不正です")
+    _require(type(profile["platform"]) is str and profile["platform"] in ("Windows", "Darwin"),
+             "managed launch: OSが不正です")
+    _require(type(profile["argfileEncoding"]) is str and profile["argfileEncoding"] in
+             (("utf-8", "windows-31j") if profile["platform"] == "Windows" else ("utf-8",)),
+             "managed launch: encodingがOSと一致しません")
+    paths = ("bundle", "run", "auxiliary", "privateTmp", "controlDescriptor", "runtimeManifest", "proofPath")
+    fields(context, (*paths, "instanceId", "generationId", "startNonce", "controlDescriptorSha256"))
+    path_type = PureWindowsPath if profile["platform"] == "Windows" else PurePosixPath
+    for name, value in context.items():
+        text(value)
+        _require("${" not in value, "managed launch: context内のtokenは禁止です")
+        if name in paths:
+            _require(path_type(value).is_absolute(), "managed launch: 絶対pathが必要です")
+    for name in ("instanceId", "startNonce"):
+        _require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", context[name]) is not None,
+                 "managed launch: 識別子が不正です")
+    require_data_generation({"schemaVersion": 2}, context["generationId"])
+    _require(re.fullmatch(r"[0-9a-f]{64}", context["controlDescriptorSha256"]) is not None,
+             "managed launch: descriptor hashが不正です")
+    fields(observed, ("argv", "cwd", "environment", "auxiliaryFiles"))
+    text(observed["cwd"])
+    _require(path_type(observed["cwd"]).is_absolute(), "managed launch: cwdが不正です")
+
+    def environment(value):
+        _require(type(value) is dict, "managed launch: envはmappingが必要です")
+        keys = set()
+        for key, item in value.items():
+            text(key)
+            text(item)
+            _require(key.isascii() and "=" not in key and "${" not in key, "managed launch: env keyが不正です")
+            comparison = key.casefold() if profile["platform"] == "Windows" else key
+            _require(comparison not in keys, "managed launch: env keyが重複しています")
+            keys.add(comparison)
+
+    environment(profile["environment"])
+    environment(observed["environment"])
+    expected_env = {key: expand(value, {"privateTmp"}) for key, value in profile["environment"].items()}
+    text(profile["mainClass"])
+    expand(profile["mainClass"], set())
+    for name in ("jvmArgs", "args", "classpath", "remapClasspath"):
+        _require(type(profile[name]) is list, "managed launch: 引数/pathはlistが必要です")
+        for value in profile[name]:
+            text(value)
+    for name in ("classpath", "remapClasspath"):
+        _require(bool(profile[name]) and len(profile[name]) == len(set(profile[name])),
+                 "managed launch: classpathが空又は重複しています")
+        for value in profile[name]:
+            validate_relative_path(value)
+            expand(value, set())
+    for value in profile["args"]:
+        expand(value, set())
+        _require(not value.startswith("@"), "managed launch: 追加argfileは禁止です")
+    properties = {"sushieric.managed." + name: name for name in
+                  ("instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest",
+                   "controlDescriptor", "controlDescriptorSha256")}
+    properties.update({"java.io.tmpdir": "privateTmp", "fabric.dli.config": "auxiliary"})
+    expected_properties = {key: "${" + name + "}" for key, name in properties.items()}
+    expected_properties["fabric.dli.config"] += "/server-launch.cfg"
+    flags, actual_properties, jvm = set(), {}, []
+    for argument in profile["jvmArgs"]:
+        _require(not argument.startswith("@") and argument not in ("-cp", "-classpath", "--class-path")
+                 and not argument.startswith("--class-path="), "managed launch: classpath/argfile混入は禁止です")
+        allowed = set()
+        if argument.startswith("-D"):
+            key, separator, value = argument[2:].partition("=")
+            _require(bool(key) and bool(separator), "managed launch: propertyが不正です")
+            flag = "property:" + key
+            actual_properties[key] = value
+            if key in properties:
+                allowed.add(properties[key])
+            elif key == "org.sqlite.tmpdir":
+                _require(value == "${privateTmp}", "managed launch: SQLite temp slotが不正です")
+                allowed.add("privateTmp")
+        elif argument.startswith(("-Xms", "-Xmx")):
+            flag = argument[:4]
+        elif argument.startswith("-XX:"):
+            flag = "XX:" + argument[4:].lstrip("+-").split("=", 1)[0]
+        else:
+            flag = argument
+        _require(flag not in flags, "managed launch: JVM flag/propertyが重複しています")
+        flags.add(flag)
+        jvm.append(expand(argument, allowed))
+    _require(all(actual_properties.get(key) == value for key, value in expected_properties.items()),
+             "managed launch: 必須propertyのtokenが一致しません")
+    _require("-XX:+DisableAttachMechanism" in profile["jvmArgs"], "managed launch: attach禁止が必要です")
+    text(profile["dliText"], multiline=True)
+    _require("\ufeff" not in profile["dliText"], "managed launch: DLIのBOMは禁止です")
+    dli = expand(profile["dliText"], {"bundle", "auxiliary"})
+    if profile["platform"] == "Windows":
+        dli = dli.replace("\n", "\r\n")
+    separator = ";" if profile["platform"] == "Windows" else ":"
+    bundle = path_type(context["bundle"])
+    classpath = separator.join(str(bundle / value) for value in profile["classpath"])
+    remap = separator.join(str(bundle / value) for value in profile["remapClasspath"])
+    arguments = [*jvm, "-cp", classpath, profile["mainClass"], *profile["args"]]
+    expected_files = {"java.args": _managed_argfile(arguments, profile["argfileEncoding"]),
+                      "server-launch.cfg": dli.encode("utf-8"),
+                      "server-remap-classpath.txt": remap.encode("utf-8")}
+    fields(observed["auxiliaryFiles"], expected_files)
+    _require(all(type(value) is bytes for value in observed["auxiliaryFiles"].values()),
+             "managed launch: 補助fileはbytesが必要です")
+    _require(type(observed["argv"]) is list, "managed launch: argvはlistが必要です")
+    for argument in observed["argv"]:
+        text(argument)
+        expand(argument, set())
+    java = bundle / "jdk/bin" / ("java.exe" if profile["platform"] == "Windows" else "java")
+    expected_argv = [str(java), "@" + str(path_type(context["auxiliary"]) / "java.args")]
+    _require(observed["argv"] == expected_argv and observed["cwd"] == context["run"]
+             and observed["environment"] == expected_env and observed["auxiliaryFiles"] == expected_files,
+             "managed launch: 展開後の起動入力が一致しません")
 
 
 def _directory(path: Path):
