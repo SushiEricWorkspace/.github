@@ -172,7 +172,7 @@ class GameTestControl:
                "proofPath": str(diagnostics / "proof.json"), "manifestHash": digest((bundle / "runtime.json").read_bytes()),
                "endpoints": {}, "stopRequested": False, "jvmAndChildrenExited": False, "runtimeSaveCompleted": False,
                "createdAt": self.registry.clock(), "pinned": False}
-        runtime._record(run)
+        expected = runtime._record(run)
         write_json(diagnostics / "request.json", payload)
         (cwd / "eula.txt").write_text("eula=true\n", encoding="utf-8")
         # 初回properties欠損の警告を保存失敗証跡に混ぜない。
@@ -181,16 +181,17 @@ class GameTestControl:
             "instanceId": run["instanceId"], "generationId": run["generationId"], "startNonce": run["nonce"],
             "proofPath": run["proofPath"], "runtimeManifest": str(bundle / "runtime.json")})
         run["commandHash"] = runtime_process.command_hash(arguments)
-        runtime._record(run)
+        expected = runtime._record(run, expected=expected)
         process = adapter.OwnedProcess()
         runtime.processes[run["runId"]] = process
 
         def created():
+            nonlocal expected
             run["creation"] = {"pid": process.pid, "stage": process.stage, "ownerGroup": process.group}
             write_json(diagnostics / "creation.json", run["creation"])
-            runtime._record(run)
+            expected = runtime._record(run, expected=expected)
             run["identity"] = adapter.identity(process.pid)
-            runtime._record(run)
+            expected = runtime._record(run, expected=expected)
             require(run["identity"] is not None and Path(run["identity"]["cwd"]).resolve() == cwd.resolve()
                     and Path(run["identity"]["executable"]).resolve() == Path(arguments[0]).resolve()
                     and run["identity"]["commandHash"] == run["commandHash"],
@@ -206,7 +207,7 @@ class GameTestControl:
                 process.start(arguments, cwd, log, run["nonce"], created)
             finally:
                 run["creation"] = {"pid": process.pid, "stage": process.stage, "ownerGroup": process.group}
-                runtime._record(run)
+                expected = runtime._record(run, expected=expected)
             deadline = time.monotonic() + payload["timeoutSeconds"]
             while process.poll() is None:
                 try:
@@ -229,7 +230,7 @@ class GameTestControl:
                 check_listeners(set(process.members()) | {process.pid})
                 require(time.monotonic() < deadline, "GAMETEST_TIMEOUT", "GameTestの期限を超過しました。自動killしません")
                 time.sleep(0.1)
-            runtime._wait_exit(run, process, max(1, deadline - time.monotonic()), verify=check_listeners)
+            expected = runtime._wait_exit(run, process, max(1, deadline - time.monotonic()), expected=expected, verify=check_listeners)
         result = {"runId": run["runId"], "artifactId": run["artifactId"], "templateId": None,
                   "exitCode": run["exitCode"], "jvmAndChildrenExited": True, "testsPassed": False,
                   "runtimeStopped": False, "snapshotClean": False}
@@ -253,6 +254,6 @@ class GameTestControl:
         result["worldRetentionUntil"] = self.registry.clock() + (0 if result["testsPassed"] and result["runtimeStopped"] else 7 * 86400)
         result["resultsRetentionUntil"] = self.registry.clock() + 30 * 86400
         run.update(result, completedAt=self.registry.clock())
-        runtime._record(run)
+        expected = runtime._record(run, expected=expected)
         write_json(diagnostics / "result.json", result)
         return result

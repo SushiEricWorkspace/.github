@@ -1,4 +1,5 @@
 """固定bundleの起動/停止。世代構築はGenerationControlで行う。"""
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -35,7 +36,7 @@ def read_json(path: Path) -> dict:
 
 
 class RuntimeControl:
-    """重いコピー・OS照合・RCON待機はinstance OS lock内、DB transaction外で行う。"""
+    """instance lock→短いtransactionで予約・確定し、外部I/Oは両方の外で行う。"""
     def __init__(self, registry, *, process_adapter=runtime_process):
         self.registry = registry
         self.process_adapter = process_adapter
@@ -110,16 +111,45 @@ class RuntimeControl:
         require(shutil.disk_usage(self.registry.root).free >= size + self.registry.inventory["reserveBytes"],
                 "NO_SPACE", "コピー中に物理空き容量が減少しました。旧データを保持します")
 
-    def _record(self, run):
-        with self.registry.transaction() as connection:
-            connection.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?)",
-                               (run["runId"], run["instanceId"], run["generationId"], json.dumps(run)))
+    @contextmanager
+    def _transaction(self, instance, *, read_only=False):
+        from .supervisor import private_lock
+        with private_lock(self.registry.root / "manager/locks" / f"instance-{instance}.lock"):
+            with self.registry.transaction(read_only=read_only) as connection:
+                yield connection
 
-    def _load_run(self, row):
+    @staticmethod
+    def _binding(current, previous, *, run_id=None):
+        require(all(current[key] == previous[key] for key in ("id", "lease", "epoch", "generation", "artifact"))
+                and current["run_id"] == (previous["run_id"] if run_id is None else run_id),
+                "STALE_OPERATION", "予約したlease・世代・runが変更されました")
+
+    def _record(self, run, *, expected=None):
+        record = json.dumps(run)
+        transaction = (self.registry.transaction() if run.get("kind") == "gametest"
+                       else self._transaction(run["instanceId"]))
+        with transaction as connection:
+            if run.get("kind") != "gametest":
+                current = self.registry._instance(connection, run["instanceId"])
+                require(current["generation"] == run["generationId"] and current["artifact"] == run["artifactId"]
+                        and current["pending"] and (expected is None or current["run_id"] == run["runId"]),
+                        "STALE_OPERATION", "runを更新する世代・予約が変更されました")
+            if expected is None:
+                require(not connection.execute("SELECT 1 FROM runs WHERE id=?", (run["runId"],)).fetchone(),
+                        "STALE_OPERATION", "既存runを置換しません")
+                connection.execute("INSERT INTO runs VALUES (?,?,?,?)",
+                                   (run["runId"], run["instanceId"], run["generationId"], record))
+            else:
+                changed = connection.execute("UPDATE runs SET record=? WHERE id=? AND instance=? AND generation=? AND record=?",
+                                             (record, run["runId"], run["instanceId"], run["generationId"], expected))
+                require(changed.rowcount == 1, "STALE_OPERATION", "runの読取元が変更されました")
+        return record
+
+    def _load_run(self, row, *, with_record=False):
         with self.registry.transaction(read_only=True) as connection:
             value = connection.execute("SELECT record FROM runs WHERE id=?", (row["run_id"],)).fetchone()
             require(value is not None, "PROOF_REQUIRED", "起動記録がありません")
-            return json.loads(value[0])
+            return (json.loads(value[0]), value[0]) if with_record else json.loads(value[0])
 
     def execute(self, command, payload, *, operation_id, dry_run=False):
         identifier(operation_id, "operationId")
@@ -131,7 +161,7 @@ class RuntimeControl:
             self.refresh()
         fingerprint = digest(canonical({"command": command, "payload": payload}))
         replay = None
-        with self.registry.transaction(read_only=True) as connection:
+        with self._transaction(payload["instanceId"], read_only=True) as connection:
             for table in ("operations", "reference_operations", "writer_operations", "snapshot_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが他の操作で使用されています")
@@ -150,6 +180,11 @@ class RuntimeControl:
             if command == "start":
                 self._active(row)
                 self._running(row)
+            with self._transaction(row["id"], read_only=True) as connection:
+                current = self.registry._instance(connection, row["id"])
+                self.registry._token(current, payload, allow_expired=command == "stop")
+                self._binding(current, row)
+                require(current["state"] == row["state"] and not current["pending"], "STALE_OPERATION", "再提示中にrunが変更されました")
             return dict(response, replayed=True, dryRun=dry_run)
         row = self._row(payload, allow_expired=command == "stop")
         require(row["generation_bound"] and row["generation"] is not None and not row["pending"],
@@ -175,15 +210,18 @@ class RuntimeControl:
             if command == "stop":
                 self._running(row)
             return {"dryRun": True, "wouldExecute": command, "instanceId": row["id"]}
-        with self.registry.transaction() as connection:
+        with self._transaction(row["id"]) as connection:
             for table in ("operations", "reference_operations", "writer_operations", "snapshot_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                         "OPERATION_CONFLICT", "operationIdが他の操作で使用されています")
             current = self.registry._instance(connection, row["id"])
             self.registry._token(current, payload, allow_expired=command == "stop")
+            self._binding(current, row)
             require(current["state"] == row["state"] and not current["pending"], "BUSY", "枠の状態が変更されました")
             require(not connection.execute("SELECT 1 FROM writer_sessions WHERE instance=? AND pending!=0", (row["id"],)).fetchone(),
                     "WRITER_PENDING", "writer保存の完了が不明なため停止・再起動を開始できません")
+            require(not connection.execute("SELECT 1 FROM reservations WHERE instance=? AND reference LIKE 'writer-call:%'",
+                                           (row["id"],)).fetchone(), "WRITER_PENDING", "writer callが実行中です")
             response = {"instanceId": row["id"], "pending": True}
             connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
                                (operation_id, fingerprint, command, row["id"], "PENDING", json.dumps(response)))
@@ -198,9 +236,15 @@ class RuntimeControl:
                 result = self._start(row, payload, generation, endpoints, operation_id)
             else:
                 result = self._stop(row, payload, generation)
-            with self.registry.transaction() as connection:
+            with self._transaction(row["id"]) as connection:
                 current = self.registry._instance(connection, row["id"])
                 self.registry._token(current, payload, allow_expired=command == "stop")
+                operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (operation_id,)).fetchone()
+                self._binding(current, row, run_id=result["runId"])
+                require(current["pending"] and current["state"] == {"start": "STARTING", "stop": "STOPPING"}[command]
+                        and operation is not None and operation["fingerprint"] == fingerprint
+                        and operation["instance"] == row["id"] and operation["command"] == command
+                        and operation["status"] == "PENDING", "STALE_OPERATION", "同じ未完了操作ではありません")
                 if command == "start":
                     connection.execute("UPDATE instances SET state='RUNNING',pending=0 WHERE id=?", (row["id"],))
                 else:
@@ -211,7 +255,13 @@ class RuntimeControl:
             return result
         except BaseException as error:
             code = error.code if isinstance(error, RegistryError) else "RUNTIME_FAILED"
-            with self.registry.transaction() as connection:
+            with self._transaction(row["id"]) as connection:
+                current = self.registry._instance(connection, row["id"])
+                operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (operation_id,)).fetchone()
+                self._binding(current, row, run_id=row.get("reserved_run_id", row["run_id"]))
+                require(current["pending"] and operation is not None and operation["status"] == "PENDING"
+                        and operation["fingerprint"] == fingerprint and operation["instance"] == row["id"],
+                        "STALE_OPERATION", "変更済みの操作を失敗へ上書きしません")
                 connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED' WHERE id=?", (row["id"],))
                 connection.execute("UPDATE runtime_operations SET status='RECOVERY_REQUIRED',response=? WHERE id=?",
                                    (json.dumps({"error": code}), operation_id))
@@ -273,10 +323,19 @@ class RuntimeControl:
                "proofPath": str(diagnostics / "proof.json"), "cwd": str(generation.resolve()),
                "manifestHash": digest((generation / "runtime/runtime.json").read_bytes()), "endpoints": endpoints,
                "stopRequested": False, "jvmAndChildrenExited": False, "runtimeSaveCompleted": False}
-        self._record(run)
-        with self.registry.transaction() as connection:
+        expected = self._record(run)
+        with self._transaction(row["id"]) as connection:
+            current = self.registry._instance(connection, row["id"])
+            self._binding(current, row)
+            operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (operation_id,)).fetchone()
+            require(current["pending"] and current["state"] == "STARTING" and operation is not None
+                    and operation["status"] == "PENDING" and operation["instance"] == row["id"]
+                    and operation["command"] == "start"
+                    and operation["fingerprint"] == digest(canonical({"command": "start", "payload": payload})),
+                    "STALE_OPERATION", "起動予約が変更されました")
             reserve(connection, row["id"], run_id, endpoints)
             connection.execute("UPDATE instances SET run_id=? WHERE id=?", (run_id, row["id"]))
+        row["reserved_run_id"] = run_id
         properties = {"instanceId": row["id"], "generationId": row["generation"], "startNonce": nonce,
                       "proofPath": run["proofPath"], "runtimeManifest": str(generation / "runtime/runtime.json")}
         require(not any(os.environ.get(key) for key in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "CLASSPATH")),
@@ -284,15 +343,16 @@ class RuntimeControl:
         arguments = launch_command(generation / "runtime", "server", generation,
                                    auxiliary=diagnostics / ".launch", jvm_properties=properties)
         run["commandHash"] = runtime_process.command_hash(arguments)
-        self._record(run)
+        expected = self._record(run, expected=expected)
 
         def created():
+            nonlocal expected
             run["creation"] = {"pid": process.pid, "stage": process.stage, "ownerGroup": process.group}
             write_json(diagnostics / "creation.json", run["creation"])
-            self._record(run)
+            expected = self._record(run, expected=expected)
             identity = self.process_adapter.identity(process.pid)
             run["identity"] = identity
-            self._record(run)
+            expected = self._record(run, expected=expected)
             write_json(diagnostics / "process.json", {"runId": run_id, "nonce": nonce, "identity": identity})
             require(identity is not None and Path(identity["cwd"]).resolve() == generation.resolve()
                     and Path(identity["executable"]).resolve() == Path(arguments[0]).resolve()
@@ -311,7 +371,7 @@ class RuntimeControl:
                     process.start(arguments, generation, log, nonce, created)
                 finally:
                     run["creation"] = {"pid": process.pid, "stage": process.stage, "ownerGroup": process.group}
-                    self._record(run)
+                    expected = self._record(run, expected=expected)
                 deadline = time.monotonic() + payload["timeoutSeconds"]
                 while True:
                     require(process.poll() is None, "START_FAILED", "起動途中でJVMが終了しました")
@@ -331,13 +391,13 @@ class RuntimeControl:
             if process is not None and process.stage == "RUNNING":
                 try:
                     if process.poll() is None:
-                        self._rcon_stop(run, generation, process, payload["timeoutSeconds"])
-                    self._wait_exit(run, process, payload["timeoutSeconds"])
+                        expected = self._rcon_stop(run, generation, process, payload["timeoutSeconds"], expected=expected)
+                    expected = self._wait_exit(run, process, payload["timeoutSeconds"], expected=expected)
                 except (RegistryError, OSError):
                     pass
             raise
 
-    def _rcon_stop(self, run, generation, process, timeout):
+    def _rcon_stop(self, run, generation, process, timeout, *, expected):
         def verify():
             runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
             expected = run["endpoints"]["rcon"]
@@ -349,13 +409,15 @@ class RuntimeControl:
                    if line.startswith("rcon.password=")]
         require(len(entries) == 1 and entries[0], "RCON_FAILED", "RCON秘密を一意に取得できません")
         run["stopRequested"] = True
-        self._record(run)
+        expected = self._record(run, expected=expected)
         endpoint = run["endpoints"]["rcon"]
         runtime_rcon.stop(endpoint["address"], endpoint["port"], entries[0], timeout, verify=verify)
         run["stopAcknowledged"] = True
-        self._record(run)
+        expected = self._record(run, expected=expected)
 
-    def _wait_exit(self, run, process, timeout, *, verify=None):
+        return expected
+
+    def _wait_exit(self, run, process, timeout, *, expected, verify=None):
         deadline = time.monotonic() + timeout
         while True:
             running = process.poll() is None
@@ -369,23 +431,26 @@ class RuntimeControl:
         run["exitCode"] = process.poll()
         run["jvmAndChildrenExited"] = True
         run["exitedAt"] = self.registry.clock()
-        self._record(run)
-        with self.registry.transaction() as connection:
+        expected = self._record(run, expected=expected)
+        transaction = (self.registry.transaction() if run.get("kind") == "gametest"
+                       else self._transaction(run["instanceId"]))
+        with transaction as connection:
             connection.execute("DELETE FROM endpoint_reservations WHERE run=?", (run["runId"],))
         process.close()
         self.processes.pop(run["runId"], None)
+        return expected
 
     def _stop(self, row, payload, generation):
-        run = self._load_run(row)
+        run, expected = self._load_run(row, with_record=True)
         process = self.processes[row["run_id"]]
         runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
-        self._rcon_stop(run, generation, process, payload["timeoutSeconds"])
-        self._wait_exit(run, process, payload["timeoutSeconds"])
+        expected = self._rcon_stop(run, generation, process, payload["timeoutSeconds"], expected=expected)
+        expected = self._wait_exit(run, process, payload["timeoutSeconds"], expected=expected)
         require(run["exitCode"] == 0, "SAVE_FAILED", "JVMが正常終了していません")
         proof = self._proof(run, generation, stopped=True)
         run["runtimeSaveCompleted"] = True
         run["proofHash"] = digest(Path(run["proofPath"]).read_bytes())
-        self._record(run)
+        expected = self._record(run, expected=expected)
         result = {"instanceId": row["id"], "generation": row["generation"], "runId": run["runId"],
                   "nonce": run["nonce"], "runtimeStopped": True, "modSaveCompleted": True,
                   "stopRequested": run["stopRequested"], "stopAcknowledged": run["stopAcknowledged"], "exitCode": run["exitCode"],
@@ -411,6 +476,9 @@ class RuntimeControl:
             try:
                 self._running(row)
             except (RegistryError, OSError, ValueError, KeyError):
-                with self.registry.transaction() as connection:
+                with self._transaction(row["id"]) as connection:
+                    current = self.registry._instance(connection, row["id"])
+                    if any(current[key] != row[key] for key in ("lease", "epoch", "generation", "run_id", "state", "pending")):
+                        continue
                     connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED' WHERE id=? AND state='RUNNING' AND run_id=?",
                                        (row["id"], row["run_id"]))

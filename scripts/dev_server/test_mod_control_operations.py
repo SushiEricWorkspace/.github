@@ -323,6 +323,7 @@ class DataUuidBoundaryTests(unittest.TestCase):
         db.executescript(SCHEMA)
         registry = SimpleNamespace(transaction=lambda **_: nullcontext(db))
         runtime = RuntimeControl(registry, process_adapter=Mock())
+        runtime._transaction = Mock(return_value=nullcontext(db))
         runtime.refresh = Mock()
         runtime._row = Mock(return_value=dict(id="slot-a", generation="generation-01", generation_bound=1,
                                               state="READY", pending=0, writers=0, children=0, run_id=None))

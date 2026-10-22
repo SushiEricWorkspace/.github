@@ -29,6 +29,8 @@ class ApiPeer:
         self.socket = socket.socket()
         self.socket.bind(("127.0.0.1", 0))
         self.socket.listen(1)
+        self.socket.settimeout(0.1)
+        self.stopping = threading.Event()
         self.endpoint = {"address": "127.0.0.1", "port": self.socket.getsockname()[1], "protocol": "tcp"}
         self.error = None
         self.request = None
@@ -37,7 +39,15 @@ class ApiPeer:
 
     def run(self):
         try:
-            with self.socket, self.socket.accept()[0] as stream:
+            while not self.stopping.is_set():
+                try:
+                    stream = self.socket.accept()[0]
+                    break
+                except socket.timeout:
+                    pass
+            else:
+                return
+            with stream:
                 stream.settimeout(3)
                 def read(size):
                     value = bytearray()
@@ -75,10 +85,14 @@ class ApiPeer:
                 stream.sendall(bytes([0x88, len(body)]) + body)
         except BaseException as error:
             self.error = error
+        finally:
+            self.socket.close()
 
     def finish(self):
         self.thread.join(4)
         if self.thread.is_alive():
+            self.stopping.set()
+            self.thread.join(1)
             raise AssertionError("合成peerが終了していません")
         if self.error:
             raise self.error
@@ -123,6 +137,7 @@ class WriterControlTests(unittest.TestCase):
         target.write_text("value: retained", encoding="utf-8")
         (self.generation / "world/unrelated/deep").mkdir(parents=True)
         peer = ApiPeer("complete")
+        self.addCleanup(peer.finish)
         def invoke(endpoint, message, operation_id, timeout, *, verify):
             return exchange(peer.endpoint, message, operation_id, timeout, verify=verify)
         try:
@@ -278,6 +293,7 @@ class WriterControlTests(unittest.TestCase):
         for mode in ("lost-response", "lost-close"):
             with self.subTest(mode=mode):
                 peer = ApiPeer(mode)
+                self.addCleanup(peer.finish)
                 def invoke(endpoint, message, operation_id, timeout, *, verify):
                     return exchange(peer.endpoint, message, operation_id, timeout, verify=verify)
                 payload = dict(self.binding, request={"action": "api", "message": {"type": "money_history_save"}, "timeoutSeconds": 2})
@@ -389,7 +405,7 @@ class WriterControlTests(unittest.TestCase):
         self.assertTrue(self.command("writer-close", dict(self.binding, drained=True, disconnected=True))["ok"])
         self.assertTrue(self.status()["cleanEligible"])
 
-    def test_api_write_and_stop_share_lock_and_api_response_not_persisted(self):
+    def test_api_write_reservation_blocks_stop_without_holding_lock(self):
         self.open()
         entered, finish = threading.Event(), threading.Event()
         def exchange(*args, **kwargs):
@@ -402,7 +418,32 @@ class WriterControlTests(unittest.TestCase):
             future = workers.submit(self.command, "writer-io", payload, "api-op")
             self.assertTrue(entered.wait(5))
             stop = dispatch(self.registry, new_request("stop", dict(self.fixture.token, timeoutSeconds=2), operation_id="stop-race"))
-            self.assertEqual("LOCK_BUSY", stop["error"]["code"])
+            self.assertEqual("WRITER_PENDING", stop["error"]["code"])
+            from .supervisor import private_lock
+            with private_lock(self.registry.root / "manager/locks/instance-persistent-01.lock"):
+                with self.registry.transaction(read_only=True) as connection:
+                    self.assertEqual(1, connection.execute("SELECT pending FROM writer_sessions WHERE id=?", (self.binding["sessionId"],)).fetchone()[0])
+            self.assertFalse(self.command("writer-io", payload, "api-op")["ok"])
+            self.assertFalse(self.command("writer-close", dict(self.binding, drained=True, disconnected=True), "closing-active")["ok"])
+            with self.registry.transaction(read_only=True) as connection:
+                operation = connection.execute("SELECT * FROM writer_operations WHERE id='api-op'").fetchone()
+                self.assertEqual(1, connection.execute("SELECT count(*) FROM reservations WHERE reference LIKE 'writer-call:%'").fetchone()[0])
+            child_code = """import json,sys
+from pathlib import Path
+from dev_server.registry import Registry,RegistryError
+payload,operation,fingerprint,now=json.loads(sys.stdin.read())
+registry=Registry(Path(sys.argv[1]),clock=lambda:now)
+try:registry.writer._claim_existing(payload,operation,fingerprint)
+except RegistryError as error:print(error.code)
+else:print('UNEXPECTED_ACQUIRED')
+"""
+            child = subprocess.run([sys.executable, "-B", "-c", child_code, str(self.registry.root)],
+                                   input=json.dumps([payload, "api-op", operation["fingerprint"], self.fixture.now]),
+                                   env=dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1]), PYTHONIOENCODING="utf-8"),
+                                   capture_output=True, text=True, encoding="utf-8", timeout=3)
+            self.assertEqual((0, "WRITER_PENDING"), (child.returncode, child.stdout.strip()), child.stderr)
+            with self.registry.transaction(read_only=True) as connection:
+                self.assertEqual(1, connection.execute("SELECT count(*) FROM reservations WHERE reference LIKE 'writer-call:%'").fetchone()[0])
             finish.set()
             self.assertTrue(future.result()["ok"])
         with self.registry.transaction(read_only=True) as connection:
@@ -411,6 +452,53 @@ class WriterControlTests(unittest.TestCase):
         replay = self.command("writer-io", payload, "api-op")
         self.assertTrue(replay["result"]["replayed"])
         self.assertNotIn("apiResponse", replay["result"])
+
+    def test_read_reservation_preserves_readback_and_blocks_other_session(self):
+        from .supervisor import private_lock
+        self.open()
+        second = dict(self.payload, sessionId="session-02")
+        self.assertTrue(self.command("writer-open", second, "open-second")["ok"])
+        second_binding = {key: value for key, value in second.items() if key not in {"pid", "startMillis", "cwd"}}
+        for action in ("read", "list", "server-read"):
+            with self.subTest(action=action):
+                entered, finish = threading.Event(), threading.Event()
+                operation = "read-" + action
+                payload = dict(self.binding, request={"action": action, "path": "usercache.json" if action == "server-read" else "item_data" if action == "list" else "config.yml"})
+                def io(*args):
+                    entered.set()
+                    self.assertTrue(finish.wait(5))
+                    return {"readFixture": action}
+                with patch.object(self.registry.writer, "_io", side_effect=io), ThreadPoolExecutor() as workers:
+                    future = workers.submit(self.command, "writer-io", payload, operation)
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        with private_lock(self.registry.root / "manager/locks/instance-persistent-01.lock"):
+                            with self.registry.transaction(read_only=True) as connection:
+                                self.assertEqual("PENDING", connection.execute("SELECT status FROM writer_operations WHERE id=?", (operation,)).fetchone()[0])
+                        other = self.command("writer-io", dict(second_binding, request={"action": "write", "path": "config.yml", "text": "other"}), "other-" + action)
+                        self.assertEqual("WRITER_PENDING", other["error"]["code"])
+                        self.assertFalse(self.command("writer-io", payload, operation)["ok"])
+                    finally:
+                        finish.set()
+                    self.assertEqual({"readFixture": action}, future.result()["result"])
+                with self.registry.transaction(read_only=True) as connection:
+                    self.assertIsNone(connection.execute("SELECT 1 FROM writer_operations WHERE id=?", (operation,)).fetchone())
+                with patch.object(self.registry.writer, "_io", return_value={"freshRead": True}):
+                    self.assertEqual({"freshRead": True}, self.command("writer-io", payload, operation)["result"])
+
+    def test_call_release_failure_preserves_claim_and_rejects_same_id(self):
+        self.open()
+        payload = dict(self.binding, request={"action": "write", "path": "config.yml", "text": "saved"})
+        with patch.object(self.registry.writer, "_release_call", side_effect=OSError("release commit failed")):
+            self.assertFalse(self.command("writer-io", payload, "release-failed")["ok"])
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(1, connection.execute("SELECT count(*) FROM reservations WHERE reference LIKE 'writer-call:%'").fetchone()[0])
+            self.assertEqual("COMPLETED", connection.execute("SELECT status FROM writer_operations WHERE id='release-failed'").fetchone()[0])
+        replay = self.command("writer-io", payload, "release-failed")
+        self.assertEqual("WRITER_PENDING", replay["error"]["code"])
+        self.fixture.assert_code("WRITER_PENDING", self.fixture.stop)
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(1, connection.execute("SELECT count(*) FROM reservations WHERE reference LIKE 'writer-call:%'").fetchone()[0])
 
     def test_io_failure_and_supervisor_restart_never_drop_writer(self):
         self.open()
@@ -454,6 +542,14 @@ class WriterControlTests(unittest.TestCase):
 
 
 class WriterApiTests(unittest.TestCase):
+    def test_unconnected_peer_cleanup_preserves_failure_and_releases_listener(self):
+        peer = ApiPeer("complete")
+        self.addCleanup(peer.finish)
+        with self.assertRaisesRegex(AssertionError, "合成peerが終了していません"):
+            peer.finish()
+        self.assertFalse(peer.thread.is_alive())
+        self.assertEqual(-1, peer.socket.fileno())
+
     def test_cli_stdin_rejects_non_payload_commands_before_resources(self):
         script = Path(__file__).parents[1] / "dev-server.py"
         with tempfile.TemporaryDirectory(prefix="writer-cli-") as directory:
@@ -467,6 +563,7 @@ class WriterApiTests(unittest.TestCase):
 
     def test_success_false_requires_response_and_peer_close(self):
         peer = ApiPeer("complete")
+        self.addCleanup(peer.finish)
         checks = []
         response = exchange(peer.endpoint, {"type": "money_history_save"}, "transport-operation", 2, verify=lambda: checks.append(True))
         peer.finish()

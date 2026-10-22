@@ -176,6 +176,64 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         with self.registry.transaction(read_only=True) as connection:
             return dict(connection.execute("SELECT * FROM instances WHERE id='persistent-01'").fetchone())
 
+    def test_start_io_releases_locks_and_same_request_never_respawns(self):
+        from .supervisor import private_lock
+        self.prepare()
+        entered, finish = threading.Event(), threading.Event()
+        from .runtime_bundle import launch_command
+        def launch(*args, **kwargs):
+            entered.set()
+            self.assertTrue(finish.wait(5))
+            return launch_command(*args, **kwargs)
+        with patch("dev_server.runtime_control.launch_command", side_effect=launch), ThreadPoolExecutor() as workers:
+            future = workers.submit(self.start)
+            try:
+                self.assertTrue(entered.wait(5))
+                with private_lock(self.root / "manager/locks/instance-persistent-01.lock"):
+                    with self.registry.transaction(read_only=True) as connection:
+                        self.assertEqual("STARTING", connection.execute("SELECT state FROM instances WHERE id='persistent-01'").fetchone()[0])
+                self.assert_code("RECOVERY_REQUIRED", self.start)
+                self.assertEqual([], self.adapter.created)
+            finally:
+                finish.set()
+            self.assertTrue(future.result()["running"])
+        self.assertEqual(1, len(self.adapter.created))
+
+    def test_run_record_cas_preserves_competing_stop_record(self):
+        self.prepare()
+        self.start()
+        original_stop = self.rcon_stop
+        def stop(*args, **kwargs):
+            original_stop(*args, **kwargs)
+            with self.registry.transaction() as connection:
+                row = connection.execute("SELECT id,record FROM runs").fetchone()
+                record = json.loads(row["record"])
+                record["competingRecord"] = True
+                connection.execute("UPDATE runs SET record=? WHERE id=?", (json.dumps(record), row["id"]))
+        with patch("dev_server.runtime_control.runtime_rcon.stop", side_effect=stop):
+            self.assert_code("STALE_OPERATION", self.stop)
+        run = self.registry.runtime._load_run(self.state())
+        self.assertTrue(run["competingRecord"])
+        self.assertNotIn("stopAcknowledged", run)
+        self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
+
+    def test_start_result_does_not_overwrite_changed_run_binding(self):
+        from .runtime_control import write_json
+        self.prepare()
+        def save(path, value):
+            write_json(path, value)
+            if path.name == "startup-proof.json":
+                with self.registry.transaction() as connection:
+                    connection.execute("UPDATE instances SET run_id='newer-run' WHERE id='persistent-01'")
+        with patch("dev_server.runtime_control.write_json", side_effect=save):
+            self.assert_code("STALE_OPERATION", self.start)
+        state = self.state()
+        self.assertEqual(("newer-run", "STARTING", 1), (state["run_id"], state["state"], state["pending"]))
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual("PENDING", connection.execute("SELECT status FROM runtime_operations WHERE id='start-01'").fetchone()[0])
+        self.assertEqual(1, len(self.adapter.created))
+        self.assertEqual(0, self.rcon_calls)
+
     def test_prepare_start_stop_replay_restart_and_no_snapshot_clean(self):
         generation = self.prepare()
         saved = (generation / "server.properties").read_bytes()
@@ -492,21 +550,21 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.prepare()
         record = self.registry.runtime._record
         failed = []
-        def fail_once(run):
+        def fail_once(run, **kwargs):
             if run.get("creation") and not failed:
                 failed.append(True)
                 raise OSError("作成記録DB失敗")
-            record(run)
+            return record(run, **kwargs)
         with patch.object(self.registry.runtime, "_record", side_effect=fail_once):
             self.assert_creation_preserved("CREATED")
 
     def test_persistent_creation_db_failure_keeps_memory_owner_and_reservations(self):
         self.prepare()
         record = self.registry.runtime._record
-        def fail(run):
+        def fail(run, **kwargs):
             if run.get("creation"):
                 raise OSError("作成記録DB継続失敗")
-            record(run)
+            return record(run, **kwargs)
         with patch.object(self.registry.runtime, "_record", side_effect=fail):
             self.assert_code("RUNTIME_FAILED", self.start)
         run = self.registry.runtime._load_run(self.state())

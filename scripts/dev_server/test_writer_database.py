@@ -149,6 +149,27 @@ class WriterDatabaseTests(unittest.TestCase):
         self.assertEqual('CLOSED', self.session()['status'])
         self.assertEqual(0, self.fixture.status()['writers'])
 
+    def test_completed_dry_run_replay_does_not_claim_or_receive_retained_response(self):
+        self.assertTrue(self.database()['ok'])
+        proxy = self.instances[0]
+        operation, session = self.operation(), self.session()
+        payload = dict(self.binding, request={'action': 'database', 'message': {'type': 'money_history_save'}, 'timeoutSeconds': 2})
+        with patch.object(self.writer, '_claim_existing') as claim, patch.object(self.writer, '_release_call') as release, \
+                patch.object(proxy, 'receive') as receive, patch.object(self.writer, '_database_ack') as ack:
+            response = fixtures.dispatch(self.registry, fixtures.new_request('writer-io', payload,
+                                         operation_id='db-operation', dry_run=True))
+        self.assertTrue(response['ok'], response)
+        self.assertTrue(response['result']['replayed'])
+        self.assertTrue(response['result']['dryRun'])
+        self.assertFalse(response['result']['responseAvailable'])
+        for call in (claim, release, receive, ack):
+            call.assert_not_called()
+        self.assertEqual(operation, self.operation())
+        self.assertEqual(session, self.session())
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM reservations WHERE reference LIKE 'writer-call:%'").fetchone()[0])
+        self.assertTrue(self.database()['result']['responseAvailable'])
+
     def test_bootstrap_keeps_validated_local_request_when_caller_changes_nested_message(self):
         message = {'type': 'money_history_save', 'playerUuid': '77777777-7777-7777-7777-777777777777'}
         original = dict(message)

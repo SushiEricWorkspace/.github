@@ -37,12 +37,15 @@ def dispatch(registry: Registry, message: dict) -> dict:
             instance = identifier(payload["instanceId"], "instanceId")
             if instance not in {row["instanceId"] for row in registry.inventory["instances"]}:
                 raise RegistryError("NOT_FOUND", "instanceが登録されていません")
-            with private_lock(registry.root / "manager" / "locks" / f"instance-{instance}.lock"):
-                if command in {"prepare", "template-init", "import", "restore", "reset", "recover", "snapshot"}:
-                    with private_lock(registry.root / "manager" / "locks" / "deployment.lock"):
+            if command in {"start", "stop", "writer-open", "writer-io", "writer-check", "writer-close"}:
+                result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
+            else:
+                with private_lock(registry.root / "manager" / "locks" / f"instance-{instance}.lock"):
+                    if command in {"prepare", "template-init", "import", "restore", "reset", "recover", "snapshot"}:
+                        with private_lock(registry.root / "manager" / "locks" / "deployment.lock"):
+                            result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
+                    else:
                         result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
-                else:
-                    result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
         else:
             result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
         return {"ok": True, "operationId": operation_id, "result": result}
