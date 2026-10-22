@@ -27,8 +27,12 @@ CLIの`writer-open`/`writer-io`/`writer-close`はoperationIdと以下の共通pa
 登録や完了証跡を追加せず、終了済み・結果不明のwriterを監視の根拠にしません。
 
 openにはpid/startMillis/cwdを加えます。監督はnative PID・開始識別・boot・cwd・実行ファイル・command hash・OS ownerを記録し、
-操作ごとに再照合します。native照合、FS、通信はSQL write transaction外で行い、
-枠のinstance lockは保存/APIの応答とCloseまで保持します。stop/startと同時に書き込みません。
+操作ごとに再照合します。instance OS lock→短いDB transactionの順で予約・確定し、native照合、FS、proxy通信・終了待機は両方の外で行います。
+I/O受付は既writer操作と同じtransactionに内部`writer-call:<fingerprint>`予約を記録し、別processを含む同じinstanceのcallと競合を検出します。
+同IDの再提示も実行中の予約を引き継ぎません。INSERTのcommitが成功したcallerだけが、call終端時にlease/epoch/世代/run/操作と予約全列を再照合して解除します。
+call予約の解除はUNKNOWN proxyの終端やwriterのpending解除ではなく、別sessionの既受付条件も変更しません。解除失敗・crashでは予約を保全し、期限で回収しません。
+`read`/`list`/`server-read`もI/O中は予約しますが、成功時は読取操作とcall予約を同じtransactionで削除し、本文を永続化しません。同IDの再読取りは新しい結果を返します。
+stop/startは未完了writerまたはcall予約を作用前に拒否します。
 管理rootのprivate IPC/ACLは既存契約を維持します。
 
 常用のstatus/API/ファイル読取りはRegistryとactive.json・generation.json、journal/staging不在、
@@ -80,7 +84,7 @@ Managerはこの明示情報がある失敗だけOPENを維持できます。err
 保存受付後のOS/DB障害、API応答喪失/Close未完、CLI応答不明はUNKNOWNとし、未完了操作とwriter登録を保持します。
 検査時点と実操作の間にOS状態が変わった場合も、受付後の失敗は保留です。
 同じoperationIdの完了済み再送は識別とsession状態を再確認します。UNKNOWN/PENDINGを再実行しません。
-`action: api`の本文はDBへ記録せず応答hashだけを残すため、再送結果からAPI本文を再取得できません。DB専用writerは同じhelperが保持する応答だけを返し、保持本文を失った場合は`responseAvailable:false`と状態/hashを返します。
+`action: api`の本文はDBへ記録せず応答hashだけを残すため、再送結果からAPI本文を再取得できません。DB専用writerは同じhelperが保持する応答だけを返し、保持本文を失った場合は`responseAvailable:false`と状態/hashを返します。完了済みDB操作のdry-run再提示は状態/hashだけを返し、保持応答の受信・ACK・call予約を行いません。
 
 切断は新規受付を閉じ、受理済みAPIキューを結果確定まで実行します。
 executor待機はI/O lock外、writer-closeは実行中I/Oが終わった後です。

@@ -43,6 +43,12 @@ python3.12 -B scripts/dev-server.py stop --root /absolute/minecraft-dev --operat
 RCON通信とJVM/child終了待機にはそれぞれpayloadの期限を使用します。
 RCONは接続・認証・停止応答全体で一つの絶対期限を使い、断片応答ごとに延長しません。
 IPC期限はそれらと検証・コピー時間を含む長さにしてください。CLI期限切れで監督操作をkill/再送しません。
+start/stopの予約と確定だけでinstance OS lock→短いDB transactionを保持します。世代・bundleの検査、OS照合、spawn、RCON、終了待機は両方の外で行います。
+予約したlease/epoch/世代/runとoperationId/fingerprint/未完了状態が一致するときだけ確定し、古い結果で新runを更新しません。
+runsは新規INSERTと読取元record bytesによる条件付きUPDATEを使い、既存runの置換や再読込による勝手な確定を行いません。GameTestも同じrecord更新規則を使います。
+作用後の結果不明ではpending/RECOVERY_REQUIREDを保全し、再spawn・新ID再送・期限による解除は行いません。
+このlock分割は既writerとの競合拒否までで、P-v5のBLOCKED/accepted drain、native受付、最新writer台帳の証明は未接続です。
+
 dry-runは条件照合だけで、DB、世代、予約、補助ファイル、プロセス、socketを作成しません。
 dry-runの成功は実行時の空きport保証ではありません。
 
