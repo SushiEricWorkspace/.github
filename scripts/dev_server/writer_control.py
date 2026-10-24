@@ -14,6 +14,7 @@ from .local_ipc import MAX_MESSAGE, encode, make_private, plain_path
 from .registry import RegistryError, fields, identifier, require
 from .runtime_control import TOKEN
 from . import runtime_process
+from .mod_control_startup import _admission, _require_open, _touch
 
 SESSION = TOKEN | {"sessionId", "runId", "nonce"}
 EDIT_DIRECTORIES = {"item_data", "ore_data", "shop_data", "recipe_data"}
@@ -43,9 +44,17 @@ class WriterControl:
     def _bound(self, connection, payload, *, closing=False):
         row = dict(self.registry._instance(connection, payload["instanceId"]))
         self.registry._token(row, payload)
-        require(row["generation_bound"] and row["generation"] is not None and not row["pending"],
+        require(row["generation_bound"] and row["generation"] is not None and (closing or not row["pending"]),
                 "INVALID_STATE", "完成世代と未完了操作不在が必要です")
-        require(row["state"] in ({"RUNNING", "LEASED_STOPPED"} if closing else {"RUNNING"}),
+        gate = _admission(connection, row)
+        if closing and row["state"] == "STOPPING":
+            require(row["pending"] and gate["gate"] == "BLOCKED" and gate["descriptor_hash"] is not None,
+                    "CONTROL_BLOCKED", "既受理専用runの停止予約が必要です")
+        elif closing:
+            require(not row["pending"], "INVALID_STATE", "未完了操作を保全します")
+        if not closing:
+            row["admission_revision"] = _require_open(connection, row)
+        require(row["state"] in ({"RUNNING", "LEASED_STOPPED", "STOPPING"} if closing else {"RUNNING"}),
                 "NOT_RUNNING", "writerの書込みは同じRUNNING runだけに許可します")
         recorded = connection.execute("SELECT record FROM runs WHERE id=?", (row["run_id"],)).fetchone()
         require(recorded is not None, "PROOF_REQUIRED", "起動記録がありません")
@@ -54,13 +63,25 @@ class WriterControl:
                 "STALE_RUN", "起動識別が一致しません")
         return row
 
-    def _session(self, connection, payload, *, closing=False):
+    def _session(self, connection, payload, *, closing=False, completed_close=None):
         row = self._bound(connection, payload, closing=closing)
         session = connection.execute("SELECT * FROM writer_sessions WHERE id=?", (payload["sessionId"],)).fetchone()
         require(session is not None and session["instance"] == row["id"]
                 and session["lease"] == row["lease"] and session["epoch"] == row["epoch"]
                 and session["generation"] == row["generation"] and session["run"] == row["run_id"]
                 and session["nonce"] == payload["nonce"], "STALE_WRITER", "writerの接続識別が一致しません")
+        if row["state"] == "STOPPING" and session["status"] == "CLOSED":
+            require(closing and completed_close is not None and not session["pending"],
+                    "STALE_WRITER", "終了済みsessionは元close応答の読戻しだけを許可します")
+            operation_id, fingerprint = completed_close
+            saved = connection.execute("SELECT * FROM writer_operations WHERE id=?", (operation_id,)).fetchone()
+            require(saved is not None and saved["session"] == payload["sessionId"]
+                    and saved["command"] == "writer-close" and saved["status"] == "COMPLETED"
+                    and saved["fingerprint"] == fingerprint,
+                    "STALE_WRITER", "同じ完成close要求ではありません")
+        elif row["state"] == "STOPPING":
+            require(session["status"] in {"OPEN", "UNKNOWN", "CLOSING"},
+                    "STALE_WRITER", "終了済みsessionへ停止中の処理を再適用しません")
         return row, session
 
     def execute(self, command, payload, *, operation_id, dry_run=False):
@@ -89,7 +110,7 @@ class WriterControl:
         fingerprint = digest(canonical({"command": command, "payload": payload}))
         if command == "writer-io" and payload["request"]["action"] == "database":
             return self._database_execute(payload, operation_id, fingerprint, dry_run)
-        if command == "writer-close" and self._has_database(payload):
+        if command == "writer-close" and self._has_database(payload, completed_close=(operation_id, fingerprint)):
             return self._database_close(payload, operation_id, fingerprint, dry_run)
         read = command == "writer-io" and payload["request"]["action"] in {"read", "list", "server-read"}
         with self.registry.runtime._transaction(payload["instanceId"], read_only=True) as connection:
@@ -101,7 +122,8 @@ class WriterControl:
                                            (payload["instanceId"],)).fetchone(), "WRITER_PENDING", "writer callが実行中です")
             if cached:
                 require(cached["fingerprint"] == fingerprint, "OPERATION_CONFLICT", "同じoperationIdへ別の要求を指定できません")
-                row, session = self._session(connection, payload, closing=command == "writer-close")
+                row, session = self._session(connection, payload, closing=command == "writer-close",
+                    completed_close=(operation_id, fingerprint) if command == "writer-close" and cached["status"] == "COMPLETED" else None)
                 require(cached["status"] == "COMPLETED", "WRITER_PENDING", "結果不明のwriter操作を再実行しません")
                 require(session["status"] == ("CLOSED" if command == "writer-close" else "OPEN"),
                         "STALE_WRITER", "完了済み接続へ古い操作を再適用できません")
@@ -125,7 +147,8 @@ class WriterControl:
             runtime_process.require_identity(json.loads(session["identity"]), self.process_adapter.identity(session["pid"]))
         if cached:
             with self.registry.runtime._transaction(payload["instanceId"], read_only=True) as connection:
-                self._session(connection, payload, closing=command == "writer-close")
+                self._session(connection, payload, closing=command == "writer-close",
+                    completed_close=(operation_id, fingerprint) if command == "writer-close" else None)
                 require(not connection.execute("SELECT 1 FROM reservations WHERE instance=? AND reference LIKE 'writer-call:%'",
                                                (row["id"],)).fetchone(), "WRITER_PENDING", "writer callが実行中です")
             return dict(json.loads(cached["response"]), replayed=True, dryRun=dry_run)
@@ -142,6 +165,7 @@ class WriterControl:
             return {"dryRun": True, "wouldExecute": command}
         if command == "writer-io" and not read:
             self._preflight(row, payload["request"])
+        expected_revision = row.get("admission_revision")
         with self.registry.runtime._transaction(payload["instanceId"]) as connection:
             for table in ("operations", "runtime_operations", "reference_operations", "writer_operations", "snapshot_operations"):
                 require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
@@ -155,6 +179,9 @@ class WriterControl:
             else:
                 row, session = self._session(connection, payload, closing=command == "writer-close")
                 require(session["status"] == "OPEN" and not session["pending"], "WRITER_PENDING", "保存操作が未完了です")
+            if command != "writer-close":
+                _require_open(connection, row, revision=expected_revision)
+            _touch(connection, row)
             connection.execute("INSERT INTO writer_operations VALUES (?,?,?,?,?,?)",
                                (operation_id, fingerprint, payload["sessionId"], command, "PENDING", "{}"))
             if command == "writer-open":
@@ -181,6 +208,7 @@ class WriterControl:
             runtime_process.require_identity(json.loads(session["identity"]), self.process_adapter.identity(session["pid"]))
             with self.registry.runtime._transaction(payload["instanceId"]) as connection:
                 self._reserved(connection, payload, operation_id, fingerprint, command)
+                _touch(connection, row)
                 connection.execute("UPDATE writer_sessions SET pending=0 WHERE id=?", (payload["sessionId"],))
                 if read:
                     self._delete_claim(connection, row, payload, operation_id, fingerprint)
@@ -197,6 +225,7 @@ class WriterControl:
             rejected = read and isinstance(error, (RegistryError, PermissionError))
             with self.registry.runtime._transaction(payload["instanceId"]) as connection:
                 self._reserved(connection, payload, operation_id, fingerprint, command)
+                _touch(connection, row)
                 if rejected:
                     self._delete_claim(connection, row, payload, operation_id, fingerprint)
                     connection.execute("DELETE FROM writer_operations WHERE id=?", (operation_id,))
@@ -215,11 +244,14 @@ class WriterControl:
                 self._release_call(row, payload, operation_id, fingerprint)
 
     def _reserved(self, connection, payload, operation_id, fingerprint, command):
-        row, session = self._session(connection, payload, closing=command == "writer-close")
+        row, session = self._session(connection, payload, closing=True)
         operation = connection.execute("SELECT * FROM writer_operations WHERE id=?", (operation_id,)).fetchone()
         require(session["pending"] and operation is not None and operation["session"] == payload["sessionId"]
                 and operation["fingerprint"] == fingerprint and operation["command"] == command
                 and operation["status"] == "PENDING", "WRITER_PENDING", "同じ未完了writer操作ではありません")
+        require(connection.execute("SELECT 1 FROM reservations WHERE operation=? AND reference=? AND instance=? AND lease=? AND epoch=?",
+                    (operation_id, "writer-call:" + fingerprint, row["id"], row["lease"], row["epoch"])).fetchone(),
+                "WRITER_PENDING", "既受理callの保持証跡がありません")
         return row, session
 
     def _claim(self, connection, row, payload, operation_id, fingerprint):
@@ -258,9 +290,9 @@ class WriterControl:
     def _database_path(self, row, session_id):
         return self.registry.runtime._paths(row['id']) / 'diagnostics' / row['run_id'] / ('db-writer-' + session_id)
 
-    def _has_database(self, payload):
+    def _has_database(self, payload, *, completed_close=None):
         with self.registry.runtime._transaction(payload["instanceId"], read_only=True) as connection:
-            row, _ = self._session(connection, payload, closing=True)
+            row, _ = self._session(connection, payload, closing=True, completed_close=completed_close)
         path = self._database_path(row, payload['sessionId'])
         plain_path(path)
         return payload['sessionId'] in self.database_proxies or path.exists()
@@ -273,7 +305,9 @@ class WriterControl:
 
     def _database_state(self, payload, operation_id, fingerprint, *, closing=False):
         with self.registry.runtime._transaction(payload["instanceId"], read_only=True) as connection:
-            row, session = self._session(connection, payload, closing=closing)
+            cached = connection.execute('SELECT * FROM writer_operations WHERE id=?', (operation_id,)).fetchone()
+            row, session = self._session(connection, payload, closing=closing or cached is not None,
+                completed_close=(operation_id, fingerprint) if closing and cached and cached['status'] == 'COMPLETED' else None)
             for table in ('operations', 'runtime_operations', 'reference_operations', 'snapshot_operations'):
                 require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
                         'OPERATION_CONFLICT', 'operationIdが他の操作で使用されています')
@@ -291,7 +325,7 @@ class WriterControl:
             self.registry.runtime._running(row)
         return row, session, cached
 
-    def _database_accept(self, payload, operation_id, fingerprint, command):
+    def _database_accept(self, payload, operation_id, fingerprint, command, *, revision=None):
         with self.registry.runtime._transaction(payload["instanceId"]) as connection:
             row, session = self._session(connection, payload, closing=command == 'writer-close')
             require(session['status'] in ({'OPEN', 'UNKNOWN'} if command == 'writer-close' else {'OPEN'})
@@ -300,6 +334,10 @@ class WriterControl:
             for table in ('operations', 'runtime_operations', 'reference_operations', 'snapshot_operations', 'writer_operations'):
                 require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
                         'OPERATION_CONFLICT', 'operationIdが受付中に使用されました')
+            if command != 'writer-close':
+                require(type(revision) is int, 'STALE_OPERATION', '元の受付revisionが必要です')
+                _require_open(connection, row, revision=revision)
+            _touch(connection, row)
             connection.execute('INSERT INTO writer_operations VALUES (?,?,?,?,?,?)',
                                (operation_id, fingerprint, payload['sessionId'], command, 'PENDING', '{}'))
             self._claim(connection, row, payload, operation_id, fingerprint)
@@ -307,7 +345,19 @@ class WriterControl:
                                ('CLOSING' if command == 'writer-close' else 'OPEN', payload['sessionId']))
         return row
 
-    def _database_record(self, payload, response, *, phase, exit_proof=None):
+    def _database_call(self, connection, payload, operation, close_call):
+        require(operation['status'] == 'PENDING' and operation['command'] in {'writer-io', 'writer-close'},
+                'WRITER_PENDING', '未完了の受理済みDB要求が必要です')
+        if close_call is None:
+            self._reserved(connection, payload, operation['id'], operation['fingerprint'], operation['command'])
+        else:
+            close_id, close_hash = close_call
+            require(operation['command'] == 'writer-io' and operation['id'] != close_id,
+                    'OPERATION_CONFLICT', 'closeが回収する元DB要求ではありません')
+            _, session = self._reserved(connection, payload, close_id, close_hash, 'writer-close')
+            require(session['status'] == 'CLOSING', 'WRITER_PENDING', 'closeの保持中だけ元DB要求を回収できます')
+
+    def _database_record(self, payload, response, *, phase, exit_proof=None, close_call=None, request=None):
         status = response['status']
         closing = exit_proof is not None
         terminal = closing or phase == 'execute' and status in {'RESULT', 'REJECTED'} or phase == 'bootstrap' and status == 'REJECTED'
@@ -331,6 +381,12 @@ class WriterControl:
                         'API_PROTOCOL', '確定済み応答を別の応答へ変更しません')
                 return previous
             require(operation['status'] == 'PENDING' and session['pending'], 'WRITER_PENDING', '未完了のDB操作ではありません')
+            if close_call is not None:
+                require(not closing and request is not None and request.get('command') in {'open', 'execute', 'resolve'}
+                        and request.get('operationId') == operation['id'] and request.get('requestHash') == operation['fingerprint'],
+                        'OPERATION_CONFLICT', '回収する私設要求が元DB要求と一致しません')
+            self._database_call(connection, payload, operation, close_call)
+            _touch(connection, row)
             if operation['command'] == 'writer-close':
                 terminal = closing
                 metadata['completed'] = closing
@@ -381,7 +437,7 @@ class WriterControl:
                 'WRITER_PENDING', '正本へ未記録の応答を解放しません')
         proxy.acknowledge(response_hash)
 
-    def _database_interrupt_bootstrap(self, payload, proxy, operation_id, fingerprint):
+    def _database_interrupt_bootstrap(self, payload, proxy, operation_id, fingerprint, *, close_call=None):
         proxy.verify()
         require(proxy.started, 'WRITER_PENDING', 'bootstrap本人が未確認です')
         if proxy.request_bytes is None:
@@ -405,6 +461,13 @@ class WriterControl:
             if proxy.response_bytes is not None:
                 require(metadata.get('proxyResponseSha256') == digest(proxy.response_bytes),
                         'WRITER_PENDING', '既知OPENの保持応答が正本と一致しません')
+            if operation['status'] == 'COMPLETED':
+                require(metadata.get('completed') is True and metadata.get('code') == 'DB_BOOTSTRAP_INTERRUPTED',
+                        'WRITER_PENDING', '完成済みDB要求を変更しません')
+                return metadata
+            require(session['pending'] and operation['command'] == 'writer-io',
+                    'WRITER_PENDING', '未完了の受理済みbootstrapが必要です')
+            self._database_call(connection, payload, operation, close_call)
             metadata.update(completed=True, rejectedBeforeEffect=True, code='DB_BOOTSTRAP_INTERRUPTED')
             connection.execute("UPDATE writer_operations SET status='COMPLETED',response=? WHERE id=?",
                                (json.dumps(metadata), operation_id))
@@ -414,18 +477,18 @@ class WriterControl:
             self._database_ack(payload, proxy)
         return metadata
 
-    def _database_collect(self, payload, proxy, deadline):
+    def _database_collect(self, payload, proxy, deadline, *, close_call=None):
         request = json.loads(proxy.request_bytes)
         phase = 'bootstrap' if request['command'] == 'open' else 'execute'
         response = proxy.receive(deadline)
         if response['status'] == 'PENDING' and phase == 'execute':
-            self._database_record(payload, response, phase=phase)
+            self._database_record(payload, response, phase=phase, close_call=close_call, request=request)
             self._database_ack(payload, proxy)
             resolve = {key: request[key] for key in ('operationId', 'requestHash')}
             response = proxy.begin(dict(resolve, command='resolve', timeoutMillis=30_000), deadline)
-        metadata = self._database_record(payload, response, phase=phase)
+        metadata = self._database_record(payload, response, phase=phase, close_call=close_call, request=request)
         if phase == 'bootstrap' and response['status'] == 'OPEN':
-            metadata = self._database_interrupt_bootstrap(payload, proxy, request['operationId'], request['requestHash'])
+            metadata = self._database_interrupt_bootstrap(payload, proxy, request['operationId'], request['requestHash'], close_call=close_call)
         return metadata, response
 
     def _database_execute(self, payload, operation_id, fingerprint, dry_run):
@@ -487,7 +550,7 @@ class WriterControl:
                     created_proxy = True
                 try:
                     require(not proxy.started or proxy.bound, 'WRITER_PENDING', '未確定のbootstrapを再実行しません')
-                    row = self._database_accept(payload, operation_id, fingerprint, 'writer-io')
+                    row = self._database_accept(payload, operation_id, fingerprint, 'writer-io', revision=row['admission_revision'])
                     claimed = True
                 except BaseException:
                     if created_proxy and not proxy.started:
@@ -544,7 +607,7 @@ class WriterControl:
                 if proxy.request_bytes is not None:
                     request = json.loads(proxy.request_bytes)
                     if request['operationId'] != operation_id:
-                        metadata, response = self._database_collect(payload, proxy, deadline)
+                        metadata, response = self._database_collect(payload, proxy, deadline, close_call=(operation_id, fingerprint))
                         if not metadata['completed']:
                             return {'sessionId': payload['sessionId'], 'closed': False, 'completed': False,
                                     'proxyStatus': response['status']}
@@ -569,7 +632,7 @@ class WriterControl:
                                                  (payload['sessionId'],)).fetchall()
                 require(len(pending) <= 1, 'WRITER_PENDING', '未完了のDB要求が一意ではありません')
                 if pending:
-                    self._database_interrupt_bootstrap(payload, proxy, pending[0]['id'], pending[0]['fingerprint'])
+                    self._database_interrupt_bootstrap(payload, proxy, pending[0]['id'], pending[0]['fingerprint'], close_call=(operation_id, fingerprint))
                 response = proxy.begin({'command': 'close', 'operationId': operation_id,
                                         'requestHash': fingerprint, 'timeoutMillis': 30_000}, deadline)
                 if response['status'] not in {'CLOSED', 'UNBOUND_CLOSED'}:

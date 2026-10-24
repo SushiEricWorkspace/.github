@@ -31,6 +31,7 @@ openにはpid/startMillis/cwdを加えます。監督はnative PID・開始識�
 I/O受付は既writer操作と同じtransactionに内部`writer-call:<fingerprint>`予約を記録し、別processを含む同じinstanceのcallと競合を検出します。
 同IDの再提示も実行中の予約を引き継ぎません。INSERTのcommitが成功したcallerだけが、call終端時にlease/epoch/世代/run/操作と予約全列を再照合して解除します。
 call予約の解除はUNKNOWN proxyの終端やwriterのpending解除ではなく、別sessionの既受付条件も変更しません。解除失敗・crashでは予約を保全し、期限で回収しません。
+DB closeは元IOの永続operationId/fingerprintを照合し、現在のclose自身のcall予約下で受理済みIOを完結します。元IOのcall予約は再生成しません。
 `read`/`list`/`server-read`もI/O中は予約しますが、成功時は読取操作とcall予約を同じtransactionで削除し、本文を永続化しません。同IDの再読取りは新しい結果を返します。
 stop/startは未完了writerまたはcall予約を作用前に拒否します。
 管理rootのprivate IPC/ACLは既存契約を維持します。
@@ -96,7 +97,7 @@ supervisor再起動時には枠をRECOVERY_REQUIREDにし、復旧機能が接�
 statusのwriters/writerSessionsは登録正本です。runtimeStopProofとwriter不在の両方が揃ったときだけcleanEligibleを返します。
 これはsnapshot作成へ進める候補判定です。snapshotCleanはsnapshot作成の全検証が成功した後だけtrueになります。
 同一OSユーザーの非協調的な直接編集、登録外writer、FS停電耐久性の証明は含みません。
-Registry DB/INITIALIZEDはversion=4です。旧開発DBは拒否・保全し、移行や既存rootの上書きは行いません。
+Registry DB/INITIALIZEDはversion=5です。旧version=4も拒否・保全し、自動移行しません。旧開発DBは拒否・保全し、移行や既存rootの上書きは行いません。
 試験には新しい空rootを用意してください。
 
 ## 自動検証
