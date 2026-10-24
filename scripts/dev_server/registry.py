@@ -62,6 +62,11 @@ CREATE TABLE runtime_operations(
  id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, command TEXT NOT NULL, instance TEXT NOT NULL,
  status TEXT NOT NULL, response TEXT NOT NULL);
 CREATE TABLE runs(id TEXT PRIMARY KEY, instance TEXT NOT NULL, generation TEXT NOT NULL, record TEXT NOT NULL);
+CREATE TABLE run_admission(
+ run TEXT PRIMARY KEY REFERENCES runs(id), instance TEXT NOT NULL, lease TEXT NOT NULL,
+ epoch INTEGER NOT NULL, generation TEXT NOT NULL, nonce TEXT NOT NULL,
+ gate TEXT NOT NULL, revision INTEGER NOT NULL, descriptor_hash TEXT,
+ start_operation TEXT NOT NULL REFERENCES runtime_operations(id));
 CREATE TABLE endpoint_reservations(
  run TEXT NOT NULL, instance TEXT NOT NULL, service TEXT NOT NULL,
  host TEXT NOT NULL, protocol TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, v6Only INTEGER NOT NULL,
@@ -133,7 +138,7 @@ def initialize(inventory: dict, *, operation_id: str, dry_run: bool = False) -> 
         connection.execute("PRAGMA synchronous=FULL")
         connection.executescript(SCHEMA)
         with connection:
-            connection.execute("INSERT INTO meta VALUES ('schemaVersion','4')")
+            connection.execute("INSERT INTO meta VALUES ('schemaVersion','5')")
             connection.execute("INSERT INTO meta VALUES ('initOperation',?)", (operation_id,))
             digest = hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
             connection.execute("INSERT INTO meta VALUES ('inventoryHash',?)", (digest,))
@@ -145,7 +150,7 @@ def initialize(inventory: dict, *, operation_id: str, dry_run: bool = False) -> 
         connection.close()
     make_private(database)
     marker = root / "manager" / "INITIALIZED"
-    marker.write_text("registry-v4\n", encoding="utf-8")
+    marker.write_text("registry-v5\n", encoding="utf-8")
     make_private(marker)
     return {"initialized": True, "instances": [row["instanceId"] for row in inventory["instances"]]}
 
@@ -166,7 +171,7 @@ class Registry:
             require_private(directory, directory=True)
         for name in ("inventory.json", "registry.sqlite", "INITIALIZED"):
             require_private(root / "manager" / name)
-        require((root / "manager" / "INITIALIZED").read_text(encoding="utf-8") == "registry-v4\n",
+        require((root / "manager" / "INITIALIZED").read_text(encoding="utf-8") == "registry-v5\n",
                 "RECOVERY_REQUIRED", "初期化が完了していません")
         self.inventory = json.loads((root / "manager" / "inventory.json").read_text(encoding="utf-8"))
         validate("inventory", self.inventory)
@@ -174,7 +179,7 @@ class Registry:
         with self.transaction(read_only=True) as connection:
             meta = dict(connection.execute("SELECT key,value FROM meta"))
             digest = hashlib.sha256(json.dumps(self.inventory, sort_keys=True).encode()).hexdigest()
-            require(meta.get("schemaVersion") == "4" and meta.get("inventoryHash") == digest,
+            require(meta.get("schemaVersion") == "5" and meta.get("inventoryHash") == digest,
                     "RECOVERY_REQUIRED", "Registryとinventoryが一致しません")
             actual_ids = {row[0] for row in connection.execute("SELECT id FROM instances")}
             declared_ids = {row["instanceId"] for row in self.inventory["instances"]}
@@ -243,6 +248,7 @@ class Registry:
         with self.transaction() as connection:
             if connection.execute("SELECT 1 FROM meta WHERE key='supervisorBoot'").fetchone():
                 connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED'")
+                connection.execute("UPDATE run_admission SET gate='BLOCKED',revision=revision+1 WHERE gate!='BLOCKED'")
                 connection.execute("UPDATE runtime_operations SET status='RECOVERY_REQUIRED' WHERE command='gametest' AND status='PENDING'")
             connection.execute("INSERT OR REPLACE INTO meta VALUES ('supervisorBoot',?)", (boot,))
         return boot
@@ -397,6 +403,7 @@ class Registry:
                     return {"dryRun": True, "wouldExecute": command}
                 result = {"shutdown": True, "bootId": boot[0]}
                 connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED'")
+                connection.execute("UPDATE run_admission SET gate='BLOCKED',revision=revision+1 WHERE gate!='BLOCKED'")
                 connection.execute("INSERT INTO operations VALUES (?,?,?)", (operation_id, fingerprint, json.dumps(result)))
                 connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,?)", (self.clock(), operation_id, command))
                 return result

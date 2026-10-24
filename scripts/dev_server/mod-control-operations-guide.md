@@ -1,7 +1,7 @@
 # Mod control原bytes正本とData UUID境界（先行実装）
 
 Refs #64。mod_control_operations.pyはMod専用wire v2の要求/応答原文を、
-既runtime_operations内へ保存する未接続の先行成果です。
+既runtime_operations内へ保存する先行成果です。通常の実起動・公開CLIは未接続で、private startupの先行利用は[run限定受付](mod-control-guide.md#p-private-startupとrun受付門先行接続)を参照してください。
 既start/stop/writerのfingerprint・replayed応答契約を横断変更していません。
 native endpoint、peer認証、instance/run/lease/世代の受付排他、
 writer台帳・native作用・停止成功・observer起動へは接続していません。
@@ -62,8 +62,8 @@ Data129のrequireManagementはleaseId/generationにUUID.fromStringを要求す�
 Data管理runへ使う場合は新しい貸出/UUID世代または許可された明示再作成が必要です。
 既root・Data state・旧receiptへの自動移行、手編集、再baselineは行いません。
 
-この先行変更ではRegistry schemaVersion/INITIALIZED markerを変更していません。
-v5の受付門/revision/native台帳は設計段階であり、実装済みと扱いません。
+原bytes保存入口の6列とwire2形式は維持します。Registry schemaVersion/INITIALIZED markerはfresh v5とし、旧v4を拒否・保全して自動移行しません。
+v5はrun限定の受付門/revisionをprivate startupへ結束します。実起動・承認供給元・native全台帳/全保存/復旧の結合は未完です。[private startup](mod-control-guide.md#p-private-startupとrun受付門先行接続)を参照してください。
 
 ## 局所検証
 

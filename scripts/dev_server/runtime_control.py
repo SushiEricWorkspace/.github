@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import stat
 import time
+import threading
 import uuid
 
 from .build_inputs import canonical, digest
@@ -15,6 +16,7 @@ from .registry import RegistryError, fields, identifier, require, ttl
 from .runtime_bundle import launch_command, verify_bundle, require_data_generation
 from .runtime_ports import instance_endpoints, reserve, prebind, require_listeners, socket_keys
 from . import runtime_process, runtime_rcon
+from .mod_control_startup import _admission, _change, _Startup
 
 TOKEN = {"instanceId", "leaseId", "epoch", "expectedGeneration"}
 
@@ -41,6 +43,46 @@ class RuntimeControl:
         self.registry = registry
         self.process_adapter = process_adapter
         self.processes = {}
+        self._control = None
+        self._control_lock = threading.Lock()
+
+    def _managed_startup(self, token, *, transport, **inputs):
+        """独立P入力のprivate受付。通常start/実承認供給元には未接続。"""
+        with self._control_lock:
+            if self._control is None:
+                self._control = _Startup(self, transport)
+            require(self._control.transport is transport, "CONTROL_BUSY", "保持transportを置換しません")
+        return self._control.start(token, **inputs)
+
+    def _managed_readback(self, token, *, deadline):
+        """既認証sessionの同BOUND原文へ保存ACKだけを返す。起動完成・再OPENは行わない。"""
+        require(self._control is not None, "CONTROL_PENDING", "保持した認証sessionがありません")
+        return self._control.readback(token, deadline=deadline)
+
+    def _reserve_managed_stop(self, payload, *, operation_id, revision):
+        """専用runを短txで閉門/停止予約する。drain・保存・実停止を代行しない。"""
+        identifier(operation_id, "operationId")
+        fields(payload, TOKEN | {"timeoutSeconds"})
+        ttl(payload["timeoutSeconds"])
+        fingerprint = digest(canonical({"command": "stop", "payload": payload}))
+        with self._transaction(payload["instanceId"]) as connection:
+            row = dict(self.registry._instance(connection, payload["instanceId"]))
+            self.registry._token(row, payload, allow_expired=True)
+            gate = _admission(connection, row)
+            require(gate["descriptor_hash"] is not None and gate["gate"] == "OPEN"
+                    and row["state"] == "RUNNING" and not row["pending"],
+                    "CONTROL_BLOCKED", "同じ専用runのOPEN受付だけを停止予約します")
+            for table in ("operations", "runtime_operations", "reference_operations", "writer_operations", "snapshot_operations"):
+                require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
+                        "OPERATION_CONFLICT", "停止要求は自動再実行しません")
+            next_revision = _change(connection, row, revision, "BLOCKED")
+            response = {"instanceId": row["id"], "runId": row["run_id"], "pending": True}
+            connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
+                (operation_id, fingerprint, "stop", row["id"], "PENDING", json.dumps(response)))
+            connection.execute("UPDATE instances SET state='STOPPING',pending=1,runtime_proof=NULL,clean_proof=NULL WHERE id=?", (row["id"],))
+            connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)",
+                (operation_id, "artifact:" + row["artifact"], row["id"], row["lease"], row["epoch"]))
+        return next_revision
 
     def _paths(self, instance):
         root = self.registry.root / "instances" / instance
@@ -139,6 +181,14 @@ class RuntimeControl:
                         "STALE_OPERATION", "既存runを置換しません")
                 connection.execute("INSERT INTO runs VALUES (?,?,?,?)",
                                    (run["runId"], run["instanceId"], run["generationId"], record))
+                if run.get("kind") != "gametest":
+                    operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (run["startOperationId"],)).fetchone()
+                    require(operation is not None and operation["instance"] == current["id"]
+                            and operation["command"] == "start" and operation["status"] == "PENDING"
+                            and operation["fingerprint"] == run["startRequestHash"],
+                            "STALE_OPERATION", "Pの元起動予約が一致しません")
+                    connection.execute("INSERT INTO run_admission VALUES (?,?,?,?,?,?,'CLOSED',0,NULL,?)",
+                        (run["runId"], current["id"], current["lease"], current["epoch"], current["generation"], run["nonce"], run["startOperationId"]))
             else:
                 changed = connection.execute("UPDATE runs SET record=? WHERE id=? AND instance=? AND generation=? AND record=?",
                                              (record, run["runId"], run["instanceId"], run["generationId"], expected))
@@ -222,6 +272,9 @@ class RuntimeControl:
                     "WRITER_PENDING", "writer保存の完了が不明なため停止・再起動を開始できません")
             require(not connection.execute("SELECT 1 FROM reservations WHERE instance=? AND reference LIKE 'writer-call:%'",
                                            (row["id"],)).fetchone(), "WRITER_PENDING", "writer callが実行中です")
+            if command == "stop":
+                gate = _admission(connection, current)
+                _change(connection, current, gate["revision"], "BLOCKED")
             response = {"instanceId": row["id"], "pending": True}
             connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
                                (operation_id, fingerprint, command, row["id"], "PENDING", json.dumps(response)))
@@ -246,6 +299,10 @@ class RuntimeControl:
                         and operation["instance"] == row["id"] and operation["command"] == command
                         and operation["status"] == "PENDING", "STALE_OPERATION", "同じ未完了操作ではありません")
                 if command == "start":
+                    gate = _admission(connection, current)
+                    require(gate["descriptor_hash"] is None and gate["gate"] == "CLOSED",
+                            "CONTROL_BLOCKED", "専用startupの受付を通常proofで開けません")
+                    _change(connection, current, gate["revision"], "OPEN")
                     connection.execute("UPDATE instances SET state='RUNNING',pending=0 WHERE id=?", (row["id"],))
                 else:
                     connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?",
@@ -319,6 +376,7 @@ class RuntimeControl:
         diagnostics.mkdir(parents=True)
         make_private(diagnostics, directory=True)
         run = {"runId": run_id, "instanceId": row["id"], "generationId": row["generation"],
+               "startOperationId": operation_id, "startRequestHash": digest(canonical({"command": "start", "payload": payload})),
                "artifactId": row["artifact"], "nonce": nonce, "identity": None,
                "proofPath": str(diagnostics / "proof.json"), "cwd": str(generation.resolve()),
                "manifestHash": digest((generation / "runtime/runtime.json").read_bytes()), "endpoints": endpoints,

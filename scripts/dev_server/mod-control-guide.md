@@ -132,8 +132,8 @@ py -3.12 -B -m unittest discover -s scripts -p test_mod_control_wire.py -v
 ```
 
 後続P統合では既runtime/writer正本と同transactionで予約・遮断・revision・完全台帳を設計します。
-start/stop待機が保持するinstance OS lockと4 worker poolへこのcontrolを共有すると
-handshakeが進まないため、別bounded受付を用意する必要があります。
+start/stopの待機はinstance OS lockとDB transactionの外です。既4 worker poolへcontrol待機も共有すると
+worker枯渇でhandshakeが進まないため、実接続には別bounded制御進行が必要です。
 未接続の予約table・新daemon・汎用SQL/path・認証fallbackはこの先行成果に含めません。
 
 ## 原bytes正本とUUIDの先行接続
@@ -204,10 +204,55 @@ transportはRegistry/DB・予約・業務作用を操作しません。将来の
 未認証/不完全frame/確定した予約前拒否には業務作用・新operation・成功相関を生成しません。
 予約commit不明や未完了操作の送受信不明はcallerが同ID/rawへUNKNOWNを結束します。
 既COMPLETED原responseの保存後に送達不明となっても完成正本を格下げせず、同要求readbackを維持します。
-積極確認できた作用前拒否は既error契約へ従います。このcaller接続自体は未実装です。
+積極確認できた作用前拒否は既error契約へ従います。通常CLIへのcaller接続は未実装です。privateの先行受付は後述します。
 
 mockはpartial read/write、header込み上限、context/peer差替え、descriptor実体検査、取消正常競合、
 未終端資源・枠・constructor故障を確認します。DLL/socket/process/file-openは禁止spyで検査します。
 実nativeの有限3ケースと両OSの固定suiteは、個別の明示許可で検証しました。実運用callerへの接続・総合受入は未完です。
 新DB/schema/台帳、GRANT/Data begin、停止成功、profile承認は追加していません。
 COMCTL/conhost等の診断例外も製品採用していません。
+
+## P private startupとrun受付門（先行接続）
+
+`RuntimeControl._managed_startup`は、Pが独立保持したexact profile原bytes、検証済みbundle、
+独立Observed、descriptor/P正本context・expectedEvidenceを明示供給するprivate入口です。
+通常startから自動転送せず、公開command・実起動・承認供給元・通常start迂回拒否は未接続です。
+候補の存在・schema2・Data座標からprofileを採用せず、新承認recordやLEGACY flagは設けません。
+
+native peer認証後のHELLOから元operationId/requestNonceへ相関するGRANTを生成し、
+固定P managementと既wire2で検査して元bytesを既runtime_operationsへ保存します。
+BOUNDは元HELLOのPRE原文とP正本へ照合し、検証RunningからACKを生成・保存してから送信します。
+受信nonceでPのrun nonceを更新しません。ACK全bytesの送信後だけ同revisionをCASして
+OPEN/RUNNINGを同短transactionで確定します。P runに保持した元start operationId/fingerprintと
+同instance/lease/epochのartifact予約を照合し、その同transactionで元起動結果をCOMPLETEDへ保存して
+当該artifact参照だけを解放します。runは参照だけ、start rowは既起動結果、wire rowはACK原文を保持します。
+通常executeは専用descriptorに結束した門を完成させず、完成ownerをprivate callerに限定します。
+保存・送信不明なら門を開けず、
+同所有PENDINGの元起動だけをRECOVERY_REQUIREDへ保全します。COMPLETED原応答をUNKNOWNへ格下げしません。
+OPEN/start完成commit後の返答不明で完成済み起動やACKを格下げしません。
+`_managed_readback`は保持した認証sessionで同BOUNDを受けたとき保存ACKだけを返し、元startのPENDINGを
+要求せず、門/revision/起動完成/参照解放を再作用しません。別run/旧世代・別原要求は拒否します。
+同要求readbackは新IDでの再作用・自動再送の許可ではありません。
+startupとreadbackは同sessionで同時に進めず、先行処理中は受信frameを消費する前に拒否します。
+失敗時はmutation前に保持したP checkpointから元起動を保全し、wire原文の保全とは別transactionにします。
+malformed/競合wireの保全不能で元startの保全を止めず、descriptor結束commitの返答不明も同じ保全対象です。
+
+fresh Registry v5にはrunごとのlease/epoch/generation/nonce・門・revisionを保持します。
+旧v4 DB/markerは拒否・保全し、自動ALTER、旧root再初期化や原本の書換えは行いません。
+通常startは従来の起動proofと同transactionで門を開き、通常stopは既pending/claim保護を維持して
+停止予約と閉門を同transactionで行います。門行欠落をOPENへ補完しません。
+
+新writer-open/ioとDB acceptはRUNNING・未pending・OPENと同run/lease/世代/nonce/revisionを
+予約transactionで再確認します。private managed stop予約は新受付をBLOCKEDにします。
+同run/sessionの受理済みoperationに結束したfinish・DB記録・closeはSTOPPING/pendingでも完結でき、
+終了済みsession・別run・旧世代への新admitには広げません。STOPPING中のCLOSED sessionは
+同run/session・元close operationId/fingerprintのCOMPLETED応答読戻しだけを許可します。閉門をdrain・全保存・reap・全系譜終了の証明にしません。
+
+制御進行は同期でinventoryのinstanceごとに1枠、未終端/不明資源と原入力はownerへ保持します。
+DB/instance lock内でnative・FS・受送信待機をしません。新threadは追加せず、
+実supervisorの4worker枯渇を解決した扱いにはしません。
+
+局所検証はSQLite memory、合成wire/Profile、bundle I/O mockとnative adapter fakeを使用します。
+同コードの全745件はWindowsで731PASS・14SKIP、Macで716PASS・29SKIP、FAIL/ERROR 0とCLI help exit0を個別に確認しました。
+実P/M起動・profile/native loadの実証・実OS startgate・旧root・全系譜/全資源の終端は未検証です。
+前成果の両OS699件/native3成功を本変更の再成功へ読み替えません。
