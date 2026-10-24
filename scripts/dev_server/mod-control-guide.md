@@ -157,3 +157,57 @@ GRANTは元HELLOの証拠hash、ACKは元BOUNDの証拠hashをechoし、各応�
 完成frameは4byteBE込み65536以下、body1..65532。innerの二重escapeとBOUNDのData status原文も含めて検査し、切捨て/分割/外部参照をしません。共有`mod-control-vectors-v2.json`と別境界vectorは合成値です。Data全モデル・serializer hash・最大status・実candidate収容・native/OS受入を証明しません。Data原文へEvidenceのexact-field/null拒否を再帰適用せず、既相関抽出とData側最終検証を維持します。
 
 共有vectorのbodyHex/frameHexが元bytesです。表示用bodyUtf8やcandidate metadataはAPIのcontextへ渡しません。両言語のencoderをcanonical化する契約はなく、それぞれの原bytesをhashし相互decodeします。native/実profile/peer/台帳耐久性/停止成功/各OS受入は後続の結合・明示許可検証まで未完です。
+
+## Mod専用native transport（caller未接続）
+
+`mod_control_transport.py`は、run限定のdescriptor・native本人・raw frame I/Oの資源ownerです。
+通常CLI、runtimeのstart/stop、wire要求の業務処理にはまだ接続していません。
+WindowsとmacOSの専用fixtureで、echo・frame上限拒否・accept timeout取消終端の3ケースをそれぞれ確認しました。
+固定699件のsuiteはWindowsが685成功・14skip、macOSが670成功・29skipで、両OSのCLI helpも終了code 0です。
+確認範囲は固定入力の試験と既知の自己所有資源です。suite内部・全系譜・全資源の終端や実profile受入を証明しません。
+既wire成功、旧runtime試験成功、同UID確認を未接続callerの受入へ読み替えません。
+
+`ModControlTransport(instance_ids)`はinventoryの有限instance集合を受け取り、同instanceにrun枠を一つ持ちます。
+`create(context, raw_descriptor)`はcaller固定のmanagementRoot、instanceId、leaseId、整数epoch、
+generationId、runtimeRunId、controller（P本人）、descriptorSha256のexact contextへ原bytesを照合します。
+本文から期待root/run/Pを採用しません。P本人を保持してから、固定parentに対する新規descriptorを作り、
+同handle/fdのsize・通常file・nlink1・owner/権限・identity・原bytesを照合します。既存fileは拒否します。
+Windows親directoryの本人比較はvolumeとFileIdを使い、可変のsize・archive属性・linksは本人に含めません。
+毎回の通常directory・DeletePending無し・reparse無し・private DACL検査と、leafの全metadata/原bytes照合は維持します。
+
+返されたendpointの`accept(expected_m_identity, deadline)`には、Pが生成・保持したMのData形式本人を渡します。
+HELLOやdescriptorからM期待本人を生成しません。Windowsは同pipeのpeer PIDと保持process handleの
+FILETIME/owner/host/boot、macOSは同socket fdのUID/PIDとnativeのsec:micro/host/bootを照合します。
+既`runtime_process.identity`の一時handleやlsof実行を、そのまま保持本人の証拠にしません。
+
+接続の`receive_frame(deadline)`は元frame bytesを返し、`send_frame(raw_frame, deadline)`は確認済み転送数を返します。
+deadlineはmonotonicの絶対時刻です。macOSはselect復帰後、新syscallの前にもdeadlineを再照合します。
+headerは4byte固定で受け、長さ取得直後にbody1..65532を検査します。
+全frame上限65536はheader込みです。JSONの再serialize、切捨て、分割送信プロトコル、自動再送はしません。
+同じ接続の並行I/Oを待ち列へ入れず拒否し、受信・送信の前後でpeerとdescriptorを再照合します。
+
+run内の接続枠は一つです。資源はnative発行前に上位ownerへ強参照で登録します。
+期限後のCancelIoExは取消要求だけであり、同OVERLAPPEDの終端までevent/buffer/pipeを保持します。
+ERROR_NOT_FOUND、WAIT_TIMEOUT、IO_INCOMPLETEを終端とみなしません。
+`TransportError.transferred`は当該frameの確認済みbyte数、`cancel_pending`は未終端資源の保持を表します。
+未回収枠への新accept/createを拒否し、`reap()`は保持I/Oの終端だけを非blockingで確認します。
+新thread/daemon/killや期限だけの回収はありません。constructor途中の資源もownerに残します。初期化はendpointの局所排他、acceptは公開前に取得した接続排他で守り、
+close/reapは使用中の資源を回収しません。全体lockは辞書・shutdown受付の更新だけに限定します。
+旧endpoint/接続の再closeでは同objectだけを外し、新run/接続を消しません。
+closeが資源を消費したか不明なら単調UNKNOWNを保持し、同じfd/handle値へ自動再closeしません。
+取消未終端は終端観測後だけ回収しますが、close不明は期限や同値再利用で正常化しません。
+`close(deadline)`は受付を閉じて有限確認し、未終端・使用中・close不明ならFalseです。
+callerはownerをsupervisor寿命で保持し、Falseを正常shutdownとして扱ってはいけません。
+
+transportはRegistry/DB・予約・業務作用を操作しません。将来のP callerが、認証済み完成要求を
+既`mod_control_operations.reserve`で短tx commitした後に業務作用へ進む責任を持ちます。
+未認証/不完全frame/確定した予約前拒否には業務作用・新operation・成功相関を生成しません。
+予約commit不明や未完了操作の送受信不明はcallerが同ID/rawへUNKNOWNを結束します。
+既COMPLETED原responseの保存後に送達不明となっても完成正本を格下げせず、同要求readbackを維持します。
+積極確認できた作用前拒否は既error契約へ従います。このcaller接続自体は未実装です。
+
+mockはpartial read/write、header込み上限、context/peer差替え、descriptor実体検査、取消正常競合、
+未終端資源・枠・constructor故障を確認します。DLL/socket/process/file-openは禁止spyで検査します。
+実nativeの有限3ケースと両OSの固定suiteは、個別の明示許可で検証しました。実運用callerへの接続・総合受入は未完です。
+新DB/schema/台帳、GRANT/Data begin、停止成功、profile承認は追加していません。
+COMCTL/conhost等の診断例外も製品採用していません。
