@@ -152,7 +152,15 @@ class MonitorPeer(ApiPeer):
     def run(self):
         self.requests = []
         try:
-            with self.socket, self.socket.accept()[0] as stream:
+            while not self.stopping.is_set():
+                try:
+                    stream = self.socket.accept()[0]
+                    break
+                except socket.timeout:
+                    pass
+            else:
+                return
+            with stream:
                 stream.settimeout(3)
                 def read(size):
                     result = bytearray()
@@ -193,6 +201,43 @@ class MonitorPeer(ApiPeer):
                     send(8, body)
         except BaseException as error:
             self.error = error
+        finally:
+            self.socket.close()
+
+
+class MonitorPeerAcceptTests(unittest.TestCase):
+    def peer(self):
+        peer = MonitorPeer.__new__(MonitorPeer)
+        peer.socket = Mock()
+        peer.stopping = Mock()
+        peer.error = None
+        return peer
+
+    def test_accept_timeout_then_connection_reaches_stream(self):
+        peer = self.peer()
+        peer.stopping.is_set.side_effect = [False, False]
+        entered = RuntimeError("合成stream到達")
+        class Stream:
+            def __enter__(self):
+                raise entered
+            def __exit__(self, *args):
+                pass
+        peer.socket.accept.side_effect = [socket.timeout(), (Stream(), ())]
+        peer.run()
+        self.assertEqual(2, peer.socket.accept.call_count)
+        self.assertIs(entered, peer.error)
+        peer.socket.close.assert_called_once_with()
+
+    def test_stop_before_or_after_timeout_does_not_accept_again(self):
+        for states, count in (([True], 0), ([False, True], 1)):
+            with self.subTest(states=states):
+                peer = self.peer()
+                peer.stopping.is_set.side_effect = states
+                peer.socket.accept.side_effect = socket.timeout()
+                peer.run()
+                self.assertEqual(count, peer.socket.accept.call_count)
+                self.assertIsNone(peer.error)
+                peer.socket.close.assert_called_once_with()
 
 
 @unittest.skipUnless(sys.platform in ('darwin', 'win32'), '対象OSのprivate証跡')
