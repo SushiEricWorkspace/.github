@@ -253,6 +253,10 @@ DB/instance lock内でnative・FS・受送信待機をしません。新thread�
 実supervisorの4worker枯渇を解決した扱いにはしません。
 
 局所検証はSQLite memory、合成wire/Profile、bundle I/O mockとnative adapter fakeを使用します。
-同コードの全745件はWindowsで731PASS・14SKIP、Macで716PASS・29SKIP、FAIL/ERROR 0とCLI help exit0を個別に確認しました。
+受理済みDB drainは共有memory SQLiteの独立2connection・単一threadの5件でも確認します。
+停止閉門後のfinish、別connectionから見た保存後ACK、close失敗時のrollback、
+UNKNOWNの確定と格下げ拒否、CLOSED読戻しの無作用を対象とします。
+これはtransaction順序・commit可視性の検証であり、同時write、BUSY、別process、OS耐久性の実証ではありません。
+全750件はWindowsで736PASS・14SKIP、Macで721PASS・29SKIP、FAIL/ERROR 0とCLI help exit0をOSごとに確認しました。
 実P/M起動・profile/native loadの実証・実OS startgate・旧root・全系譜/全資源の終端は未検証です。
 前成果の両OS699件/native3成功を本変更の再成功へ読み替えません。
