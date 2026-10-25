@@ -167,3 +167,17 @@ Pがdescriptor/listenerをM生成前に用意する契約は、
 運用者の承認入力とhashをPが保持し、exact argv/environment/補助bytesを所有M起動へ接続します。
 wire ACKはMのManagement受付許可、通常startの完成は既STARTED proofと実listenerのP照合後に分けます。
 既`freeze`/`validate_bundle_managed_launch`が承認・実起動・通常readyを実証したとは扱いません。
+
+通常接続の`codeSources`は、固定Knot登録search sourceと指定launcher anchorの実出典を
+独立bundleへ対応させる限定保証です。全JVM/全loader/未観測loaderや全期間不変は保証しません。
+論理origin/id、nested/directory/privateTmpの独立出典、UNKNOWN拒否は
+[共有合意のcodeSources domain](mod-control-guide.md#codesourcesの承認観測domain)に従います。
+Mの観測配列から承認側expectedを作らず、candidate存在を承認へ昇格させません。
+
+PはM生成前に、descriptorの同run専用leaf直下へ互いに重ならないauxiliary/privateTmpを用意し、
+独立context11値と補助3file原bytesを固定します。Mのnative cwd/argv・owned argfile抽出は候補観測であり、
+options/descriptor/root/専有leafへの束縛と再生成raw完全一致を経て照合します。
+[配置と所有寿命](mod-control-guide.md#同runの補助fileprivatetmpと所有寿命)に従い、
+transport closeを削除許可にせず、失敗/終端不明はownerが保全します。
+Freezerはこのrun用directoryやcontextを生成せず、既通常launchの5property/mbcsをこの接続へ流用しません。
+これらは次の通常接続向け契約であり、現private startupや通常launchに実装済みという意味ではありません。
