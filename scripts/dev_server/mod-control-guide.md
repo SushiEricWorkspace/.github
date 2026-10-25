@@ -295,6 +295,32 @@ Pは検証済み原bytesとhashを自身の起動寿命だけ保持し、通常s
 各P起動で再明示するのは信頼する起動経路の契約・運用責任であり、人間の毎回の物理操作や
 同UIDの悪意あるコードへの耐性を証明するものではありません。具体Profile/native値の採用は別審査です。
 
+### codeSourcesの承認・観測domain
+
+既Evidenceの`codeSources`は、固定Fabric Loader 0.19.3の正規Knot targetの登録search sourceと、
+指定launcher anchorの実出典をPRE/BOUNDで照合する限定保証です。`fabric-knot-target`は実targetの
+parentが固定`KnotClassLoader$DynamicURLClassLoader`であることを確認し、public `getURLs()`を観測します。
+`fabric-launcher-app`は実FabricLauncherBase/KnotのClassLoader objectとCodeSourceを使います。
+Mod/Data/JNAの実Class anchorと実containerも対応確認に使い、candidate一覧や`getClassPath()`を実測にしません。
+
+独立期待側は凍結bundle manifest・実jar bytes・固定loader/export入力と`fabric.mod.json`から集合を確定し、
+MのHELLO/BOUND配列をコピーしません。Mは観測した実体だけを同handle/fd・hashで一意なbundle出典へ対応させます。
+未観測jarをmanifestから追加せず、privateTmp内のbyte同一展開物も独立出典が一意な場合だけ扱います。
+JarFSはbacking jar/宣言nested entryのbytes連鎖、directoryはmanifestの閉じたfile集合を照合し、
+未知FS・出典不明・曖昧・実体不一致はUNKNOWNとして拒否します。runtime生成物の期待値をMから補いません。
+
+論理`origin`は`bundle:<manifest相対POSIX path>`、nestedは`bundle:<outer>!/<entry>`です。
+各segmentをUTF-8でpercent-encodeし、ASCII英数字と`-._~`以外を大文字hexで表し、`/`を区切りとして保ちます。
+literal `!`/`%`もencodeします。実体照合後はmanifest表記を使い、Windowsの大小文字差を別originにしません。
+既`id`は`SHA256(UTF8(loaderId + NUL + origin))`の小文字hex64文字です。これは承認や実体認証の代用ではありません。
+
+URL登録はloaded class一覧ではなく、登録更新も原子的ではありません。全JVM/全loader、元Appのanchor外source、
+未観測loader、BOUND後の追加や全期間不変を保証しません。bootstrap/platformのJDK classは既JDK欄で扱い、
+架空codeSourceを作りません。互換Knot/別game provider/custom loaderは受入対象外です。
+観測対象URL/anchor/containerが想定外loaderに対応すれば拒否しますが、未観測loaderへの登録の網羅検出ではありません。
+PRE/BOUNDの変化・競合や独立期待を確定できないprofileはUNKNOWN/採用保留とし、拒否値を自動承認しません。
+この限定保証の採用だけでnativeSources閉包、具体Profile、実P-M接続やOS受入を解禁しません。
+
 ### Mへ渡す固定入力
 
 candidateはbundle内の`launch/managed-server-candidate.json`にあるProfile v1の元UTF-8 JSON bytesです。
@@ -320,6 +346,31 @@ Pは既Profileのargv/完全environment/3補助file bytes・argfileEncodingをex
 親environmentやWindowsの`mbcs`/ACPから値を補完しません。新しい任意引数/環境変数の転送口は作りません。
 Pは所有Mのnative identityと実際に渡した入力を独立に保持し、Mは実測証拠を既wire2で返します。
 Pの承認済みexpected集合をMへ渡して、その値を実測証拠として返させてはいけません。
+
+### 同runの補助file・privateTmpと所有寿命
+
+Pはdescriptorの固定親`ROOT/manager/control/RUNTIME_RUN_ID`を同run専用leafとし、
+`auxiliary`と`privateTmp`をその直下の別々の専用子directoryへ限定します。子名は固定しません。
+同一path・相互包含、別run/root、bundle/world/shopとの重複を拒否します。
+既P正本に合わせ、`run`は`ROOT/instances/INSTANCE/generations/GENERATION`、`bundle`はその`runtime`です。
+path構文だけで専有とせず、親を含むlink/reparse拒否、current SID/UIDのprivate権限と実体を照合します。
+
+PがM生成前にこの配置を選び、既context11値とProfile原入力・hashを独立保持します。
+descriptor/listener、2子directory、exact encodingの`java.args`/`server-launch.cfg`/
+`server-remap-classpath.txt`の原bytesを先に用意し、完全argv/environmentで所有Mを起動します。
+FreezerやMの報告から承認contextを逆生成せず、Pは自身の値とM本人を照合します。
+
+Mはnative cwdを固定generationへ、native argvを固定bundle javaと唯一の絶対`@java.args`へ照合します。
+その親をauxiliary候補とし、owned readした既byte quotingのargfile内の唯一の`java.io.tmpdir`をprivateTmp候補とします。
+抽出値は自己承認せず、固定7property/options/descriptor/root・同run leaf・専有実体へ束縛してから、
+Profileの再生成raw bytesと実argv/cwd/完全env/補助3fileを照合します。未知encoding/構文・重複・不一致は拒否します。
+PRE/BOUNDで同じ責務を行い、二時点を原子的観測や同SID悪意コード耐性とは扱いません。
+
+leaf/補助file/tmpは所有Mと当runのnative資源・保存/停止処理が使う間保持します。
+transport closeやACK、timeout、期限切れだけから削除を許可しません。失敗・終端/close不明時は
+当ownerが入力・原応答・予約と未終端資源を保全し、新runへ使い回しません。
+削除は別の明示cleanup/GCで、同root/run/owner・M/利用者の終端・資源解放・保存/参照の完了を確認して判断します。
+この仕様はcleanupの自動実行や、正常保存停止の実装完了を意味しません。
 
 ### ACKと通常readyの順序
 
