@@ -157,3 +157,13 @@ P正本Context/native本人、profile承認、Fabric追加code閉包、JNA/SQLit
 
 関連確認は`test_runtime_bundle.py`、`test_managed_profile.py`、`test_task_maven.py`で行います。
 合成bundle/独立入力/CLIの確認であり、実JVM・native・OS受入の成功とは区別します。
+
+## 通常管理起動へ渡す境界（次の接続向け合意）
+
+Profile v1 candidateの固定位置・元UTF-8 bytes・既7管理propertyと、
+Pがdescriptor/listenerをM生成前に用意する契約は、
+[通常管理起動の共有合意](mod-control-guide.md)に従います。
+この合意は通常launchへ接続済みという意味ではありません。candidateやbundleの検証から承認を生成せず、
+運用者の承認入力とhashをPが保持し、exact argv/environment/補助bytesを所有M起動へ接続します。
+wire ACKはMのManagement受付許可、通常startの完成は既STARTED proofと実listenerのP照合後に分けます。
+既`freeze`/`validate_bundle_managed_launch`が承認・実起動・通常readyを実証したとは扱いません。

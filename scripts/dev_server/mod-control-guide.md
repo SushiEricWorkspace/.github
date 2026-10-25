@@ -260,3 +260,105 @@ UNKNOWNの確定と格下げ拒否、CLOSED読戻しの無作用を対象とし�
 全750件はWindowsで736PASS・14SKIP、Macで721PASS・29SKIP、FAIL/ERROR 0とCLI help exit0をOSごとに確認しました。
 実P/M起動・profile/native loadの実証・実OS startgate・旧root・全系譜/全資源の終端は未検証です。
 前成果の両OS699件/native3成功を本変更の再成功へ読み替えません。
+
+## 次の通常管理起動へ接続する共有合意（未実装）
+
+この節は`.github#64`と`SushiEricServerMod#597`が後続で接続する境界を定めます。
+現在の`RuntimeControl._managed_startup`は、明示入力のprivate経路でACK送信直後に
+OPEN/RUNNINGと元startを完成します。以下の通常ready後の完成へ変更済みとは扱いません。
+wire2、descriptor v1、Profile v1、Data DTOは変更しません。
+
+### 起動時の承認入力
+
+承認責任者は対象OS・管理rootの人間の運用者です。対象root・instance・artifactと、
+exact Profileおよび既`expectedEvidence`のJDK/code/mod/native許可集合を明示承認します。
+Pの入力媒体は、既supervise起動経路の`--payload-file`へ渡す読取専用UTF-8 JSONとし、
+承認済み原入力のSHA-256を信頼する起動側から別指定する方式とします。
+後続CLIの形は`supervise --root ROOT --payload-file INPUT --supervise-input-sha256 SHA256`を想定します。
+現CLIはこの組合せを実装しておらず、現在の実行手順ではありません。
+
+起動専用入力は既fieldの`managementRoot`と`instances`を持ち、各要素を
+`instanceId, artifactId, runtimeManifestHash, expectedEvidence`に限定します。
+rootは`--root`・Pのroot実体・inventoryと結束し、instanceは同inventory内で一意、
+件数と入力全体を既有限上限（inventory件数、64KiB）へ限定します。
+artifactとmanifestは既固定bundleに照合し、対象外instance/artifactは受け付けません。
+新しい承認台帳、承認ID/フラグ、サービス、通常startのpayload項目は追加しません。
+
+入力の私設directory/leafは、Windowsではcurrent SID単独のowner/DACL、
+macOSでは既UID・directory 0700/leaf 0600を要求します。親pathのlink/reparseを拒否し、
+同handleで有限read・実体/size照合・原bytesのhash照合を行います。権限を自動修復しません。
+PがcandidateやMの報告から計算したhashを、運用者の承認hashへ置き換えてはいけません。
+入力不一致・欠落はM生成/GRANT前に拒否し、旧launchへfallbackしません。
+
+Pは検証済み原bytesとhashを自身の起動寿命だけ保持し、通常startやMの報告からexpectedを採用しません。
+読み込み後の入力file変更はP内の承認内容を変更せず、別artifactの自動採用やhot reloadもしません。
+各P起動で再明示するのは信頼する起動経路の契約・運用責任であり、人間の毎回の物理操作や
+同UIDの悪意あるコードへの耐性を証明するものではありません。具体Profile/native値の採用は別審査です。
+
+### Mへ渡す固定入力
+
+candidateはbundle内の`launch/managed-server-candidate.json`にあるProfile v1の元UTF-8 JSON bytesです。
+既runtime manifestのsize/SHA-256・artifact IDと、承認済み`profileSha256`へ一致させ、再serializeしません。
+Mは`runtimeManifest`のbundleを基準にこの固定位置を参照します。任意の候補探索や承認値の補完は行いません。
+Pはinstance/runの予約とP本人を結束したdescriptor/endpointを、M生成前に用意します。
+descriptorは`ROOT/manager/control/<runtimeRunId>/mod-control.json`の元UTF-8 bytesへ固定します。
+
+通常の管理M/serverへ渡す管理propertyは次の7項目です。値はいずれもJavaの文字列です。
+
+| property | 値の契約 |
+| --- | --- |
+| `sushieric.managed.instanceId` | 同inventoryのinstance識別子 |
+| `sushieric.managed.generationId` | Data管理世代のcanonical UUID文字列 |
+| `sushieric.managed.startNonce` | Pが当該起動へ生成した元nonce。Data run UUIDから推測しない |
+| `sushieric.managed.proofPath` | 当該runの既起動proofの絶対path |
+| `sushieric.managed.runtimeManifest` | 固定bundleのruntime manifestの絶対path |
+| `sushieric.managed.controlDescriptor` | 上記固定descriptorの絶対path |
+| `sushieric.managed.controlDescriptorSha256` | descriptor原bytesのSHA-256小文字16進64文字 |
+
+部分指定を旧5項目の管理起動へ降格させません。管理引数のない通常起動とGameTestの既契約を混同しません。
+Pは既Profileのargv/完全environment/3補助file bytes・argfileEncodingをexactに使用します。
+親environmentやWindowsの`mbcs`/ACPから値を補完しません。新しい任意引数/環境変数の転送口は作りません。
+Pは所有Mのnative identityと実際に渡した入力を独立に保持し、Mは実測証拠を既wire2で返します。
+Pの承認済みexpected集合をMへ渡して、その値を実測証拠として返させてはいけません。
+
+### ACKと通常readyの順序
+
+1. Pは上記入力を検証し、元start/run/lease/epoch/generation/nonce、P本人、artifactを結束して閉門予約します。
+2. Pはdescriptor/listenerを用意してMを所有起動し、実M本人を結束してHELLO/GRANTを相関します。
+3. M本人がGRANTのmanagementでData beginRunし、元Running statusをBOUNDへ保持します。
+4. PはACK原bytesを既wire台帳へ保存してから送信します。Mは相関済みACK後にManagement受付を許可できます。
+5. MはPのRUNNING/start完了を待たず、通常起動を続けて既STARTED proofと実listenerを成立させます。
+6. Pは同じ所有M、nonce、artifact、既STARTED proofと実listenerを照合します。ACK送信だけで通常readyとしません。
+7. Pは同run/revisionと元start予約を再確認し、一度のtransactionでOPEN/RUNNING・元start完成・元artifact参照解放を行います。
+
+新しいReady DTOやwire phaseは作りません。ACK前にPがManagement listenerを待つ順序や、
+MがACK後にPのRUNNINGを待つ順序は循環するため禁止します。wire ACKの保存完了と、
+通常startへの成功応答・artifact参照解放は別の責務です。private側と通常側で二重completeしません。
+
+ACK保存後に通常readyが失敗/不明になっても、保存ACKをUNKNOWNへ格下げしません。
+元startは結果不明として原本/予約を保持し、門を開かず、同じ起動を再作用しません。
+同じ認証済みM/session・元BOUND原bytesのACK読戻しは、元startを完成/再OPEN/再解放しません。
+旧nonce/世代/P起動/別原要求や新operationIdへの読替えを拒否します。
+初回のCLI応答喪失も新IDの起動へ切り替えず、元operationの保存状態を確認します。
+
+制御受送信は実際の管理startから使うinstance限定の有界進行へ結束します。
+共有4workerが待機中でもHELLO/BOUND/同BOUND読戻しが進み、DB transaction/instance lock内で待ちません。
+同instanceの未終端/不明slot・native資源・所有Mを新runへ再利用せず、ownerが保持します。
+供給providerやlaneだけを先に追加する成果にはしません。
+
+### 依存と確認範囲
+
+固定Mod `4828499eb05ff2b168f82705ab842e92e751adf1`は、通常world入口の
+`WorldRunBootstrap.prepare`で管理run本人bindingを未完了として拒否します。
+旧5propertyのManagedRunOptionsや非管理WorldRunGate/NormalWorldSavesを、Mのwire2実peerと扱いません。
+固定Data `e5719b310da191abd6aa94c534dbb1d37f35c62d`の管理run APIだけでも、Modの接続完了にはなりません。
+
+実施順は、この共有合意の確定commit → Mod#597のM実peer/通常startupの確定commit →
+.github#64の通常P接続とOS別受入です。Modはこの仕様と既wire/Profile/Data契約を参照し、
+.githubのP helperへ実行依存しません。.githubに製品Mpeerを模倣実装しません。
+P内の承認入力媒体をMod実装の待ち条件にせず、同時に実P-M接続をP側mockの成功から推定しません。
+
+後続の反証は、承認/root/SID/hash不一致の作用前拒否、exact入力と所有Mの相関、
+ACK前/後・ready失敗/commit返答不明・同BOUND読戻し・元start再要求、
+二重complete/参照二重解放0、4worker飢餓と未終端slot拒否の交差を対象とします。
+この文書の合意は実装/実P-M/Profile採用・両OS受入の成功ではなく、停止全保存/exitの証明でもありません。
