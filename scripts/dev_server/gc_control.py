@@ -39,6 +39,17 @@ class GcControl:
         elif kind in {"snapshot", "run"}:
             identifier(name, "id")
             parts = ("snapshots" if kind == "snapshot" else "temporary", name)
+        elif kind in {"gametest", "world"}:
+            identifier(name, "runId")
+            with self.registry.transaction(read_only=True) as connection:
+                row = connection.execute("SELECT record FROM runs WHERE id=?", (name,)).fetchone()
+            require(row is not None, "NOT_FOUND", "GT実行記録がありません")
+            run = json.loads(row[0])
+            require(run.get("kind") == "gametest", "INVALID_INPUT", "GT実行記録が必要です")
+            cwd, _ = self.registry.gametest._paths(run)
+            require(kind != "gametest" or run.get("layout") == "private-gametest-v1",
+                    "ROOT_MISMATCH", "旧runの配置を変更できません")
+            return cwd / "world" if kind == "world" else cwd
         elif kind == "generation":
             values = name.split("/")
             require(len(values) == 2, "INVALID_INPUT", "generationはinstance/idで指定してください")
@@ -111,7 +122,8 @@ class GcControl:
                 protected.add("generation:" + clean["instanceId"] + "/" + clean["generation"])
                 protected.add("diagnostics:" + clean["instanceId"] + "/" + clean["runId"])
         for run in runs:
-            if "run:" + run["runId"] in protected or run.get("pinned") or not run.get("jvmAndChildrenExited"):
+            if ("run:" + run["runId"] in protected or "gametest:" + run["runId"] in protected
+                    or run.get("pinned") or not run.get("jvmAndChildrenExited")):
                 protected.add("run:" + run["runId"])
                 protected.add("artifact:" + run["artifactId"])
                 if run.get("kind") != "gametest":
@@ -164,7 +176,7 @@ class GcControl:
             if reference in protected or not path.exists():
                 return
             tree = self._tree(path)
-            candidates.append({"reference": reference, "path": path.relative_to(self.registry.root).as_posix(),
+            candidates.append({"reference": reference, "path": Path(os.path.relpath(path, self.registry.root)).as_posix(),
                                "bytes": sum(f["size"] for f in tree["files"]), "tree": tree})
         for row in snapshots:
             if "snapshot:" + row["id"] not in protected:
@@ -202,7 +214,7 @@ class GcControl:
                 continue
             if "run:" + run["runId"] in protected or "completedAt" not in run:
                 continue
-            path = self._path("run:" + run["runId"])
+            cwd, path = self.registry.gametest._paths(run)
             if not path.exists():
                 continue
             self._exited(run)
@@ -211,22 +223,24 @@ class GcControl:
                     and result["jvmAndChildrenExited"] is True
                     and all(key in run and run[key] == value for key, value in result.items()),
                     "PROOF_MISMATCH", "GameTest結果が一致しません")
-            if result["testsPassed"] and result["runtimeStopped"]:
+            if result["testsPassed"] and result["runtimeStopped"] and "gametest" not in run.get("gcRemoved", []):
                 require(digest(regular_bytes(Path(run["proofPath"]))) == result["proofHash"],
                         "PROOF_MISMATCH", "GameTest終了証跡が変わりました")
                 from .gametest_report import read_report
-                report = read_report(path / "report.xml")
+                report = read_report(cwd / "report.xml")
                 require(all(result.get(key) == value for key, value in report.items()),
                         "PROOF_MISMATCH", "GameTestレポートが変わりました")
             elapsed = self.registry.clock() - run["completedAt"]
             world_eligible = (result["testsPassed"] and result["runtimeStopped"]) or elapsed > policy["failureWorldSeconds"]
             if elapsed > policy["resultsSeconds"] and world_eligible:
+                if run.get("layout") == "private-gametest-v1" and "gametest" not in run.get("gcRemoved", []):
+                    add("gametest:" + run["runId"], cwd)
                 add("run:" + run["runId"], path)
             else:
                 protected.add("artifact:" + run["artifactId"])
                 if world_eligible:
                     if "world" not in run.get("gcRemoved", []):
-                        add("world:" + run["runId"], path / "world")
+                        add("world:" + run["runId"], cwd / "world")
         for path in (self.registry.root / "artifacts").iterdir():
             plain_path(path)
             if re.fullmatch("[0-9a-f]{64}", path.name) and "artifact:" + path.name not in protected:
@@ -284,7 +298,13 @@ class GcControl:
             old = {c["reference"]: c for c in json.loads(plan["response"])["candidates"]}
             current = {c["reference"]: c for c in self.candidates()}
             require(all(r in old and current.get(r) == old[r] for r in references), "GC_CHANGED", "参照・保持期限・内容が変わりました。候補を再表示してください")
-            selected = [old[r] for r in references]
+            for reference in references:
+                if reference.startswith("run:"):
+                    companion = "gametest:" + reference.split(":", 1)[1]
+                    require(companion not in current or companion in references, "INVALID_INPUT",
+                            "GT実行領域を残して診断anchorだけを回収できません")
+            selected = sorted((old[r] for r in references),
+                              key=lambda candidate: candidate["reference"].startswith("run:"))
             result = {"removed": references, "bytes": sum(c["bytes"] for c in selected)}
         elif action == "pin":
             path = self._path(payload["reference"])
@@ -327,7 +347,7 @@ class GcControl:
                         kind, name = reference.split(":", 1)
                         if kind == "snapshot":
                             connection.execute("DELETE FROM snapshots WHERE id=?", (name,))
-                        if kind in {"world", "run"}:
+                        if kind in {"world", "run", "gametest"}:
                             row = connection.execute("SELECT record FROM runs WHERE id=?", (name,)).fetchone()
                             run = json.loads(row[0])
                             run["gcRemoved"] = sorted(set(run.get("gcRemoved", [])) | {kind})
@@ -341,11 +361,19 @@ class GcControl:
         return self._response(result)
 
     def _remove(self, candidate, operation):
-        path = self.registry.root / candidate["path"]
-        require(path.is_absolute() and path.is_relative_to(self.registry.root)
-                and path != self.registry.root, "INVALID_INPUT", "回収対象の境界が不正です")
+        path = Path(os.path.abspath(self.registry.root / candidate["path"]))
+        plain_path(path)
+        kind = candidate["reference"].split(":", 1)[0]
+        external = kind in {"gametest", "world"}
+        if external:
+            require(path == self._path(candidate["reference"]),
+                    "ROOT_MISMATCH", "GT回収対象の固定配置が一致しません")
+        else:
+            require(path.is_absolute() and path.is_relative_to(self.registry.root)
+                    and path != self.registry.root, "INVALID_INPUT", "回収対象の境界が不正です")
         require(self._tree(path) == candidate["tree"], "GC_CHANGED", "回収直前に内容が変わりました")
-        destination = self.registry.root / "quarantine" / ("gc-" + operation + "-" + digest(candidate["reference"].encode()))
+        name = "gc-" + operation + "-" + digest(candidate["reference"].encode())
+        destination = (path.parent / name if external else self.registry.root / "quarantine" / name)
         storage.move(path, destination)
         require(self._tree(destination) == candidate["tree"], "GC_CHANGED", "隔離後の内容が一致しません")
         for file in candidate["tree"]["files"]:
