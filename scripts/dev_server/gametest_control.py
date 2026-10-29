@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 import traceback
 import uuid
@@ -11,7 +12,7 @@ import uuid
 from .build_inputs import canonical, digest
 from .contracts import ContractError
 from .gametest_report import read_report
-from .local_ipc import make_private, plain_path
+from .local_ipc import make_private, plain_path, require_private
 from .registry import RegistryError, fields, identifier, require, ttl
 from .runtime_bundle import launch_command, verify_bundle
 from .runtime_control import read_json, write_json
@@ -22,6 +23,34 @@ class GameTestControl:
     """予約と結果はRegistry、重い検査とJVM待機はDB transaction外で行う。"""
     def __init__(self, registry):
         self.registry = registry
+
+    def _area(self):
+        """新GT専用の固定sibling領域。管理markerの祖先を引き継がない。"""
+        root = self.registry.root
+        area = root.with_name(root.name + "-gametest-private")
+        plain_path(area)
+        require(area.absolute() == area.resolve(), "ROOT_MISMATCH", "GT領域の実体が一致しません")
+        for parent in (area, *area.parents):
+            require(not any(os.path.lexists(parent / marker) for marker in
+                            ("manager/INITIALIZED", "manager/registry.sqlite", "manager/inventory.json")),
+                    "ROOT_MISMATCH", "GT領域を管理root配下に配置できません")
+        if area.exists():
+            require(area.is_dir(), "ROOT_MISMATCH", "GT領域はdirectoryが必要です")
+            require_private(area, directory=True)
+        return area
+
+    def _paths(self, run):
+        """旧runは移動せず、新layoutだけ固定cwdと診断anchorを照合する。"""
+        identifier(run["runId"], "runId")
+        anchor = self.registry.root / "temporary" / run["runId"]
+        layout = run.get("layout")
+        require(layout in (None, "private-gametest-v1"), "ROOT_MISMATCH", "未知のGT配置は保全します")
+        cwd = anchor if layout is None else self._area() / run["runId"]
+        plain_path(anchor)
+        plain_path(cwd)
+        require(Path(run["cwd"]) == cwd and Path(run["proofPath"]) == anchor / "diagnostics/proof.json",
+                "ROOT_MISMATCH", "GT実行領域・診断anchorが一致しません")
+        return cwd, anchor
 
     def execute(self, payload, *, operation_id, dry_run=False):
         if type(payload) is dict and payload.get("action") == "pin":
@@ -44,6 +73,10 @@ class GameTestControl:
         bundle = self.registry.root / "artifacts" / payload["artifactId"]
         verify_bundle(bundle)
         self.registry.runtime._space()
+        area = self._area()
+        if not area.exists():
+            require(shutil.disk_usage(area.parent).free >= self.registry.inventory["reserveBytes"],
+                    "NO_SPACE", "GT専用領域の配置先に起動余裕がありません。自動削除しません")
         if dry_run:
             return {"dryRun": True, "wouldExecute": "gametest", "runId": payload["runId"]}
         with self.registry.transaction() as connection:
@@ -88,6 +121,9 @@ class GameTestControl:
         run = self.registry.root / "temporary" / payload["runId"]
         plain_path(run)
         require(not run.exists(), "EXISTING_DATA", "GameTestの既存データを上書きしません")
+        cwd = self._area() / payload["runId"]
+        plain_path(cwd)
+        require(not cwd.exists(), "EXISTING_DATA", "GT専用領域の既存runを上書きしません")
         count = connection.execute("SELECT count(*) FROM runtime_operations WHERE command='gametest' AND status IN ('PENDING','RECOVERY_REQUIRED')").fetchone()[0]
         require(count < self.registry.inventory["gameTestConcurrency"], "BUSY", "GameTestの同時実行枠が使用中です")
         return None
@@ -131,7 +167,8 @@ class GameTestControl:
                 "GameTestまたは終了時保存に失敗しました。run-idの結果・ログを確認してください")
         return dict(result, **extra)
 
-    def _proof(self, run, bundle):
+    def _proof(self, run, bundle, *, ready=True):
+        self._paths(run)
         proof = read_json(Path(run["proofPath"]))
         identity = proof["identity"]
         require(proof["schemaVersion"] == 1 and proof["instanceId"] == run["instanceId"]
@@ -144,6 +181,10 @@ class GameTestControl:
                 and Path(identity["runtimeManifest"]).resolve() == (bundle / "runtime.json").resolve()
                 and Path(identity["cwd"]).resolve() == Path(run["cwd"]).resolve(),
                 "PROOF_MISMATCH", "GameTestのプロセス・runtimeが一致しません")
+        require(proof["phase"] in {"INITIALIZING", "STARTED", "STOPPING", "STOPPED"},
+                "PROOF_MISMATCH", "GT証跡の段階が不正です")
+        if not ready and proof["phase"] == "INITIALIZING":
+            return proof
         startup = proof["startup"]
         require(startup["ready"] is True and startup["managementEnabled"] is False
                 and startup["managementStarted"] is False and startup["listeners"] == []
@@ -160,13 +201,21 @@ class GameTestControl:
     def _run(self, payload, bundle):
         runtime = self.registry.runtime
         adapter = runtime.process_adapter
-        cwd = self.registry.root / "temporary" / payload["runId"]
+        with self.registry.db_lock:
+            area = self._area()
+            if not area.exists():
+                area.mkdir()
+                make_private(area, directory=True)
+        anchor = self.registry.root / "temporary" / payload["runId"]
+        anchor.mkdir()
+        make_private(anchor, directory=True)
+        cwd = area / payload["runId"]
         cwd.mkdir()
         make_private(cwd, directory=True)
-        diagnostics = cwd / "diagnostics"
+        diagnostics = anchor / "diagnostics"
         diagnostics.mkdir()
         make_private(diagnostics, directory=True)
-        run = {"kind": "gametest", "runId": payload["runId"], "instanceId": payload["runId"],
+        run = {"kind": "gametest", "layout": "private-gametest-v1", "runId": payload["runId"], "instanceId": payload["runId"],
                "generationId": payload["runId"], "owner": payload["owner"], "artifactId": payload["artifactId"],
                "templateId": None, "nonce": uuid.uuid4().hex, "cwd": str(cwd), "identity": None,
                "proofPath": str(diagnostics / "proof.json"), "manifestHash": digest((bundle / "runtime.json").read_bytes()),
@@ -215,10 +264,16 @@ class GameTestControl:
                 except OSError as error:
                     if process.poll() is not None:
                         break
-                    if self._proof(run, bundle)["phase"] not in ("STOPPING", "STOPPED"):
-                        raise
+                    try:
+                        phase = self._proof(run, bundle, ready=False)["phase"]
+                    except (RegistryError, OSError, ValueError, KeyError, TypeError, AttributeError):
+                        raise error
+                    run["proofPhaseAtIdentityFailure"] = phase
                     run["identityReadFailure"] = {"errorType": type(error).__name__,
                                                   "nativeError": getattr(error, "winerror", None) or getattr(error, "errno", None)}
+                    expected = runtime._record(run, expected=expected)
+                    if phase not in ("STOPPING", "STOPPED", "INITIALIZING"):
+                        raise error
                     check_listeners(set(process.members()) | {process.pid})
                     if time.monotonic() >= deadline:
                         raise

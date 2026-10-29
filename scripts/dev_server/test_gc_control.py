@@ -196,7 +196,7 @@ class GameTestGcTests(unittest.TestCase):
             self.run_test()
         self.adapter.identity = lambda pid: None
         self.adapter.recorded_members = lambda creation, nonce: []
-        path = self.root / "temporary" / self.payload["runId"]
+        path = self.registry.gametest._area() / self.payload["runId"]
         (path / "world").mkdir(exist_ok=True)
         make_private(path / "world", directory=True)
         marker = path / "world/marker"
@@ -214,7 +214,7 @@ class GameTestGcTests(unittest.TestCase):
         self.command("gc", {"action": "apply", "planId": "plan", "references": references,
                             "approvedBy": self.inventory["operator"]}, "apply")
         self.assertFalse((path / "world").exists())
-        self.assertTrue((path / "diagnostics/result.json").exists())
+        self.assertTrue((self.root / "temporary" / self.payload["runId"] / "diagnostics/result.json").exists())
         self.assertEqual([], self.command("gc", {"action": "plan"}, "plan-again")["candidates"])
 
     def test_failure_world_retained_seven_days_results_thirty_days(self):
@@ -226,6 +226,115 @@ class GameTestGcTests(unittest.TestCase):
         self.now += 23 * 86400
         self.assertIn("run:" + self.payload["runId"],
                       [c["reference"] for c in self.command("gc", {"action": "plan"}, "day-thirty-one")["candidates"]])
+
+    def test_expired_run_reclaims_both_locations_explicitly(self):
+        path = self.completed()
+        self.now += 31 * 86400
+        candidates = self.candidates()
+        references = [candidate["reference"] for candidate in candidates]
+        self.assertIn("gametest:" + self.payload["runId"], references)
+        self.assertIn("run:" + self.payload["runId"], references)
+        self.command("gc", {"action": "apply", "planId": "plan", "references": references,
+                            "approvedBy": self.inventory["operator"]}, "apply")
+        self.assertFalse(path.exists())
+        self.assertFalse((self.root / "temporary" / self.payload["runId"]).exists())
+
+    def test_diagnostic_anchor_cannot_be_removed_before_external_cwd(self):
+        path = self.completed()
+        self.now += 31 * 86400
+        self.candidates()
+        self.assert_code("INVALID_INPUT", lambda: self.command("gc", {
+            "action": "apply", "planId": "plan", "references": ["run:" + self.payload["runId"]],
+            "approvedBy": self.inventory["operator"]}, "apply"))
+        self.assertTrue(path.exists())
+        self.assertTrue((self.root / "temporary" / self.payload["runId"]).exists())
+
+    def test_external_cwd_pin_protects_both_locations(self):
+        self.completed()
+        self.command("gc", {"action": "pin", "reference": "gametest:" + self.payload["runId"], "pinned": True}, "pin-external")
+        self.now += 31 * 86400
+        self.assertEqual([], self.candidates())
+
+    def test_reverse_selection_keeps_anchor_when_private_cwd_move_fails(self):
+        path = self.completed()
+        self.now += 31 * 86400
+        self.candidates()
+        from . import storage
+        original = storage.move
+        def move(source, destination, **kwargs):
+            if source == path:
+                raise PermissionError("synthetic-private-cwd-failure")
+            return original(source, destination, **kwargs)
+        references = ["run:" + self.payload["runId"], "gametest:" + self.payload["runId"]]
+        with patch("dev_server.gc_control.storage.move", side_effect=move):
+            self.assert_code("GC_FAILED", lambda: self.command("gc", {
+                "action": "apply", "planId": "plan", "references": references,
+                "approvedBy": self.inventory["operator"]}, "apply"))
+        self.assertTrue(path.exists())
+        anchor = self.root / "temporary" / self.payload["runId"] / "diagnostics"
+        self.assertTrue((anchor / "proof.json").is_file())
+        self.assertTrue((anchor / "result.json").is_file())
+
+    def test_final_reparse_is_rejected_before_resolving_candidate(self):
+        path = self.completed()
+        candidate = next(c for c in self.registry.gc.candidates() if c["reference"].startswith("world:"))
+        source = path / "world"
+        target = self.root.parent / "outside-identical-tree"
+        import shutil
+        shutil.copytree(source, target)
+        make_private(target, directory=True)
+        make_private(target / "marker")
+        self.assertEqual(candidate["tree"], self.registry.gc._tree(target))
+        from types import SimpleNamespace
+        original_lstat, original_resolve = Path.lstat, Path.resolve
+        def resolve(entry, *args, **kwargs):
+            return target if Path(os.path.abspath(entry)) == source else original_resolve(entry, *args, **kwargs)
+        def lstat(entry, *args, **kwargs):
+            if entry == source:
+                return SimpleNamespace(st_mode=0o040700, st_file_attributes=0x400)
+            return original_lstat(entry, *args, **kwargs)
+        with patch.object(Path, "resolve", resolve), patch.object(Path, "lstat", lstat), \
+                patch("dev_server.gc_control.storage.move") as move, self.assertRaises(OSError):
+            self.registry.gc._remove(candidate, "synthetic-race")
+        move.assert_not_called()
+        self.assertEqual(b"synthetic-world", (target / "marker").read_bytes())
+
+    def test_link_replacement_after_plan_preserves_outside_target(self):
+        path = self.completed()
+        target = self.root.parent / "outside-identical-tree"
+        import shutil
+        shutil.copytree(path / "world", target)
+        make_private(target, directory=True)
+        make_private(target / "marker")
+        probe = self.root.parent / "link-probe"
+        try:
+            os.symlink(target, probe, target_is_directory=True)
+        except OSError as error:
+            self.skipTest("OSが試験用symlink作成を拒否: " + str(error))
+        probe.unlink()
+        self.candidates()
+        original = self.registry.gc._remove
+        def replace(candidate, operation):
+            source = path / "world"
+            source.rename(path / "original-world")
+            os.symlink(target, source, target_is_directory=True)
+            return original(candidate, operation)
+        with patch.object(self.registry.gc, "_remove", side_effect=replace):
+            self.assert_code("GC_FAILED", lambda: self.command("gc", {
+                "action": "apply", "planId": "plan", "references": ["world:" + self.payload["runId"]],
+                "approvedBy": self.inventory["operator"]}, "apply"))
+        self.assertEqual(b"synthetic-world", (target / "marker").read_bytes())
+
+    def test_changed_external_report_blocks_both_deletions(self):
+        path = self.completed()
+        self.now += 31 * 86400
+        references = [candidate["reference"] for candidate in self.candidates()]
+        (path / "report.xml").write_text('<testsuite tests="1"><testcase name="changed"/></testsuite>')
+        self.assert_code("PROOF_MISMATCH", lambda: self.command("gc", {
+            "action": "apply", "planId": "plan", "references": references,
+            "approvedBy": self.inventory["operator"]}, "apply"))
+        self.assertTrue(path.exists())
+        self.assertTrue((self.root / "temporary" / self.payload["runId"]).exists())
 
     def test_pin_protects_reproduction_data(self):
         self.completed()

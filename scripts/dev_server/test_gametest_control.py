@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -107,6 +108,196 @@ class GameTestControlTests(RegistryFixture, unittest.TestCase):
 
     def run_test(self, payload=None, operation="run-test", dry=False):
         return self.command("gametest", payload or self.payload, operation, dry)
+
+    def test_private_cwd_is_outside_markers_and_keeps_diagnostic_anchor(self):
+        self.run_test()
+        cwd = self.registry.gametest._area() / self.payload["runId"]
+        anchor = self.root / "temporary" / self.payload["runId"]
+        self.assertFalse(cwd.is_relative_to(self.root))
+        self.assertEqual(str(cwd), self.adapter.process.identity["cwd"])
+        self.assertTrue((cwd / "report.xml").is_file())
+        self.assertTrue((anchor / "diagnostics/proof.json").is_file())
+        self.assertFalse((anchor / "world").exists())
+        from dev_server.local_ipc import require_private
+        require_private(cwd, directory=True)
+        require_private(cwd.parent, directory=True)
+
+    def test_sibling_and_ancestor_markers_reject_before_reservation(self):
+        for relative in ("manager/INITIALIZED", "manager/registry.sqlite", "manager/inventory.json"):
+            with self.subTest(relative=relative):
+                marker = self.root.parent / relative
+                marker.parent.mkdir(exist_ok=True)
+                marker.write_bytes(b"marker")
+                try:
+                    self.assert_code("ROOT_MISMATCH", self.run_test)
+                    self.assertIsNone(self.adapter.process)
+                finally:
+                    marker.unlink()
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM runtime_operations").fetchone()[0])
+
+    def test_space_never_treats_unreadable_or_reparse_area_as_absent(self):
+        area = self.registry.gametest._area()
+        original = Path.lstat
+        for error in (PermissionError("synthetic-denied"), OSError("synthetic-io")):
+            with self.subTest(error=type(error).__name__):
+                def lstat(path, *args, **kwargs):
+                    if path == area:
+                        raise error
+                    return original(path, *args, **kwargs)
+                with patch.object(Path, "lstat", lstat), self.assertRaises(type(error)) as caught:
+                    self.registry.runtime._space()
+                self.assertIs(error, caught.exception)
+        from types import SimpleNamespace
+        def reparse(path, *args, **kwargs):
+            if path == area:
+                return SimpleNamespace(st_mode=0o040700, st_file_attributes=0x400)
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "lstat", reparse), self.assertRaises(OSError):
+            self.registry.runtime._space()
+
+    def test_normal_space_does_not_require_an_unused_gt_area(self):
+        marker = self.root.parent / "manager/INITIALIZED"
+        marker.parent.mkdir()
+        marker.write_bytes(b"ancestor-marker")
+        self.registry.runtime._space()
+        self.assert_code("ROOT_MISMATCH", self.run_test)
+
+    def test_existing_private_run_is_not_reused(self):
+        from dev_server.local_ipc import make_private
+        area = self.registry.gametest._area()
+        area.mkdir()
+        make_private(area, directory=True)
+        (area / self.payload["runId"]).mkdir()
+        self.assert_code("EXISTING_DATA", self.run_test)
+        self.assertIsNone(self.adapter.process)
+
+    def test_private_area_link_is_rejected(self):
+        target = self.root.parent / "link-target"
+        target.mkdir()
+        try:
+            os.symlink(target, self.registry.gametest._area(), target_is_directory=True)
+        except OSError as error:
+            self.skipTest("OSが試験用symlink作成を拒否: " + str(error))
+        with self.assertRaises(OSError):
+            self.run_test()
+        self.assertIsNone(self.adapter.process)
+        self.assertEqual([], list(target.iterdir()))
+
+    def test_private_area_counts_toward_quota_and_physical_reserve(self):
+        from dev_server.local_ipc import make_private
+        area = self.registry.gametest._area()
+        area.mkdir()
+        make_private(area, directory=True)
+        data = area / "reserved"
+        data.write_bytes(b"x" * 2000)
+        size = sum(path.stat().st_size for path in self.root.rglob("*") if path.is_file())
+        self.registry.inventory["quotaBytes"] = size + self.registry.inventory["reserveBytes"] + 1999
+        self.assert_code("NO_SPACE", self.run_test)
+        self.assertIsNone(self.adapter.process)
+        self.registry.inventory["quotaBytes"] = 10000000
+        usage = shutil.disk_usage
+        with patch("dev_server.runtime_control.shutil.disk_usage",
+                   side_effect=lambda path: type("Usage", (), {"free": 0})() if path == area else usage(path)):
+            self.assert_code("NO_SPACE", self.run_test)
+
+    def test_initial_area_checks_its_parent_free_space_before_reservation(self):
+        area = self.registry.gametest._area()
+        usage = shutil.disk_usage
+        with patch("dev_server.gametest_control.shutil.disk_usage",
+                   side_effect=lambda path: type("Usage", (), {"free": 0})() if path == area.parent else usage(path)) as checked:
+            self.assert_code("NO_SPACE", self.run_test)
+        self.assertIn(unittest.mock.call(area.parent), checked.call_args_list)
+        self.assertFalse(area.exists())
+        self.assertIsNone(self.adapter.process)
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM runtime_operations").fetchone()[0])
+
+    def _malformed_identity_proof(self, fault):
+        self.adapter.fault = fault
+        error = PermissionError(299, "original-identity-error")
+        original = self.adapter.identity
+        calls = 0
+        def identity(pid):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return original(pid)
+            raise error
+        with patch.object(self.adapter, "identity", side_effect=identity), patch.object(Process, "poll", return_value=None):
+            with self.assertRaises(RegistryError) as caught:
+                self.run_test()
+        self.assertIs(error, caught.exception.__cause__)
+        self.assertFalse(self.adapter.closed)
+        self.assertIs(self.adapter.process, self.registry.runtime.processes[self.payload["runId"]])
+        with self.registry.transaction(read_only=True) as connection:
+            row = connection.execute("SELECT status,response FROM runtime_operations WHERE id='run-test'").fetchone()
+        self.assertEqual("RECOVERY_REQUIRED", row["status"])
+        failure = json.loads(row["response"])
+        self.assertEqual("PermissionError", failure["errorType"])
+        self.assertEqual(299, failure["nativeError"])
+
+    def test_null_proof_identity_keeps_original_native_cause(self):
+        self._malformed_identity_proof(lambda proof: proof.update(identity=None))
+
+    def test_malformed_proof_phase_keeps_original_native_cause(self):
+        self._malformed_identity_proof(lambda proof: proof.update(phase=[]))
+
+    def test_null_proof_roots_keeps_original_native_cause(self):
+        self._malformed_identity_proof(lambda proof: proof["startup"].update(roots=None))
+
+    def test_initializing_proof_keeps_original_identity_error_until_owned_exit(self):
+        self.adapter.fault = lambda proof: proof.update(phase="INITIALIZING", startup={})
+        self.adapter.exit_code = 1
+        error = PermissionError(5, "original-identity-error")
+        original = self.adapter.identity
+        calls = 0
+        def identity(pid):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return original(pid)
+            raise error
+        with patch.object(self.adapter, "identity", side_effect=identity), \
+                patch.object(Process, "poll", side_effect=[None, None, 1, 1, 1]):
+            self.assert_code("GAMETEST_FAILED", self.run_test)
+        self.assertTrue(self.adapter.closed)
+        with self.registry.transaction(read_only=True) as connection:
+            row = connection.execute("SELECT status,response FROM runtime_operations WHERE id='run-test'").fetchone()
+            run = json.loads(connection.execute("SELECT record FROM runs WHERE id=?", (self.payload["runId"],)).fetchone()[0])
+        self.assertEqual("FAILED", row["status"])
+        self.assertTrue(run["jvmAndChildrenExited"])
+        self.assertEqual("INITIALIZING", run["proofPhaseAtIdentityFailure"])
+        self.assertEqual("PermissionError", run["identityReadFailure"]["errorType"])
+        self.assertFalse(json.loads(row["response"])["runtimeStopped"])
+
+    def test_initializing_proof_does_not_hide_live_identity_cause(self):
+        self.adapter.fault = lambda proof: proof.update(phase="INITIALIZING", startup={})
+        error = PermissionError(5, "original-identity-error")
+        original = self.adapter.identity
+        calls = 0
+        def identity(pid):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return original(pid)
+            raise error
+        with patch.object(self.adapter, "identity", side_effect=identity), \
+                patch.object(Process, "poll", return_value=None), \
+                patch("dev_server.gametest_control.time.monotonic", side_effect=[0, 4]):
+            with self.assertRaises(RegistryError) as caught:
+                self.run_test()
+        self.assertIs(error, caught.exception.__cause__)
+        self.assertFalse(self.adapter.closed)
+        self.assert_code("RECOVERY_REQUIRED", self.run_test)
+        self.assert_code("BUSY", lambda: self.command("gc", {"action": "plan"}, "held-plan"))
+
+    def test_legacy_layout_is_kept_and_unknown_layout_rejected(self):
+        anchor = self.root / "temporary" / "old-run"
+        run = {"runId": "old-run", "cwd": str(anchor), "proofPath": str(anchor / "diagnostics/proof.json")}
+        self.assertEqual((anchor, anchor), self.registry.gametest._paths(run))
+        self.assert_code("ROOT_MISMATCH", lambda: self.registry.gametest._paths(dict(run, layout="unknown")))
+        self.assert_code("ROOT_MISMATCH", lambda: self.registry.gametest._paths(dict(run, cwd=str(self.root))))
 
     def test_completed_result_replays_without_relaunching(self):
         result = self.run_test()

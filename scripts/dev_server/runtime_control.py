@@ -124,7 +124,15 @@ class RuntimeControl:
     def _space(self, required_bytes=0):
         used_bytes = 0
         plain_path(self.registry.root)
-        directories = [self.registry.root]
+        roots = [self.registry.root]
+        area = self.registry.root.with_name(self.registry.root.name + "-gametest-private")
+        try:
+            area.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            roots.append(self.registry.gametest._area())
+        directories = roots.copy()
         while directories:
             directory = directories.pop()
             with os.scandir(directory) as entries:
@@ -145,7 +153,7 @@ class RuntimeControl:
                         used_bytes += info.st_size
         margin = self.registry.inventory["reserveBytes"]
         require(used_bytes + required_bytes + margin <= self.registry.inventory["quotaBytes"]
-                and shutil.disk_usage(self.registry.root).free >= required_bytes + margin,
+                and all(shutil.disk_usage(root).free >= required_bytes + margin for root in roots),
                 "NO_SPACE", "runtime配備と起動余裕を確保できません。自動削除しません")
 
     def copy_space(self, size):
