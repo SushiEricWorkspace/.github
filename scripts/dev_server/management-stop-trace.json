@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "normal": [
+    "freeze",
+    "unsubmitted-rejected-write",
+    "submitted-settlement",
+    "original-response-write",
+    "STOP_BLOCK",
+    "external-writers-closed",
+    "BLOCKED",
+    "final-save-db-close",
+    "SAVE_REQUESTED",
+    "latest-completion",
+    "control-close",
+    "M-finish"
+  ],
+  "failures": {
+    "write-failure": "UNKNOWN",
+    "close-first": "UNKNOWN",
+    "response-loss": "UNKNOWN",
+    "child-exit-unknown": "UNKNOWN",
+    "timeout": "UNKNOWN"
+  },
+  "historyEndWhileFrozen": true
+}

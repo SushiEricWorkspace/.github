@@ -68,7 +68,7 @@ def _managed_text(value, multiline=False):
         (ord(c) < 32 or ord(c) == 127) and not (multiline and c in "\n\t") for c in value),
         "managed launch: textが不正です")
     try:
-        value.encode("utf-8")
+        _require(len(value.encode("utf-8")) <= 65532, "managed launch: textが上限外です")
     except UnicodeError:
         raise ContractError("managed launch: UTF-8 textが不正です") from None
 
@@ -157,7 +157,7 @@ def validate_managed_launch(profile: dict, context: dict, observed: dict) -> Non
     """承認済みM/server templateとP正本値から展開済み起動入力の完全一致を純粋に検査する。
 
     file/OS/環境を読み取らず、引数も変更しない。不一致はContractError。
-    profile承認・native本人・実起動の検証ではなく、通常launchには未接続。
+    通常launchでも使用する。profile承認・native本人・実起動は呼出側で別途検証する。
     """
     _validate_managed_profile(profile)
     _managed_fields(context, (*_MANAGED_PATHS, "instanceId", "generationId", "startNonce", "controlDescriptorSha256"))
@@ -179,6 +179,15 @@ def validate_managed_launch(profile: dict, context: dict, observed: dict) -> Non
     _managed_environment(observed["environment"])
     keys = [key.casefold() if profile["platform"] == "Windows" else key for key in observed["environment"]]
     _require(len(keys) == len(set(keys)), "managed launch: env keyが重複しています")
+    expected = _expand_managed_launch(profile, context)
+    _managed_fields(observed["auxiliaryFiles"], expected["auxiliaryFiles"])
+    _require(all(type(value) is bytes for value in observed["auxiliaryFiles"].values()),
+             "managed launch: 補助fileはbytesが必要です")
+    _require(observed == expected, "managed launch: 展開後の起動入力が一致しません")
+
+
+def _expand_managed_launch(profile, context):
+    path_type = PureWindowsPath if profile["platform"] == "Windows" else PurePosixPath
     expand = lambda value: re.sub(r"\$\{([^{}]+)\}", lambda match: context[match[1]], value)
     expected_env = {key: expand(value) for key, value in profile["environment"].items()}
     dli = expand(profile["dliText"])
@@ -192,21 +201,16 @@ def validate_managed_launch(profile: dict, context: dict, observed: dict) -> Non
     expected_files = {"java.args": _managed_argfile(arguments, profile["argfileEncoding"]),
                       "server-launch.cfg": dli.encode("utf-8"),
                       "server-remap-classpath.txt": remap.encode("utf-8")}
-    _managed_fields(observed["auxiliaryFiles"], expected_files)
-    _require(all(type(value) is bytes for value in observed["auxiliaryFiles"].values()),
-             "managed launch: 補助fileはbytesが必要です")
-    _require(type(observed["argv"]) is list, "managed launch: argvはlistが必要です")
-    for argument in observed["argv"]:
-        _managed_text(argument)
-        _managed_tokens(argument, set())
     java = bundle / "jdk/bin" / ("java.exe" if profile["platform"] == "Windows" else "java")
     expected_argv = [str(java), "@" + str(path_type(context["auxiliary"]) / "java.args")]
-    _require(observed["argv"] == expected_argv and observed["cwd"] == context["run"]
-             and observed["environment"] == expected_env and observed["auxiliaryFiles"] == expected_files,
-             "managed launch: 展開後の起動入力が一致しません")
+    _require(all(len(raw) <= 65532 for raw in expected_files.values())
+             and len(canonical(expected_argv)) <= 65532 and len(canonical(expected_env)) <= 65532,
+             "managed launch: 補助file/argv/envが上限外です")
+    return {"argv": expected_argv, "cwd": context["run"], "environment": expected_env, "auxiliaryFiles": expected_files}
 
 
 def _read_managed_profile(data: bytes) -> dict:
+    _require(type(data) is bytes and 0 < len(data) <= 65532, "managed candidate: サイズが上限外です")
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -570,12 +574,37 @@ def verify_bundle(root: Path) -> dict:
 
 
 def launch_command(root: Path, profile: str, run: Path, *, auxiliary: Path | None = None,
-                   jvm_properties: dict[str, str] | None = None) -> list[str]:
+                   jvm_properties: dict[str, str] | None = None, managed_context: dict | None = None) -> list[str]:
     """補助設定だけを新規auxiliaryへ出力し、runのcwd/rootは変更しない。
 
-    管理propertyは全5項目または未指定。JVMの開始・世代操作は呼出側の責務。
+    通常Mはmanaged_contextと全7項目、GTは既5項目。承認・JVM開始は呼出側の責務。
     """
     verify_bundle(root)
+    if managed_context is not None:
+        _require(profile == "server" and jvm_properties is not None
+                 and jvm_properties.keys() == {"instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest",
+                                               "controlDescriptor", "controlDescriptorSha256"}
+                 and all(managed_context[key] == value for key, value in jvm_properties.items()),
+                 "launch: 通常managed serverは全7項目が必要です")
+        candidate = _read_managed_profile(regular_bytes(root / _MANAGED_CANDIDATE))
+        observed = _expand_managed_launch(candidate, managed_context)
+        validate_managed_launch(candidate, managed_context, observed)
+        validate_bundle_managed_launch(root, managed_context, observed)
+        from .local_ipc import make_private, plain_path
+        auxiliary = Path(managed_context["auxiliary"])
+        private_tmp = Path(managed_context["privateTmp"])
+        for directory in (auxiliary, private_tmp):
+            plain_path(directory)
+            directory.mkdir(exist_ok=False)
+            make_private(directory, directory=True)
+        for name, raw in observed["auxiliaryFiles"].items():
+            path = auxiliary / name
+            with path.open("xb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            make_private(path)
+        return observed["argv"]
     descriptor = json.loads(regular_bytes(root / "launch/profiles.json"))
     _require(descriptor["version"] == 1 and descriptor["platform"] == platform.system()
              and descriptor["machine"] == platform.machine(), "launch: 作成OS/アーキテクチャと一致しません")
@@ -584,8 +613,9 @@ def launch_command(root: Path, profile: str, run: Path, *, auxiliary: Path | Non
     _require(root != run and root not in run.parents, "launch: bundle内へ実行データを置けません")
     auxiliary = auxiliary if auxiliary is not None else run / ".launch"
     properties = jvm_properties if jvm_properties is not None else {}
-    _require(not properties or properties.keys() == {"instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest"},
-             "launch: 管理propertyは全項目が必要です")
+    _require(not properties or profile == "gameTest" and properties.keys() == {
+        "instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest"},
+        "launch: 旧5項目の管理propertyはGameTest専用です。通常Mには承認済みcontextと7項目が必要です")
     _require(all(type(value) is str and value for value in properties.values()), "launch: 管理propertyが不正です")
     _require(auxiliary.is_absolute() and not auxiliary.exists(), "launch: 新しい絶対補助pathが必要です")
     _require(root != auxiliary and root not in auxiliary.parents, "launch: bundleへ起動補助を書き込めません")

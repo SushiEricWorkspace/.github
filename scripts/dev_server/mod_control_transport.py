@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 
-from .mod_control_wire import MAX_FRAME, _identity, absolute_path, decode_descriptor, descriptor_path
+from .mod_control_wire import MAX_FRAME, MAX_BODY_V3, _identity, absolute_path, decode_descriptor, descriptor_path
 
 
 class TransportError(OSError):
@@ -43,9 +43,11 @@ class ModControlTransport:
 
     同instanceの旧run、取消未終端、close失敗が残れば再利用しない。callerはこのownerを
     supervisor寿命で強参照し、close=Falseを正常shutdownとして扱わない。
-    native未指定時だけ対象OSのadapterを初期化する。通常CLIには接続していない。
+    native未指定時だけ対象OSのadapterを初期化する。通常CLIはwire3を明示する。
     """
-    def __init__(self, instance_ids, *, native=None, clock=time.monotonic):
+    def __init__(self, instance_ids, *, native=None, clock=time.monotonic, wire_version=2):
+        _require(type(wire_version) is int and wire_version in (2, 3), "wire版が不正です")
+        self.max_frame = MAX_FRAME if wire_version == 2 else MAX_BODY_V3 + 4
         self.instances = frozenset(instance_ids)
         _require(bool(self.instances), "inventoryのinstance集合が必要です")
         self.native = native if native is not None else _native()
@@ -227,7 +229,7 @@ class _Connection:
         finally:
             self.lock.release()
 
-    def _io(self, kind, value, deadline, *, transferred=0):
+    def _io(self, kind, value, deadline, *, transferred=0, idle=None):
         if self.endpoint.owner.clock() >= deadline:
             raise TransportError("I/O発行前にdeadlineを超えました", transferred=transferred)
         _require(self.pending is None, "前I/Oが未終端です")
@@ -236,6 +238,13 @@ class _Connection:
         self.pending = operation
         try:
             operation.start()
+            if idle is not None:
+                while not operation.terminal:
+                    idle()
+                    operation.poll()
+                    if not operation.terminal:
+                        time.sleep(0.01)
+                deadline = self.endpoint.owner.clock() + 30
             result = operation.finish(deadline, self.endpoint.owner.clock)
         except BaseException as error:
             if not operation.terminal:
@@ -264,8 +273,8 @@ class _Connection:
         self.endpoint.pin.check(self.endpoint.raw)
         self.endpoint.owner.native.authenticate(self.channel, self.peer, self.expected)
 
-    def receive_frame(self, deadline: float) -> bytes:
-        """header4byteを先に検査し、全65536byte以内の元frameを返す。JSON再整形しない。"""
+    def receive_frame(self, deadline: float, *, idle=None) -> bytes:
+        """prefixを先に検査し、選択版の有限frameを返す。idle中も単一I/Oを保持する。"""
         _deadline(deadline)
         with self._exclusive():
             self._ready()
@@ -274,11 +283,15 @@ class _Connection:
                 for target in (4, None):
                     if target is None:
                         length = int.from_bytes(result, "big")
-                        _require(0 < length <= MAX_FRAME - 4, "body長が上限外です")
+                        _require(0 < length <= self.endpoint.owner.max_frame - 4, "body長が上限外です")
                         target = 4 + length
                     while len(result) < target:
-                        data = self._io("read", target - len(result), deadline, transferred=len(result))
-                        _require(type(data) is bytes and 0 < len(data) <= target - len(result), "frameが途中で切断されました")
+                        chunk = min(65536, target - len(result))
+                        waiting = idle if not result else None
+                        data = self._io("read", chunk, deadline, transferred=len(result), idle=waiting)
+                        if waiting is not None:
+                            deadline = self.endpoint.owner.clock() + 30
+                        _require(type(data) is bytes and 0 < len(data) <= chunk, "frameが途中で切断されました")
                         result.extend(data)
                 self._ready()
                 return bytes(result)
@@ -291,15 +304,16 @@ class _Connection:
     def send_frame(self, raw_frame: bytes, deadline: float):
         """元frameを送る。部分送信/期限超過を未送信へ読み替えず、自動再送しない。"""
         _deadline(deadline)
-        _require(type(raw_frame) is bytes and 4 < len(raw_frame) <= MAX_FRAME
+        _require(type(raw_frame) is bytes and 4 < len(raw_frame) <= self.endpoint.owner.max_frame
                  and int.from_bytes(raw_frame[:4], "big") == len(raw_frame) - 4, "送信frame長が不正です")
         with self._exclusive():
             self._ready()
             sent = 0
             try:
                 while sent < len(raw_frame):
-                    size = self._io("write", raw_frame[sent:], deadline, transferred=sent)
-                    _require(type(size) is int and 0 < size <= len(raw_frame) - sent, "送信byte数が不正です")
+                    chunk = raw_frame[sent:sent + 65536]
+                    size = self._io("write", chunk, deadline, transferred=sent)
+                    _require(type(size) is int and 0 < size <= len(chunk), "送信byte数が不正です")
                     sent += size
                 self._ready()
                 return sent
@@ -308,6 +322,18 @@ class _Connection:
                 if isinstance(error, TransportError):
                     error.transferred = max(error.transferred, sent)
                 raise
+
+    def wait_peer_close(self, deadline: float) -> bool:
+        """元channelのEOFだけを待つ。追加bytes・timeout・取消未終端はclose証拠にしない。"""
+        _deadline(deadline)
+        with self._exclusive():
+            _require(self.authenticated and not self.closing and self.pending is None, "元channelが未終端です")
+            self.endpoint.pin.check(self.endpoint.raw)
+            try:
+                _require(self._io("read", 1, deadline) == b"", "COMPLETION後に追加bytesがあります")
+                return True
+            finally:
+                self.closing = True
 
     def reap(self):
         if not self.lock.acquire(blocking=False):
@@ -844,6 +870,8 @@ class _WinOperation:
                 raise TransportError('pipe待機が不明です')
             self.poll()
         if self.error is not None:
+            if self.kind == 'read' and self.error == 109 and self.transferred == 0:
+                return b''  # ERROR_BROKEN_PIPEは元clientのEOF。
             raise OSError(self.error, 'pipe I/Oが失敗しました')
         if self.kind == 'read':
             _require(self.transferred <= self.value, "native readサイズが不正です")
@@ -873,7 +901,7 @@ class _WindowsNative:
     def __init__(self):
         from . import windows_security
         self.security = windows_security
-        self.kernel = windows_security.kernel
+        self.kernel = ctypes.WinDLL('kernel32', use_last_error=True)
         self.nt = ctypes.WinDLL('ntdll', use_last_error=True)
         handle, pointer, u32 = ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32
         class SecurityAttributes(ctypes.Structure):

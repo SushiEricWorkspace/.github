@@ -184,14 +184,16 @@ class RuntimeBundleTests(unittest.TestCase):
                       "proofPath": str(self.root / "proof.json"), "runtimeManifest": str(deployed / "runtime.json")}
         first = self.root / "diagnostics/run-01"
         second = self.root / "diagnostics/run-02"
-        one = launch_command(deployed, "server", generation, auxiliary=first, jvm_properties=properties)
+        with self.assertRaises(ContractError):
+            launch_command(deployed, "server", generation, auxiliary=first, jvm_properties=properties)
+        one = launch_command(deployed, "gameTest", generation, auxiliary=first, jvm_properties=properties)
         preserved = (first / "java.args").read_bytes()
-        two = launch_command(deployed, "server", generation, auxiliary=second,
+        two = launch_command(deployed, "gameTest", generation, auxiliary=second,
                              jvm_properties=dict(properties, startNonce="nonce-02"))
         self.assertNotEqual(one, two)
         self.assertEqual(preserved, (first / "java.args").read_bytes())
         self.assertIn(str(second).replace("\\", "\\\\"), (second / "java.args").read_text())
-        self.assertIn(str(second), (second / "server-launch.cfg").read_text())
+        self.assertIn(str(second), (second / "gameTest-launch.cfg").read_text())
         verify_bundle(deployed)
         with self.assertRaises(ContractError):
             launch_command(deployed, "server", deployed / "data", auxiliary=self.root / "invalid")

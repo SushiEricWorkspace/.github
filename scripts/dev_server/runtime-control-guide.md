@@ -30,6 +30,7 @@ stopだけは、同じleaseId・epoch・expectedGenerationの一致を条件に�
 停止途中で期限を越えた場合も同じ照合で完了し、完了済みの同一stop要求は再実行せず結果を返します。
 stopはexpires・owner・epochを変更しません。停止後に[世代ガイド](generation-guide.md)のrecoverで照合し、明示的にTTLを更新します。
 start・renew・release・writer操作などは期限切れのまま拒否します。owner入力は追加せず、現行のlease能力トークンで認可します。
+例外は、同runが既にSTOPPING/BLOCKEDへ予約された後の既受理DB回収・writer-closeです。新しい作用やwriter-openは許可しません。
 稼働中の監督は起動時に読み込んだ実装を使用します。CLIやソースを更新しても、既存監督の期限判定は更新されません。
 監督の再起動は全枠を復旧待ちにするため、期限切れRUNNINGを自動解消する目的で再起動せず、既存runの対応を別途確認します。
 
@@ -40,14 +41,14 @@ python3.12 -B scripts/dev-server.py stop --root /absolute/minecraft-dev --operat
 ```
 
 `--timeout-seconds`はCLIのIPC応答期限、payloadのtimeoutSecondsは監督が起動/停止を待つ期限です。
-RCON通信とJVM/child終了待機にはそれぞれpayloadの期限を使用します。
+通常managed stopはdrain、RCON、control終端、JVM/child終了待機でpayloadの残り期限を共有します。
 RCONは接続・認証・停止応答全体で一つの絶対期限を使い、断片応答ごとに延長しません。
 IPC期限はそれらと検証・コピー時間を含む長さにしてください。CLI期限切れで監督操作をkill/再送しません。
 start/stopの予約と確定だけでinstance OS lock→短いDB transactionを保持します。世代・bundleの検査、OS照合、spawn、RCON、終了待機は両方の外で行います。
 予約したlease/epoch/世代/runとoperationId/fingerprint/未完了状態が一致するときだけ確定し、古い結果で新runを更新しません。
 runsは新規INSERTと読取元record bytesによる条件付きUPDATEを使い、既存runの置換や再読込による勝手な確定を行いません。GameTestも同じrecord更新規則を使います。
 作用後の結果不明ではpending/RECOVERY_REQUIREDを保全し、再spawn・新ID再送・期限による解除は行いません。
-このlock分割は既writerとの競合拒否までで、P-v5のBLOCKED/accepted drain、native受付、最新writer台帳の証明は未接続です。
+通常Mのnative受付・BLOCKED/accepted drain・Requested専用最新台帳は[wire3接続](mod-control-guide.md#通常管理起動の共有合意とwire3接続)に従います。停止中のclaimは既所有者が元結果を保存・解放し、専用control受信と公開stopは同run閉門予約へ合流します。実サーバー/OS別受入の完了を示すものではありません。
 
 dry-runは条件照合だけで、DB、世代、予約、補助ファイル、プロセス、socketを作成しません。
 dry-runの成功は実行時の空きport保証ではありません。
@@ -60,10 +61,9 @@ generation.jsonを構築し、全hash照合後にactive.jsonとDBへ同じ世代
 ## 起動照合と予約
 
 normalのserver profileを使い、GameTest runner引数を手編集しません。
-generationをcwdとして、診断用instances/<instanceId>/diagnostics/<runId>/.launchだけをrunごとに変えます。
-nonce、proofPath、instance/generation、runtime manifestの全管理propertyを追加します。
-Javaの引数ファイルはWindowsではシステム文字コード、macOSではUTF-8で出力し、byte単位で引用します。
-Windowsのシステム文字コードで表現できないパスは置換せず拒否します。
+generationをcwdとし、`manager/control/<runId>/auxiliary`と`private-tmp`を専有します。
+独立承認したProfileのexact environment・encoding・補助3fileと全7管理propertyを使用します。
+GTの既5propertyとOS既定encodingは別経路です。通常Mのencodingを実ACPから補完しません。
 [Java 21の引数ファイル仕様](https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html#java-command-line-argument-files)に従い、OSの文字コード設定は変更しません。
 JAVA_TOOL_OPTIONS、JDK_JAVA_OPTIONS、_JAVA_OPTIONS、CLASSPATHによる暗黙入力は拒否します。
 
@@ -109,7 +109,7 @@ startup-proof.json、runtime-stop.json、およびRegistryのrunsに残します
 
 API bind失敗、nonce/root/hash/socket不一致、保存Boolean=false/例外、writer未終了、
 非正常exit、期限超過ではRECOVERY_REQUIREDとし、データ・診断・未完了操作の参照を保全します。
-start失敗の後始末も自身の識別とRCON所有を確認できた場合の正常stopだけです。
+通常start失敗後は元ACK・start予約・所有processと制御資源を保持します。
 他プロセス停止、stdin fallback、自動kill、期限切れleaseの自動再貸出しはありません。
 監督再起動では全枠を保留し、recoverによる照合が完了するまで二重起動しません。
 

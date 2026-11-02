@@ -25,6 +25,7 @@ public final class DatabaseProxyMain {
     private Operation operation;
     private ManagementServerMessage known;
     private boolean unknown;
+    private boolean rejected;
     private String handle;
     private boolean closing;
     private String closeId;
@@ -97,9 +98,14 @@ public final class DatabaseProxyMain {
         ManagementServerMessage response = response(initial, deadline);
         require(response instanceof ManagementServerMessage.DatabaseContext);
         ManagementServerMessage.DatabaseContext context = (ManagementServerMessage.DatabaseContext) response;
-        known = response;
-        operation = null;
-        require(context.getSuccess() && context.getBinding() != null);
+        if (context.getRejectedBeforeEffect()) {
+            require(!context.getSuccess() && context.getBinding() == null);
+            known = response;
+            rejected = true;
+            return result("REJECTED", id, hash, response);
+        }
+        require(context.getSuccess());
+        require(context.getBinding() != null);
         ManagementDatabaseBinding value = context.getBinding();
         uuid(value.getWorldUuid()); uuid(value.getRunId());
         require(instance.equals(value.getInstanceId()) && generation.equals(value.getGenerationId()) && value.getStartNonce() == null);
@@ -117,7 +123,7 @@ public final class DatabaseProxyMain {
         Operation next = make(id, hash, message);
         if (operation != null) {
             require(operation.id().equals(id) && operation.hash().equals(hash) && operation.wire().equals(next.wire()));
-            if (known != null) return result(unknown ? "UNKNOWN" : "RESULT", id, hash, known);
+            if (known != null) return result(knownStatus(), id, hash, known);
             return finish(deadline);
         }
         require(!unknown);
@@ -131,16 +137,26 @@ public final class DatabaseProxyMain {
         fields(frame, "command", "operationId", "requestHash", "timeoutMillis");
         require(operation != null && operation.id().equals(id) && operation.hash().equals(hash));
         if (known == null) return finish(deadline);
-        if (!unknown) return result("RESULT", id, hash, known);
-        return result("UNKNOWN", id, hash, known);
+        return result(knownStatus(), id, hash, known);
     }
+
+    private String knownStatus() { return unknown ? "UNKNOWN" : rejected ? "REJECTED" : "RESULT"; }
 
     private JsonObject finish(long deadline) throws Exception {
         ManagementServerMessage value = response(operation, deadline);
         unknown = false;
+        rejected = false;
         if (value instanceof ManagementServerMessage.DatabaseContext context) {
-            require(context.getSuccess() && context.getBinding() != null && samePublicBinding(context.getBinding()));
+            rejected = context.getRejectedBeforeEffect();
+            require(!rejected || !context.getSuccess() && context.getBinding() == null);
+            if (!rejected) {
+                unknown = !context.getSuccess();
+                if (!unknown) require(context.getBinding() != null && samePublicBinding(context.getBinding()));
+            }
         } else if (value instanceof ManagementServerMessage.DatabaseHistory history) {
+            rejected = history.getRejectedBeforeEffect();
+            require(!rejected || !history.getSuccess() && history.getHandle() == null);
+            if (!rejected && !history.getSuccess()) unknown = true;
             if (operation.message() instanceof ManagementClientMessage.DatabaseHistoryStart) {
                 if (history.getSuccess()) { require(history.getHandle() != null); uuid(history.getHandle()); handle = history.getHandle(); }
                 else require(history.getHandle() == null);
@@ -148,12 +164,12 @@ public final class DatabaseProxyMain {
             if (operation.message() instanceof ManagementClientMessage.DatabaseHistoryPage && history.getSuccess()) require(Objects.equals(handle, history.getHandle()));
             if (operation.message() instanceof ManagementClientMessage.DatabaseHistoryEnd) {
                 if (history.getSuccess() && Objects.equals(history.getHandle(), handle)) handle = null;
-                else unknown = true;
+                else if (!rejected) unknown = true;
             }
         } else if (value instanceof ManagementServerMessage.DatabaseProductResult product) {
             HostAdapterResponse body = product.getResponse();
             require(operation.message() instanceof ManagementClientMessage.DatabaseProductRequest);
-            require(operation.id().equals(body.getRequestId()));
+            require(((ManagementClientMessage.DatabaseProductRequest)operation.message()).getRequest().getRequestId().equals(body.getRequestId()));
             HostAdapterCodec.INSTANCE.decodeResponse(HostAdapterCodec.INSTANCE.encodeResponse(body));
             if (body.getStatus() == HostAdapterStatus.SUCCESS) {
                 HostAdapterAction action = ((ManagementClientMessage.DatabaseProductRequest)operation.message()).getRequest().getAction();
@@ -163,11 +179,14 @@ public final class DatabaseProxyMain {
             }
             unknown = body.getStatus() == HostAdapterStatus.UNKNOWN ||
                     body.getStatus() == HostAdapterStatus.REJECTED && !body.getRejectedBeforeEffect();
+            rejected = body.getStatus() == HostAdapterStatus.REJECTED && body.getRejectedBeforeEffect();
         } else if (value instanceof ManagementServerMessage.MoneyHistorySaveResult money) {
-            unknown = !money.getSuccess() || money.getPendingCount() != 0;
+            rejected = money.getRejectedBeforeEffect();
+            require(!rejected || !money.getSuccess() && money.getPendingCount() == 0 && money.getSavedCount() == 0);
+            unknown = !rejected && (!money.getSuccess() || money.getPendingCount() != 0);
         }
         known = value;
-        return result(unknown ? "UNKNOWN" : "RESULT", operation.id(), operation.hash(), value);
+        return result(knownStatus(), operation.id(), operation.hash(), value);
     }
 
     private JsonObject close(JsonObject frame, String id, String hash, long deadline) throws Exception {
