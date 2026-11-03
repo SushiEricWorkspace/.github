@@ -134,7 +134,16 @@ python3.12 -B scripts/export-dev-runtime.py --recipe RECIPE --source-lock LOCK -
 ```
 
 既存receiptを再利用・上書きしません。ビルド前lockと現在の実recipeに一致する候補を用意してください。
-`build-dev-runtime.py --managed-profile PROFILE`も同じ候補を指定できます。登録taskのbuild/describeDevRuntime後に記録済み公式exporterを一度呼び、新しいreceiptを生成します。ModのGradle taskへ未知propertyを転送しません。Profileがbuild中に変われば拒否します。
+従来の一括手順`build-dev-runtime.py --managed-profile PROFILE`は維持しています。新しい二段階手順では、まずProfileを渡さず`prepare`を実行します。prepareは一度だけpublish/describeし、新GAVとclasspath、準備IDを出力します。準備物はstore内の`.prepared/<build ID>`に保存され、上書きできません。
+
+```text
+python3.12 -B scripts/build-dev-runtime.py prepare --task-root TASK_ROOT --owner OWNER --store STORE
+python3.12 -B scripts/build-dev-runtime.py freeze --task-root TASK_ROOT --owner OWNER --store STORE --prepared-id BUILD_ID --managed-profile PROFILE
+```
+
+独立に承認された完全Profileを用意してから、同じtask・owner・storeのfreezeへ渡してください。freezeは登録状態、source lock、recipe、公開物hashを再検証し、再build/re-publishせず記録済みexporterを一度だけ呼びます。準備記録はexport開始前に消費済みとなり、失敗後も再利用できません。やり直しは新しいprepareから行います。準備記録と診断用Maven出力はtaskの既存build記録・明示回収規約に従います。approvalとexpectedEvidenceは別途供給し、prepare出力から生成しません。
+整合性検査・現在のtask登録確認で発生した例外は準備をINVALIDにしますが、KeyboardInterrupt等の中断は失効処理の対象にしません。失効記録の保存に失敗した場合も検査時の元例外を主例外として報告し、保存失敗をnoteへ添えます。
+store/.preparedの準備記録・snapshotは自動GCしません。回収はtask ownerがtaskのbuild記録・artifact保全方針を確認してから明示的に行います。パス検証にはjunction/TOCTOUの既知制約があり、#64 R7と同様に同時の敵対的差替えまでは防ぎません。
 未指定時は通常freezeのbundle内容を維持し、CLI出力は`managedCandidate: null`と未指定理由を示します。
 指定したProfileの不足・不整合はfreeze失敗となり、候補なしの正常出力へ切り替えません。
 旧bundleへ候補を後付けせず、候補を含むbundleは別artifact IDになります。候補不在の保存済みv1/v2 bundleの通常検証・launchは維持します。
