@@ -57,7 +57,7 @@ Javaの長いclasspathはrun側のargfileへ展開し、OSのコマンド長上�
 既定はrun/.launchを新規作成し、`auxiliary`を渡すとrun-id専用の別pathへ出力します。
 cwd/world/configを変えず同世代を再起動できます。既存の補助path・bundleは上書きしません。
 bundleの内部へ実行データを置けませんが、generation/runtimeの配備は許可します。
-管理propertyは全5項目または未指定です。プロセス開始・正常停止・保存証跡は
+通常Mは承認済みexact Profileと全7管理property、GameTestは既5項目です。プロセス開始・正常停止・保存証跡は
 [runtime制御](runtime-control-guide.md)の責務です。
 
 ## runtimeのversionと切替
@@ -134,7 +134,7 @@ python3.12 -B scripts/export-dev-runtime.py --recipe RECIPE --source-lock LOCK -
 ```
 
 既存receiptを再利用・上書きしません。ビルド前lockと現在の実recipeに一致する候補を用意してください。
-ModのGradle taskや`build-dev-runtime.py`への新しいproperty転送は追加していません。
+`build-dev-runtime.py --managed-profile PROFILE`も同じ候補を指定できます。登録taskのbuild/describeDevRuntime後に記録済み公式exporterを一度呼び、新しいreceiptを生成します。ModのGradle taskへ未知propertyを転送しません。Profileがbuild中に変われば拒否します。
 未指定時は通常freezeのbundle内容を維持し、CLI出力は`managedCandidate: null`と未指定理由を示します。
 指定したProfileの不足・不整合はfreeze失敗となり、候補なしの正常出力へ切り替えません。
 旧bundleへ候補を後付けせず、候補を含むbundleは別artifact IDになります。候補不在の保存済みv1/v2 bundleの通常検証・launchは維持します。
@@ -152,18 +152,18 @@ DLIの`${run}/.launch`から`${auxiliary}`への置換以外に本文を生成�
 `validate_bundle_managed_launch(bundle, context, observed)`はbundle全検証と候補の元bytes照合後、callerが独立に渡す既Context/Observedを`validate_managed_launch`へ渡します。
 Observedのargv/cwd/envと3補助file bytesを候補自身から作るAPIではありません。Contextのbundle/runtimeManifestは指定bundleへ束縛します。
 候補が存在しなければこの候補専用入口を拒否し、通常launchへfallbackしません。
-P正本Context/native本人、profile承認、Fabric追加code閉包、JNA/SQLiteの実load由来、管理受付と正常停止の受入は未接続です。
+P正本Context/native本人と独立承認の供給は通常supervise/startへ接続しています。具体Profileの承認、Fabric追加code閉包、JNA/SQLiteの実load由来、実サーバー・OS別受入の完了を示しません。
 診断のCOMCTL/conhost例外を製品へ流用せず、通常launch・startgate・Data-v2世代拒否の条件は変更しません。
 
 関連確認は`test_runtime_bundle.py`、`test_managed_profile.py`、`test_task_maven.py`で行います。
 合成bundle/独立入力/CLIの確認であり、実JVM・native・OS受入の成功とは区別します。
 
-## 通常管理起動へ渡す境界（次の接続向け合意）
+## 通常管理起動へ渡す境界
 
 Profile v1 candidateの固定位置・元UTF-8 bytes・既7管理propertyと、
 Pがdescriptor/listenerをM生成前に用意する契約は、
 [通常管理起動の共有合意](mod-control-guide.md)に従います。
-この合意は通常launchへ接続済みという意味ではありません。candidateやbundleの検証から承認を生成せず、
+通常Pのsupervise/startがこの境界へ接続します。candidateやbundleの検証から承認を生成せず、
 運用者の承認入力とhashをPが保持し、exact argv/environment/補助bytesを所有M起動へ接続します。
 wire ACKはMのManagement受付許可、通常startの完成は既STARTED proofと実listenerのP照合後に分けます。
 既`freeze`/`validate_bundle_managed_launch`が承認・実起動・通常readyを実証したとは扱いません。
@@ -180,4 +180,4 @@ options/descriptor/root/専有leafへの束縛と再生成raw完全一致を経�
 [配置と所有寿命](mod-control-guide.md#同runの補助fileprivatetmpと所有寿命)に従い、
 transport closeを削除許可にせず、失敗/終端不明はownerが保全します。
 Freezerはこのrun用directoryやcontextを生成せず、既通常launchの5property/mbcsをこの接続へ流用しません。
-これらは次の通常接続向け契約であり、現private startupや通常launchに実装済みという意味ではありません。
+実装・合成試験と、具体Profile/native集合の独立承認・実P/Mの通常起動停止・OS別受入は区別します。

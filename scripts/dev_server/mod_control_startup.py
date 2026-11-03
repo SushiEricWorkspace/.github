@@ -1,4 +1,4 @@
-"""P正本を明示供給するprivate startup。実launch/承認供給/公開commandは未接続。"""
+"""独立P入力とnative peerの起動handshake。通常wire3はready完成を呼出元へ分離する。"""
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -50,7 +50,9 @@ def _touch(connection, row):
 
 
 def _reply(request, context, phase):
-    message = wire.decode_frame_v2(request)
+    version = wire._json(request[4:]).get("version")
+    require(type(version) is int and version in (2, 3), "INVALID_INPUT", "明示wire版が必要です")
+    message = wire._decode_profile_frame(request, version)
     payload = {"requestBodySha256": wire.sha256(request[4:])}
     if phase == "GRANT":
         require(message["type"] == "request" and message["phase"] == "HELLO", "INVALID_INPUT", "HELLOが必要です")
@@ -70,9 +72,14 @@ class _Startup:
     """inventoryの各instanceに同期1枠。呼出元は共有4workerへ待機処理を載せない。
 
     transportと受信原文を寿命中保持する。未知終端のsessionを新runへ再利用しない。
-    実supervisorでの制御進行・承認入力の供給は後続で接続する。
+    通常wire3の承認供給と専用受信進行はManagedRuntimeが所有する。
     """
-    def __init__(self, runtime, transport):
+    def __init__(self, runtime, transport, *, version=2):
+        self.version = version
+        self.decode = wire.decode_frame_v3 if version == 3 else wire.decode_frame_v2
+        self.binding = wire.correlate_binding_v3 if version == 3 else wire.correlate_binding_v2
+        self.grant = wire.correlate_grant_v3 if version == 3 else wire.correlate_grant_v2
+        self.response = wire.correlate_response_v3 if version == 3 else wire.correlate_response_v2
         self.runtime = runtime
         self.registry = runtime.registry
         self.transport = transport
@@ -112,7 +119,8 @@ class _Startup:
                 "CONTROL_BLOCKED", "元の閉門revisionが必要です")
         return row, descriptor, raw, gate
 
-    def start(self, token, *, profile_raw, launch_context, observed, context, revision, deadline):
+    def start(self, token, *, profile_raw, launch_context, observed, context, revision, deadline,
+              endpoint=None, defer_ready=False):
         """Pが独立保持するexact入力で2往復する。承認やMの実起動を代行しない。
 
         ACK原文をcommit後に送信し、同run/revisionでOPENとRUNNINGを同時確定する。
@@ -158,27 +166,31 @@ class _Startup:
                     ("id", "lease", "epoch", "generation", "artifact", "run_id")}, gate["revision"], wire.sha256(raw), gate["nonce"])
                 revision = _change(connection, row, revision, "CLOSED")
                 connection.execute("UPDATE run_admission SET descriptor_hash=? WHERE run=?", (wire.sha256(raw), row["run_id"]))
-            session["endpoint"] = self.transport.create(transport_context, raw)
+            session["endpoint"] = endpoint if endpoint is not None else self.transport.create(transport_context, raw)
             channel = session["endpoint"].accept(context["owner"], deadline)
             session["connection"] = channel
             hello = channel.receive_frame(deadline)
             session["request"] = session["hello"] = hello
             grant_frame = _reply(hello, context, "GRANT")
-            wire.correlate_grant_v2(hello, grant_frame, context)
+            self.grant(hello, grant_frame, context)
             self._save(token, context, revision, hello, grant_frame)
             require(channel.send_frame(grant_frame, deadline) == len(grant_frame),
                     "CONTROL_UNKNOWN", "GRANT全bytesの送信を確認できません")
             request = channel.receive_frame(deadline)
             session["request"] = request
-            message = wire.correlate_binding_v2(request, context,
-                pre_evidence_json=wire.decode_frame_v2(hello)["payload"]["profileEvidenceJson"])
+            message = self.binding(request, context,
+                pre_evidence_json=self.decode(hello)["payload"]["profileEvidenceJson"])
             require(message["type"] == "request" and message["phase"] == "BOUND", "INVALID_INPUT", "BOUNDが必要です")
             ack_frame = _reply(request, context, "ACK")
-            ack = wire.correlate_response_v2(request, ack_frame)
+            ack = self.response(request, ack_frame)
             require(ack["type"] == "response" and ack["phase"] == "ACK", "INVALID_INPUT", "成功ACKの原文が必要です")
             self._save(token, context, revision, request, ack_frame)
             require(channel.send_frame(ack_frame, deadline) == len(ack_frame),
                     "CONTROL_UNKNOWN", "ACK全bytesの送信を確認できません")
+            if defer_ready:
+                session["acknowledged"] = True
+                session["revision"] = revision
+                return ack_frame
             with self.runtime._transaction(token["instanceId"]) as connection:
                 row, _, _, gate = self._row(connection, token, context, revision)
                 _change(connection, row, revision, "OPEN")
@@ -265,8 +277,8 @@ class _Startup:
             channel = session["connection"]
             request = channel.receive_frame(deadline)
             context = session["context"]
-            message = wire.correlate_binding_v2(request, context,
-                pre_evidence_json=wire.decode_frame_v2(session["hello"])["payload"]["profileEvidenceJson"])
+            message = self.binding(request, context,
+                pre_evidence_json=self.decode(session["hello"])["payload"]["profileEvidenceJson"])
             require(message["type"] == "request" and message["phase"] == "BOUND", "INVALID_INPUT", "元BOUNDだけを読み戻します")
             with self.runtime._transaction(token["instanceId"], read_only=True) as connection:
                 row = self.registry._instance(connection, token["instanceId"])
@@ -278,8 +290,8 @@ class _Startup:
                         and gate["descriptor_hash"] == wire.sha256(context["descriptorJson"].encode()),
                         "STALE_RUN", "保存ACKを別runへ返しません")
                 saved = operations.readback(connection, row["id"], request)
-                require(saved is not None and wire.decode_frame_v2(saved)["type"] == "response"
-                        and wire.decode_frame_v2(saved)["phase"] == "ACK", "CONTROL_PENDING", "完成ACK原文がありません")
+                require(saved is not None and self.decode(saved)["type"] == "response"
+                        and self.decode(saved)["phase"] == "ACK", "CONTROL_PENDING", "完成ACK原文がありません")
             require(channel.send_frame(saved, deadline) == len(saved), "CONTROL_UNKNOWN", "保存ACK全bytesの送達が不明です")
             return saved
         finally:

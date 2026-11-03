@@ -19,7 +19,7 @@ class DatabaseProxy:
     呼出側は生成前にこのobjectを保持し、verifyでwriter/runの現在本人を照合する。
     startの途中失敗後も別childへ置換しない。request本文・応答本文は永続記録へ書かない。
     """
-    def __init__(self, bundle, diagnostics, binding, *, verify, process_adapter=runtime_process):
+    def __init__(self, bundle, diagnostics, binding, *, verify, process_adapter=runtime_process, control_identity=None):
         self.bundle = Path(bundle)
         self.diagnostics = Path(diagnostics)
         self.binding_hash = digest(canonical(binding))
@@ -37,6 +37,8 @@ class DatabaseProxy:
         self.sent_complete = False
         self.bound = False
         self.pending_operation = None
+        self.control_identity = control_identity
+        self.data_identity = None
         self.closing_operation = None
 
     def _record(self):
@@ -71,6 +73,9 @@ class DatabaseProxy:
                     and identity['commandHash'] == self.record['commandHash'],
                     'PROCESS_MISMATCH', '生成した固定proxyの本人が一致しません')
             self.identity = identity
+            if self.control_identity is not None:
+                self.data_identity = self.control_identity(self.process.pid)
+                self.record['controlIdentity'] = self.data_identity
             self.record['identity'] = identity
             self._record()
 
@@ -195,4 +200,7 @@ class DatabaseProxy:
             if time.monotonic() >= deadline:
                 raise TimeoutError('proxy全child終了の待機期限です')
             time.sleep(0.01)
-        return {'proxyExited': True, 'proxyChildrenExited': True}
+        proof = {'proxyExited': True, 'proxyChildrenExited': True}
+        if self.data_identity is not None:
+            proof['proxyIdentity'] = self.data_identity
+        return proof

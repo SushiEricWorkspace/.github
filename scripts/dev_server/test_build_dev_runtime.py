@@ -125,7 +125,7 @@ class BuildDevRuntimeTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             build_dev_runtime.recorded_exporter(repos[".github"], source_lock)
 
-    def main_fixture(self, extras=(), failure=None):
+    def main_fixture(self, extras=(), failure=None, *, managed=False):
         task = self.root / "worktrees/task-41"
         data_model = task / "SushiEricDataModel"
         mod = task / "SushiEricServerMod"
@@ -140,6 +140,10 @@ class BuildDevRuntimeTests(unittest.TestCase):
         exporter.write_text("# fixture\n")
         store = self.root / "store"
         store.mkdir()
+        profile = self.root / 'explicit-profile.json'
+        if managed:
+            from .test_managed_profile import fixture
+            profile.write_bytes(canonical(fixture()[0]))
 
         mod_coordinate = (
             "io.github.sushiericworkspace:sushieric-datamodel-mod-dev:"
@@ -163,7 +167,7 @@ class BuildDevRuntimeTests(unittest.TestCase):
         def gradle_side_effect(repo, *args):
             if failure is not None:
                 raise failure
-            if repo == mod:
+            if repo == mod and 'exportDevRuntime' in args:
                 lock_path = Path(next(arg.split("=", 1)[1] for arg in args if arg.startswith("-PruntimeSourceLock=")))
                 bundle = synthetic_bundle(store, json.loads(lock_path.read_bytes()))
                 write_receipt(lock_path, bundle)
@@ -178,6 +182,15 @@ class BuildDevRuntimeTests(unittest.TestCase):
                     (directory / artifact).write_bytes(b"artifact")
                     (directory / f"{module}-{version}.pom").write_bytes(b"pom")
 
+        def export(command, *, cwd, check):
+            self.assertEqual(github, cwd)
+            self.assertTrue(check)
+            self.assertEqual(str(exporter.resolve()), command[2])
+            self.assertEqual(str(profile.absolute()), command[command.index('--managed-profile') + 1])
+            lock_path = Path(command[command.index('--source-lock') + 1])
+            self.assertFalse(lock_path.with_suffix('.receipt.json').exists())
+            write_receipt(lock_path, synthetic_bundle(store, json.loads(lock_path.read_bytes())))
+
         source_lock = {"sourceLockVersion": 1, "sources": [
             {"root": str(task / name), "record": {"repo": name, "commit": "0" * 40,
              "dirtyPatchSha256": digest(b""), "untrackedInputs": []},
@@ -185,17 +198,23 @@ class BuildDevRuntimeTests(unittest.TestCase):
              "patchBase64": ""} for name in sorted(names)]}
         with patch.object(build_dev_runtime, "__file__", str(github / "scripts/build-dev-runtime.py")), \
                 patch.object(sys, "argv", ["build-dev-runtime.py", "--task-root", str(task),
-                                            "--owner", "owner", "--store", str(store)]), \
+                                            "--owner", "owner", "--store", str(store)] +
+                                           (["--managed-profile", str(profile)] if managed else [])), \
                 patch.object(build_dev_runtime, "registered_task", return_value={name: {} for name in names}) as registered, \
                 patch.object(build_dev_runtime, "capture_sources", return_value=source_lock), \
                 patch.object(build_dev_runtime, "verify_sources"), \
                 patch.object(build_dev_runtime.uuid, "uuid4", return_value=type("Id", (), {"hex": build_id})()), \
-                patch.object(build_dev_runtime, "gradle", side_effect=gradle_side_effect) as gradle:
+                patch.object(build_dev_runtime, "gradle", side_effect=gradle_side_effect) as gradle, \
+                patch.object(build_dev_runtime.subprocess, "run", side_effect=export) as exporter_run:
             build_dev_runtime.main()
 
         self.assertEqual(3, registered.call_count)
         registered.assert_called_with(task.absolute(), "owner", names)
-        export_call = next(call for call in gradle.call_args_list if "exportDevRuntime" in call.args)
+        export_call = next(call for call in gradle.call_args_list if ("describeDevRuntime" if managed else "exportDevRuntime") in call.args)
+        if managed:
+            exporter_run.assert_called_once()
+        else:
+            exporter_run.assert_not_called()
         self.assertEqual(mod, export_call.args[0])
         self.assertIn(f"-PruntimeExporter={exporter.resolve()}", export_call.args)
         self.assertIn("runGameTest", export_call.args)
@@ -223,6 +242,9 @@ class BuildDevRuntimeTests(unittest.TestCase):
 
     def test_main_passes_recorded_task_exporter_to_gradle(self):
         self.main_fixture()
+
+    def test_managed_profile_uses_describe_then_official_exporter_without_old_receipt(self):
+        self.main_fixture(managed=True)
 
     def test_build_failure_is_recorded_and_maven_is_kept(self):
         with self.assertRaisesRegex(RuntimeError, "fixture Gradle failure"):

@@ -390,7 +390,7 @@ while True:
  body=json.dumps(response,separators=(',',':')).encode();sys.stdout.buffer.write(struct.pack('!I',len(body))+body);sys.stdout.buffer.flush()
  if command=='close':break
 ''', encoding='utf-8')
-        proxy = DatabaseProxy(self.bundle, self.root / 'owned', {'nonceHash': 'fixture-binding'}, verify=lambda: None)
+        proxy = DatabaseProxy(self.bundle, self.root / 'owned', {'nonceHash': digest(str(self.root).encode())}, verify=lambda: None)
         identity = runtime_process.identity(os.getpid())
         self.assertIsNotNone(identity)
         with patch('dev_server.database_proxy.proxy_command', return_value=[identity['executable'], '-B', str(script)]):

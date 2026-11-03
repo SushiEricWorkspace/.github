@@ -9,6 +9,8 @@ import struct
 from .contracts import absolute_path
 
 MAX_FRAME = 65536
+MAX_BODY_V3 = 4194304
+MAX_EVIDENCE_V3 = 1048576
 PURPOSE = "mod-control"
 DESCRIPTOR_PROPERTY = "sushieric.managed.controlDescriptor"
 DESCRIPTOR_HASH_PROPERTY = "sushieric.managed.controlDescriptorSha256"
@@ -382,6 +384,8 @@ def _profile_inventory(value):
     _hash(jdk["releaseSha256"])
     for name in ("codeSources", "mods", "nativeSources"):
         _require(type(value[name]) is list, "証拠集合が必要です")
+        if name == "nativeSources":
+            _require(len(value[name]) <= 1024, "native証拠集合の件数が上限外です")
         ids = []
         for item in value[name]:
             if name == "codeSources":
@@ -446,11 +450,21 @@ def _v2_projection(value):
 
 def decode_frame_v2(frame: bytes) -> dict:
     """wire2の構文/証拠を検証する。descriptor1とData抽出を再利用し、native認証や受付はしない。"""
-    _require(type(frame) is bytes and 4 < len(frame) <= MAX_FRAME, "frameのサイズが不正です")
+    return _decode_profile_frame(frame, 2)
+
+
+def decode_frame_v3(frame: bytes) -> dict:
+    """wire3固定の4MiB bodyと1MiB証拠を検証する。旧版へ降格しない。"""
+    return _decode_profile_frame(frame, 3)
+
+
+def _decode_profile_frame(frame, version):
+    limit = MAX_FRAME if version == 2 else MAX_BODY_V3 + 4
+    _require(type(frame) is bytes and 4 < len(frame) <= limit, "frameのサイズが不正です")
     _require(struct.unpack(">I", frame[:4])[0] == len(frame) - 4, "frame長または末尾dataが不正です")
     value = _json(frame[4:])
     _fields(value, {"version", "purpose", "type", "phase", "operationId", "requestNonce", "descriptorSha256", "payload"})
-    _require(type(value["version"]) is int and value["version"] == 2, "wire2が必要です")
+    _require(type(value["version"]) is int and value["version"] == version, "wire版が一致しません")
     phase, kind, payload = value["phase"], value["type"], value["payload"]
     _require(type(phase) is str and phase in PAYLOAD_FIELDS, "phaseが不正です")
     if kind == "error":
@@ -461,7 +475,7 @@ def decode_frame_v2(frame: bytes) -> dict:
     if kind != "error" and phase in _V2_EXTRA:
         _hash(payload["profileEvidenceSha256"])
         if phase in {"HELLO", "BOUND"}:
-            _profile_text(payload["profileEvidenceJson"], MAX_FRAME - 4)
+            _profile_text(payload["profileEvidenceJson"], MAX_FRAME - 4 if version == 2 else MAX_EVIDENCE_V3)
             raw = payload["profileEvidenceJson"].encode("utf-8")
             _require(sha256(raw) == payload["profileEvidenceSha256"], "証拠原bytesのhashが一致しません")
             evidence = _profile_evidence(raw)
@@ -472,7 +486,16 @@ def decode_frame_v2(frame: bytes) -> dict:
 
 def correlate_response_v2(request_frame: bytes, response_frame: bytes) -> dict:
     """wire2の元body/inner原bytes相関。異版errorを含むfallbackや作用の再実行を許可しない。"""
-    request, response = decode_frame_v2(request_frame), decode_frame_v2(response_frame)
+    return _profile_response(request_frame, response_frame, 2)
+
+
+def correlate_response_v3(request_frame: bytes, response_frame: bytes) -> dict:
+    """wire3の要求・応答を原bodyと証拠hashへ相関する。"""
+    return _profile_response(request_frame, response_frame, 3)
+
+
+def _profile_response(request_frame, response_frame, version):
+    request, response = (_decode_profile_frame(frame, version) for frame in (request_frame, response_frame))
     _correlate_response_values(_v2_projection(request), _v2_projection(response), sha256(request_frame[4:]))
     if response["type"] != "error" and request["phase"] in {"HELLO", "BOUND"}:
         _require(response["payload"]["profileEvidenceSha256"] == request["payload"]["profileEvidenceSha256"],
@@ -505,24 +528,42 @@ def _evidence_context(evidence, context, descriptor, descriptor_raw):
 
 def correlate_grant_v2(hello_frame: bytes, grant_frame: bytes, context: dict) -> dict:
     """callerが固定したP正本とPRE/GRANTを照合する。contextの由来を認証するAPIではない。"""
+    return _profile_grant(hello_frame, grant_frame, context, 2)
+
+
+def correlate_grant_v3(hello_frame: bytes, grant_frame: bytes, context: dict) -> dict:
+    """独立P入力とwire3 PRE/GRANTを照合する。"""
+    return _profile_grant(hello_frame, grant_frame, context, 3)
+
+
+def _profile_grant(hello_frame, grant_frame, context, version):
     descriptor, raw = _profile_context(context)
-    response = correlate_response_v2(hello_frame, grant_frame)
+    response = _profile_response(hello_frame, grant_frame, version)
     _require(response["type"] == "response" and response["phase"] == "GRANT"
              and response["descriptorSha256"] == sha256(raw)
              and _same_json(response["payload"]["management"], context["management"]), "同じP正本へのGRANTが必要です")
-    hello = decode_frame_v2(hello_frame)
+    hello = _decode_profile_frame(hello_frame, version)
     _evidence_context(_profile_evidence(hello["payload"]["profileEvidenceJson"].encode("utf-8")), context, descriptor, raw)
     return response
 
 
 def correlate_binding_v2(frame: bytes, context: dict, *, pre_evidence_json: str | None = None) -> dict:
     """固定GRANT/Data相関とBOUND不変証拠を照合する。PRE原文は元HELLOからcallerが保持して渡す。"""
+    return _profile_binding(frame, context, pre_evidence_json, 2)
+
+
+def correlate_binding_v3(frame: bytes, context: dict, *, pre_evidence_json: str | None = None) -> dict:
+    """wire3のGRANT bindingとPREから不変のBOUND証拠を照合する。"""
+    return _profile_binding(frame, context, pre_evidence_json, 3)
+
+
+def _profile_binding(frame, context, pre_evidence_json, version):
     descriptor, raw = _profile_context(context)
-    message = decode_frame_v2(frame)
+    message = _decode_profile_frame(frame, version)
     _correlate_binding_value(_v2_projection(message), raw, owner=context["owner"], management=context["management"])
     if message["phase"] == "BOUND":
         _require(type(pre_evidence_json) is str, "元HELLOのPRE証拠が必要です")
-        _profile_text(pre_evidence_json, MAX_FRAME - 4)
+        _profile_text(pre_evidence_json, MAX_FRAME - 4 if version == 2 else MAX_EVIDENCE_V3)
         pre = _profile_evidence(pre_evidence_json.encode("utf-8"))
         bound = _profile_evidence(message["payload"]["profileEvidenceJson"].encode("utf-8"))
         _require(pre["checkpoint"] == "PRE_ADMISSION", "元PRE checkpointが必要です")

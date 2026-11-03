@@ -161,7 +161,7 @@ if os.name == "nt":
             self.group = None
             self.stage = "NOT_CREATED"
 
-        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None):
+        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None, environment=None):
             self.group = "Local\\sushieric-runtime-" + name
             with security_descriptor() as descriptor:
                 attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
@@ -183,7 +183,7 @@ if os.name == "nt":
                     os.set_handle_inheritable(handle, True)
                 try:
                     self.handle, self.thread, self.pid, _ = _winapi.CreateProcess(arguments[0], subprocess.list2cmdline(arguments), None, None,
-                        True, 0x4 | subprocess.CREATE_NO_WINDOW, None, str(cwd), start)
+                        True, 0x4 | subprocess.CREATE_NO_WINDOW, environment, str(cwd), start)
                     self.stage = "CREATED"
                 finally:
                     for handle in start.lpAttributeList["handle_list"]:
@@ -326,9 +326,9 @@ else:
             self.process = self.pid = self.group = None
             self.stage = "NOT_CREATED"
 
-        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None):
+        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None, environment=None):
             self.process = subprocess.Popen(arguments, cwd=cwd, stdin=subprocess.DEVNULL if input_fd is None else input_fd,
-                                            stdout=log if output_fd is None else output_fd, stderr=log, start_new_session=True)
+                                            stdout=log if output_fd is None else output_fd, stderr=log, start_new_session=True, env=environment)
             self.pid = self.process.pid
             self.group = self.pid
             self.stage = "CREATED"

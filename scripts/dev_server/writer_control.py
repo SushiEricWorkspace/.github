@@ -43,7 +43,7 @@ class WriterControl:
 
     def _bound(self, connection, payload, *, closing=False):
         row = dict(self.registry._instance(connection, payload["instanceId"]))
-        self.registry._token(row, payload)
+        self.registry._token(row, payload, allow_expired=closing and row["state"] == "STOPPING")
         require(row["generation_bound"] and row["generation"] is not None and (closing or not row["pending"]),
                 "INVALID_STATE", "完成世代と未完了操作不在が必要です")
         gate = _admission(connection, row)
@@ -301,7 +301,7 @@ class WriterControl:
         with self.registry.runtime._transaction(binding["instanceId"], read_only=True) as connection:
             row, session = self._session(connection, binding, closing=True)
         runtime_process.require_identity(json.loads(session['identity']), self.process_adapter.identity(session['pid']))
-        self.registry.runtime._running(row)
+        self.registry.runtime._running(row, closing=True)
 
     def _database_state(self, payload, operation_id, fingerprint, *, closing=False):
         with self.registry.runtime._transaction(payload["instanceId"], read_only=True) as connection:
@@ -322,7 +322,7 @@ class WriterControl:
                         'WRITER_PENDING', '新DB要求を受け付けられません')
         runtime_process.require_identity(json.loads(session['identity']), self.process_adapter.identity(session['pid']))
         if not (closing and cached and cached['status'] == 'COMPLETED'):
-            self.registry.runtime._running(row)
+            self.registry.runtime._running(row, closing=closing or cached is not None)
         return row, session, cached
 
     def _database_accept(self, payload, operation_id, fingerprint, command, *, revision=None):
@@ -544,8 +544,13 @@ class WriterControl:
                 if proxy is None:
                     require(previous_proxy is None, 'WRITER_PENDING', '保持proxyが変更されました')
                     require(len(self.database_proxies) < 4, 'DB_PROXY_LIMIT', 'DB proxyの4枠が使用中です')
+                    identity_options = {}
+                    if self.registry.runtime.managed is not None:
+                        from .mod_control_runtime import process_identity
+                        native = self.registry.runtime.managed.transport.native
+                        identity_options['control_identity'] = lambda pid: process_identity(native, self.process_adapter, pid)
                     proxy = DatabaseProxy(bundle, path, binding, verify=lambda: self._database_verify(binding),
-                                          process_adapter=self.process_adapter)
+                                          process_adapter=self.process_adapter, **identity_options)
                     self.database_proxies[payload['sessionId']] = proxy
                     created_proxy = True
                 try:
@@ -583,7 +588,7 @@ class WriterControl:
             if claimed:
                 self._release_call(row, payload, operation_id, fingerprint)
 
-    def _database_close(self, payload, operation_id, fingerprint, dry_run):
+    def _database_close(self, payload, operation_id, fingerprint, dry_run, *, deadline=None):
         claimed = False
         try:
             row, session, cached = self._database_state(payload, operation_id, fingerprint, closing=True)
@@ -602,7 +607,7 @@ class WriterControl:
             claimed = True
             proxy = self.database_proxies.get(payload['sessionId'])
             require(proxy is not None, 'WRITER_PENDING', '以前のproxy本人とpipeを引き継ぎません')
-            deadline = time.monotonic() + 30
+            deadline = time.monotonic() + 30 if deadline is None else deadline
             try:
                 if proxy.request_bytes is not None:
                     request = json.loads(proxy.request_bytes)

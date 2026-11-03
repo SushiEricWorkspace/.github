@@ -30,7 +30,8 @@ class TemplateInitializationTests(unittest.TestCase):
         self.addCleanup(self.target.doCleanups)
         # 別のModクラスを固定したbundleを作り、異なるartifactを使用する。
         self.target.bundle_fixture.classes.joinpath("Test.class").write_bytes(b"new-mod-build")
-        bundle = self.target.bundle_fixture.freeze()
+        _, _, candidate = self.target.bundle_fixture.managed_candidate()
+        bundle = self.target.bundle_fixture.freeze_managed(candidate)
         shutil.copytree(bundle, self.target.root / "artifacts" / bundle.name)
         self.payload = dict(self.target.token, artifactId=bundle.name, generationId="00000000-0000-4000-8000-000000000035", acceptEula=True,
                             sourceRoot=str(self.source.root), templateId=self.source.template, templateHash=None,

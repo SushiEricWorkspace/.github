@@ -350,6 +350,7 @@ class StartupTests(unittest.TestCase):
         self.runtime.refresh = Mock()
         self.runtime._active = Mock(return_value=Path(self.launch['run']))
         self.runtime._space = Mock()
+        self.runtime.managed = Mock(sessions={})
         def start(row, payload, generation, endpoints, operation):
             self.run['startOperationId'] = operation
             self.run['startRequestHash'] = self.db.execute('SELECT fingerprint FROM runtime_operations WHERE id=?', (operation,)).fetchone()[0]

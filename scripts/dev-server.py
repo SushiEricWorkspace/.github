@@ -30,12 +30,15 @@ def main() -> int:
     parser.add_argument("--operation-id")
     parser.add_argument("--payload", default="{}", help="command固有のJSON object")
     parser.add_argument("--payload-file", type=Path, help="shellの引用符処理を避けてJSON objectをファイルで指定")
+    parser.add_argument("--supervise-input-sha256", help="独立承認済みsupervise入力原bytesのSHA-256")
     parser.add_argument("--payload-stdin", action="store_true", help="Manager本文をOS引数へ載せず標準入力から受け取る")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout-seconds", type=int, default=5, help="IPC応答の待機期限。期限後も自動再送/killしない")
     args = parser.parse_args()
     operation_id = args.operation_id
     try:
+        if args.command != "supervise" and args.supervise_input_sha256 is not None:
+            raise RegistryError("INVALID_INPUT", "承認hashはsupervise専用です")
         if not args.root.is_absolute():
             raise RegistryError("INVALID_INPUT", "管理rootは明示的な絶対パスで指定してください")
         if args.command == "init":
@@ -52,9 +55,9 @@ def main() -> int:
             from dev_server.ssh_broker import serve
             return serve(args.root, sys.stdin.buffer, sys.stdout.buffer)
         elif args.command == "supervise":
-            if args.dry_run or args.inventory is not None or args.payload != "{}" or args.payload_file is not None or args.payload_stdin:
+            if args.dry_run or args.inventory is not None or args.payload != "{}" or args.payload_stdin or bool(args.payload_file) != bool(args.supervise_input_sha256):
                 raise RegistryError("INVALID_INPUT", "superviseは初期化済みrootだけを指定してください")
-            supervise(args.root)
+            supervise(args.root, approval_file=args.payload_file, approval_sha256=args.supervise_input_sha256)
             return 0
         else:
             if args.command in {"prepare", "template-init", "import", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-check", "writer-close", "gametest", "gc"} and operation_id is None:

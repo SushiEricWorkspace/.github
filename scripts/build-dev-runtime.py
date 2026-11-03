@@ -11,7 +11,7 @@ import uuid
 
 from dev_server.build_inputs import canonical, capture_sources, digest, regular_bytes, verify_sources
 from dev_server.contracts import ContractError
-from dev_server.runtime_bundle import _directory
+from dev_server.runtime_bundle import _directory, _read_managed_profile
 from dev_server.task_worktrees import TaskError, TaskWorktrees
 from dev_server.task_maven import TaskMaven
 from dev_server.build_lock import build_lock
@@ -75,10 +75,14 @@ def main():
     parser.add_argument("--store", type=Path, required=True)
     parser.add_argument("--manager", action="store_true")
     parser.add_argument("--with-core", action="store_true", help="Coreを検証・発行する。Modへ未接続の依存を追加はしない")
+    parser.add_argument("--managed-profile", type=Path, help="通常M用exact Profileの明示候補。承認はsuperviseで別途指定")
     args = parser.parse_args()
     root = args.task_root.absolute()
     _directory(root)
     _directory(args.store.absolute())
+    profile_raw = regular_bytes(args.managed_profile) if args.managed_profile is not None else None
+    if profile_raw is not None:
+        _read_managed_profile(profile_raw)
     names = {"SushiEricDataModel", "SushiEricServerMod", ".github"}
     if args.manager:
         names.add("SushiEricServerManager")
@@ -135,10 +139,17 @@ def main():
             source_lock["publications"] = publications
             lock.parent.mkdir(parents=True, exist_ok=True)
             lock.write_bytes(canonical(source_lock))
-            gradle(repos["SushiEricServerMod"], "build", "exportDevRuntime", "-x", "runGameTest", "-x", "runServer", *mod_args,
+            gradle(repos["SushiEricServerMod"], "build", "describeDevRuntime" if args.managed_profile is not None else "exportDevRuntime", "-x", "runGameTest", "-x", "runServer", *mod_args,
                    f"-PruntimeSourceLock={lock}", f"-PruntimeArtifactStore={args.store.absolute()}",
                    f"-PruntimePython={sys.executable}",
                    f"-PruntimeExporter={exporter}")
+            if args.managed_profile is not None:
+                if regular_bytes(args.managed_profile) != profile_raw:
+                    raise ContractError("build: 明示Profileがビルド中に変更されました")
+                subprocess.run([sys.executable, "-B", str(exporter),
+                                "--recipe", str(repos["SushiEricServerMod"] / "build/dev-runtime/recipe.json"),
+                                "--source-lock", str(lock), "--store", str(args.store.absolute()),
+                                "--managed-profile", str(args.managed_profile.absolute())], cwd=github, check=True)
             verify_sources(source_lock)
             registered_task(root, args.owner, names)
             record = records.succeed(record, source_lock)

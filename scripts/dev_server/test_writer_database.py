@@ -10,7 +10,7 @@ from . import test_writer_control as fixtures
 
 
 class ProxyPeer:
-    def __init__(self, bundle, diagnostics, binding, *, verify, process_adapter):
+    def __init__(self, bundle, diagnostics, binding, *, verify, process_adapter, control_identity=None):
         self.diagnostics = diagnostics
         self.verify = verify
         self.started = self.bound = self.exited = False

@@ -261,12 +261,31 @@ UNKNOWNの確定と格下げ拒否、CLOSED読戻しの無作用を対象とし�
 実P/M起動・profile/native loadの実証・実OS startgate・旧root・全系譜/全資源の終端は未検証です。
 前成果の両OS699件/native3成功を本変更の再成功へ読み替えません。
 
-## 次の通常管理起動へ接続する共有合意（未実装）
+## 通常管理起動の共有合意とwire3接続
+
+現行の通常callerは`mod_control_runtime.ManagedRuntime`です。以下の承認入力をsupervisor寿命で保持し、native所有descriptor/listener→7property/完全environment→HELLO/GRANT→M本人beginRun→BOUND/ACK→既STARTED proof/実listener→同transactionでOPEN/RUNNINGの順に進みます。ACK後ready失敗では起動予約・所有process・保存ACKを保持し、自動RCON/kill/再OPENを行いません。同接続の元BOUND原文だけは専用受信threadでACKを読み戻せます。
+
+通常wire3はouter body 1..4194304B、profile証拠原文1048576Bまでです。inner適合とescape後outer適合を別々に検査し、native I/Oは65536B以下に分けます。descriptor/candidate/既IPCの上限を一括拡張しません。wire1/2の65536B frameは独立維持します。control台帳は元版と原要求/応答を保持し、保存済み終端をUNKNOWNへ格下げせず、旧行を移行しません。
+
+停止は、P閉門→既受理writer結果の耐久記録/ack・proxy/全child実exit→RCONです。直接RCON/console/OS停止ではMが先にfreeze・未投入要求の作用前拒否配送・投入済みsettlementを行い、専用受信threadがSTOP_BLOCKを受けて同run予約へ合流します。共有4workerやmanaged-stopのdrain待機で受信を塞ぎません。既claim所有者の回収/解放を待ち、二重I/Oを行いません。BLOCKEDは全必要writerの元要求と実proxy/child exitの耐久記録を確認した後だけ保存して送信します。
+
+ManagementのDatabaseContext/DatabaseHistory/MoneyHistorySaveResultは、同接続・元nonce・種別を照合した`rejectedBeforeEffect=true`だけを確定REJECTEDとします。商品応答の既作用前拒否もREJECTEDへ揃えます。false/省略、nonce/種別不一致、timeout/切断はUNKNOWNを保持し、CLOSEDへ変換しません。元結果の保存後にackし、close応答と実exit0/全child不在は別々に確認します。
+
+Mの最終保存/DBclose後、元Runningのworld/run/世代/pathと相関するRequestedへ、同transactionの最新全件completionを生成・保存して送信します。control close後のData finishはM本人が行います。PはSTOPPED proof・所有M/全childの実exit0後に停止を確定し、次runまで閉門を維持します。直接停止も同じ終端照合を使い、公開stopとの競合で二重completeしません。DB proxy以外の外部writerについて必要なdrain/実終了証拠を持たない場合は成功を作らず保留します。
+
+共有fixtureはMod commit `1b36b6e29a86244f1d2c67dda9709bf9bc0cf26d`のGit blobと同bytesです。`mod-control-vectors-v3-local.json`（73736B、SHA-256 `e515f795e9fc92849506c5389b19daad22cf086b3845bfcb9557d5f22f3c53b9`）、`management-stop-vectors.json`、`management-stop-trace.json`のbyte一致をunitで固定します。合成制御/実DTO proxy試験と、Windows S1〜S3・OS shutdown・Darwinの実受入は区別します。
 
 この節は`.github#64`と`SushiEricServerMod#597`が後続で接続する境界を定めます。
 現在の`RuntimeControl._managed_startup`は、明示入力のprivate経路でACK送信直後に
-OPEN/RUNNINGと元startを完成します。以下の通常ready後の完成へ変更済みとは扱いません。
-wire2、descriptor v1、Profile v1、Data DTOは変更しません。
+OPEN/RUNNINGと元startを完成します。通常wire3ではこのprivate入口を使用せず、
+`ManagedRuntime`が通常ready後の完成まで接続します。
+通常経路はwire3固定です。descriptor v1、Profile v1、Data DTOは維持し、wire1/2へfallbackしません。この節より前のwire1/2・private先行成果の記述は旧版の検証境界です。
+
+STOP_BLOCKのwire operationと公開stopは別IDを保持し、既`reservations`の`stop:<元stop ID>`で親子を結束します。
+直接停止が先なら同runの内部stop予約を作り、後着の公開stopはその耐久結果へ合流します。
+停止確定と所有M/child終了照合は元stopだけが行い、合流要求は結果を読み戻します。
+停止中の既受理DB回収・history-end・proxy closeは、同runのBLOCKED予約と所有M/Management待受を照合します。
+MのSTOPPING proofを通常readyへ昇格せず、Minecraft/RCON待受が閉じてもManagementの実待受を必要とします。
 
 ### 起動時の承認入力
 
@@ -274,8 +293,7 @@ wire2、descriptor v1、Profile v1、Data DTOは変更しません。
 exact Profileおよび既`expectedEvidence`のJDK/code/mod/native許可集合を明示承認します。
 Pの入力媒体は、既supervise起動経路の`--payload-file`へ渡す読取専用UTF-8 JSONとし、
 承認済み原入力のSHA-256を信頼する起動側から別指定する方式とします。
-後続CLIの形は`supervise --root ROOT --payload-file INPUT --supervise-input-sha256 SHA256`を想定します。
-現CLIはこの組合せを実装しておらず、現在の実行手順ではありません。
+公式CLIは`supervise --root ROOT --payload-file INPUT --supervise-input-sha256 SHA256`で指定します。入力なしのsuperviseは貸出/GT等を維持しますが、通常startはM生成前にPROFILE_REQUIREDで拒否します。
 
 起動専用入力は既fieldの`managementRoot`と`instances`を持ち、各要素を
 `instanceId, artifactId, runtimeManifestHash, expectedEvidence`に限定します。
@@ -344,7 +362,7 @@ descriptorは`ROOT/manager/control/<runtimeRunId>/mod-control.json`の元UTF-8 b
 部分指定を旧5項目の管理起動へ降格させません。管理引数のない通常起動とGameTestの既契約を混同しません。
 Pは既Profileのargv/完全environment/3補助file bytes・argfileEncodingをexactに使用します。
 親environmentやWindowsの`mbcs`/ACPから値を補完しません。新しい任意引数/環境変数の転送口は作りません。
-Pは所有Mのnative identityと実際に渡した入力を独立に保持し、Mは実測証拠を既wire2で返します。
+Pは所有Mのnative identityと実際に渡した入力を独立に保持し、Mは実測証拠をwire3で返します。
 Pの承認済みexpected集合をMへ渡して、その値を実測証拠として返させてはいけません。
 
 ### 同runの補助file・privateTmpと所有寿命
@@ -399,10 +417,13 @@ ACK保存後に通常readyが失敗/不明になっても、保存ACKをUNKNOWN�
 
 ### 依存と確認範囲
 
-固定Mod `4828499eb05ff2b168f82705ab842e92e751adf1`は、通常world入口の
+旧固定Mod `4828499eb05ff2b168f82705ab842e92e751adf1`は、通常world入口の
 `WorldRunBootstrap.prepare`で管理run本人bindingを未完了として拒否します。
 旧5propertyのManagedRunOptionsや非管理WorldRunGate/NormalWorldSavesを、Mのwire2実peerと扱いません。
 固定Data `e5719b310da191abd6aa94c534dbb1d37f35c62d`の管理run APIだけでも、Modの接続完了にはなりません。
+
+現在の通常接続の前提はMod `1b36b6e29a86244f1d2c67dda9709bf9bc0cf26d`です。
+旧登録依存のまま新Pだけをビルドして対応済みとせず、対応ModとPを同じ新固定bundleへ含めます。
 
 実施順は、この共有合意の確定commit → Mod#597のM実peer/通常startupの確定commit →
 .github#64の通常P接続とOS別受入です。Modはこの仕様と既wire/Profile/Data契約を参照し、
