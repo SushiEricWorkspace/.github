@@ -66,6 +66,29 @@ class ManagedProfileTests(unittest.TestCase):
                 self.assertIsNone(validate_managed_launch(*values))
                 self.assertEqual(before, values)
 
+    def test_valueless_system_property_is_preserved_and_restricted(self):
+        profile, context, _ = fixture()
+        argument = "-Duser.variant"
+        profile["jvmArgs"].append(argument)
+        actual = observed(profile, context)
+        original = deepcopy(profile["jvmArgs"])
+        self.assertIsNone(validate_managed_launch(profile, context, actual))
+        self.assertEqual(original, profile["jvmArgs"])
+        argfile = actual["auxiliaryFiles"]["java.args"]
+        self.assertIn(b"\"-Duser.variant\"", argfile)
+        self.assertNotIn(b"\"-Duser.variant=\"", argfile)
+
+        for invalid in ("-D", "-D=x", "-Dsushieric.managed.startNonce",
+                        argument, "@arguments", "-classpath"):
+            with self.subTest(invalid=invalid):
+                profile, context, _ = fixture()
+                profile["jvmArgs"].append(invalid)
+                if invalid == argument:
+                    profile["jvmArgs"].append(invalid)
+                actual = observed(profile, context)
+                with self.assertRaises(ContractError):
+                    validate_managed_launch(profile, context, actual)
+
     def test_shared_static_argfile_byte_vectors(self):
         vectors = json.loads(Path(__file__).with_name("managed-argfile-vectors-v1.json").read_bytes())
         for case in vectors["cases"]:

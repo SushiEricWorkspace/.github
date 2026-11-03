@@ -128,7 +128,7 @@ def _validate_managed_profile(profile):
         allowed = set()
         if argument.startswith("-D"):
             key, separator, value = argument[2:].partition("=")
-            _require(bool(key) and bool(separator), "managed launch: propertyが不正です")
+            _require(bool(key), "managed launch: propertyが不正です")
             flag = "property:" + key
             actual_properties[key] = value
             if key in _MANAGED_PROPERTIES:

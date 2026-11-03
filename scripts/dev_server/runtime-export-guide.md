@@ -155,6 +155,7 @@ DLIの`${run}/.launch`から`${auxiliary}`への置換以外に本文を生成�
 
 元JVM列は順序と値を維持し、DLI補助pathのslot置換だけを行います。
 追加可能なのはProfileに明示した7管理property、`-XX:+DisableAttachMechanism`、`java.io.tmpdir`、任意の`org.sqlite.tmpdir`の既tokenだけです。
+値なしのJVM system propertyは、キーが空でない`-Dkey`に限りProfileへ追加できます。元の引数文字列を維持し、管理propertyには値が必要です。
 元引数の欠落・上書き・順序変更や、それ以外のheap/native設定等の追加は未対応として拒否します。
 元recipeに含まれる引数がこの照合に通ることは、意味上の許可やnative閉包の承認ではありません。
 
