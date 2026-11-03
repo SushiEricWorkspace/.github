@@ -125,7 +125,7 @@ class BuildDevRuntimeTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             build_dev_runtime.recorded_exporter(repos[".github"], source_lock)
 
-    def main_fixture(self, extras=(), failure=None, *, managed=False):
+    def main_fixture(self, extras=(), failure=None, *, managed=False, stage=None):
         task = self.root / "worktrees/task-41"
         data_model = task / "SushiEricDataModel"
         mod = task / "SushiEricServerMod"
@@ -167,6 +167,12 @@ class BuildDevRuntimeTests(unittest.TestCase):
         def gradle_side_effect(repo, *args):
             if failure is not None:
                 raise failure
+            if repo == mod and "describeDevRuntime" in args:
+                recipe_path = mod / "build/dev-runtime/recipe.json"
+                recipe_path.parent.mkdir(parents=True, exist_ok=True)
+                recipe_path.write_bytes(canonical({"dataModelCoordinate": mod_coordinate,
+                                                   "profiles": {"server": {"classpath": ["first.jar"]},
+                                                                "gameTest": {"classpath": [mod_coordinate]}}}))
             if repo == mod and 'exportDevRuntime' in args:
                 lock_path = Path(next(arg.split("=", 1)[1] for arg in args if arg.startswith("-PruntimeSourceLock=")))
                 bundle = synthetic_bundle(store, json.loads(lock_path.read_bytes()))
@@ -196,10 +202,11 @@ class BuildDevRuntimeTests(unittest.TestCase):
              "dirtyPatchSha256": digest(b""), "untrackedInputs": []},
              "inputs": [{"path": "scripts/export-dev-runtime.py"}] if name == ".github" else [],
              "patchBase64": ""} for name in sorted(names)]}
+        argv = (["build-dev-runtime.py"] + ([stage] if stage else []) + ["--task-root", str(task),
+                "--owner", "owner", "--store", str(store)] +
+                (["--managed-profile", str(profile)] if managed else []))
         with patch.object(build_dev_runtime, "__file__", str(github / "scripts/build-dev-runtime.py")), \
-                patch.object(sys, "argv", ["build-dev-runtime.py", "--task-root", str(task),
-                                            "--owner", "owner", "--store", str(store)] +
-                                           (["--managed-profile", str(profile)] if managed else [])), \
+                patch.object(sys, "argv", argv), \
                 patch.object(build_dev_runtime, "registered_task", return_value={name: {} for name in names}) as registered, \
                 patch.object(build_dev_runtime, "capture_sources", return_value=source_lock), \
                 patch.object(build_dev_runtime, "verify_sources"), \
@@ -210,7 +217,8 @@ class BuildDevRuntimeTests(unittest.TestCase):
 
         self.assertEqual(3, registered.call_count)
         registered.assert_called_with(task.absolute(), "owner", names)
-        export_call = next(call for call in gradle.call_args_list if ("describeDevRuntime" if managed else "exportDevRuntime") in call.args)
+        expected_task = "describeDevRuntime" if managed or stage == "prepare" else "exportDevRuntime"
+        export_call = next(call for call in gradle.call_args_list if expected_task in call.args)
         if managed:
             exporter_run.assert_called_once()
         else:
@@ -236,8 +244,10 @@ class BuildDevRuntimeTests(unittest.TestCase):
             if call.args[0] != mod:
                 self.assertFalse(any(arg.startswith("-PcombatCoreDevelopmentCoordinate=") for arg in call.args[1:]))
         record = json.loads((task.parent / ".build-records/task-41" / f"{build_id}.json").read_bytes())
-        self.assertEqual("SUCCEEDED", record["state"])
-        self.assertTrue(record["artifactId"])
+        self.assertEqual("STARTED" if stage == "prepare" else "SUCCEEDED", record["state"])
+        if stage != "prepare":
+            self.assertTrue(record["artifactId"])
+        self.task, self.store, self.profile, self.exporter = task, store, profile, exporter
         return gradle.call_args_list
 
     def test_main_passes_recorded_task_exporter_to_gradle(self):
@@ -245,6 +255,202 @@ class BuildDevRuntimeTests(unittest.TestCase):
 
     def test_managed_profile_uses_describe_then_official_exporter_without_old_receipt(self):
         self.main_fixture(managed=True)
+
+    def test_prepare_describes_and_saves_recipe_without_export(self):
+        calls = self.main_fixture(stage="prepare")
+        self.assertTrue(any("describeDevRuntime" in call.args for call in calls))
+        state = json.loads((self.store / ".prepared" / ("a" * 32) / "prepared.json").read_bytes())
+        self.assertEqual("PREPARED", state["state"])
+        self.assertEqual("task-41", state["taskId"])
+        self.assertEqual("owner", state["owner"])
+        self.assertEqual(["first.jar", state["dataModelCoordinate"]],
+                         build_dev_runtime.recipe_classpath(json.loads(Path(state["recipe"]).read_bytes())))
+        record = json.loads((self.task.parent / ".build-records/task-41" / ("a" * 32 + ".json")).read_bytes())
+        self.assertEqual("STARTED", record["state"])
+
+    def test_prepare_final_output_failure_records_failed_from_started_record(self):
+        with patch("builtins.print", side_effect=RuntimeError("final output failed")):
+            with self.assertRaisesRegex(RuntimeError, "final output failed"):
+                self.main_fixture(stage="prepare")
+        record_path = self.root / "worktrees/.build-records/task-41" / ("a" * 32 + ".json")
+        self.assertEqual("FAILED", json.loads(record_path.read_bytes())["state"])
+
+    def test_freeze_exports_prepared_recipe_once_without_rebuilding(self):
+        self.main_fixture(stage="prepare")
+        from .test_managed_profile import fixture
+        self.profile.write_bytes(canonical(fixture()[0]))
+        argv = ["build-dev-runtime.py", "freeze", "--task-root", str(self.task), "--owner", "owner",
+                "--store", str(self.store), "--prepared-id", "a" * 32,
+                "--managed-profile", str(self.profile)]
+        helper = str(self.task / ".github/scripts/build-dev-runtime.py")
+        with patch.object(build_dev_runtime, "__file__", helper), \
+                patch.object(sys, "argv", argv), \
+                patch.object(build_dev_runtime, "registered_task", return_value={".github": {}}), \
+                patch.object(build_dev_runtime, "verify_sources"), \
+                patch.object(build_dev_runtime, "recorded_exporter", return_value=self.exporter.resolve()), \
+                patch.object(build_dev_runtime.subprocess, "run") as export, \
+                patch.object(build_dev_runtime.TaskMaven, "succeed", return_value={"artifactId": "bundle-id"}) as succeed:
+            build_dev_runtime.main()
+            export.assert_called_once()
+            command = export.call_args.args[0]
+            self.assertIn(str(self.task / "SushiEricServerMod/build/dev-runtime/recipe.json"), command)
+            self.assertIn(str(self.task / "SushiEricServerMod" / "build/dev-runtime" /
+                              ("source-lock-" + "a" * 32 + ".json")), command)
+            self.assertIn(str(self.profile.absolute()), command)
+            succeed.assert_called_once()
+        with patch.object(build_dev_runtime, "__file__", helper), \
+                patch.object(sys, "argv", argv), patch.object(build_dev_runtime.subprocess, "run") as export:
+            with self.assertRaisesRegex(ContractError, "消費済み"):
+                build_dev_runtime.main()
+            export.assert_not_called()
+
+    def test_freeze_exporter_failure_records_failed_and_preserves_exception(self):
+        self.main_fixture(stage="prepare")
+        from .test_managed_profile import fixture
+        self.profile.write_bytes(canonical(fixture()[0]))
+        argv = ["build-dev-runtime.py", "freeze", "--task-root", str(self.task), "--owner", "owner",
+                "--store", str(self.store), "--prepared-id", "a" * 32,
+                "--managed-profile", str(self.profile)]
+        helper = str(self.task / ".github/scripts/build-dev-runtime.py")
+        failure = subprocess.CalledProcessError(7, "exporter")
+        with patch.object(build_dev_runtime, "__file__", helper), \
+                patch.object(sys, "argv", argv), \
+                patch.object(build_dev_runtime, "registered_task", return_value={".github": {}}), \
+                patch.object(build_dev_runtime, "verify_sources"), \
+                patch.object(build_dev_runtime, "recorded_exporter", return_value=self.exporter.resolve()), \
+                patch.object(build_dev_runtime.subprocess, "run", side_effect=failure):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                build_dev_runtime.main()
+        self.assertIs(failure, raised.exception)
+        record_path = self.task.parent / ".build-records/task-41" / ("a" * 32 + ".json")
+        self.assertEqual("FAILED", json.loads(record_path.read_bytes())["state"])
+        self.assertTrue((self.store / ".prepared" / ("a" * 32) / "consumed").is_file())
+
+    def test_freeze_registered_task_rejection_invalidates_matching_preparation(self):
+        store, directory, _, _, _ = self.prepared_fixture()
+        root = self.root / "worktrees/task-41"
+        with patch.object(build_dev_runtime, "verify_sources"), \
+                patch.object(build_dev_runtime, "registered_task", side_effect=TaskError("task registration changed")):
+            with self.assertRaisesRegex(TaskError, "task registration changed"):
+                build_dev_runtime.load_prepared_for_freeze(root, store, "a" * 32, "task-41", "owner")
+        state = json.loads((directory / "prepared.json").read_bytes())
+        self.assertEqual("INVALID", state["state"])
+        self.assertEqual("task registration changed", state["failure"])
+
+    def test_freeze_other_owner_cannot_invalidate_preparation(self):
+        store, directory, _, _, _ = self.prepared_fixture()
+        with patch.object(build_dev_runtime, "registered_task") as registered:
+            with self.assertRaisesRegex(ContractError, "task/owner/store/ID"):
+                build_dev_runtime.load_prepared_for_freeze(
+                    self.root / "worktrees/task-41", store, "a" * 32, "task-41", "other-owner")
+        registered.assert_not_called()
+        self.assertEqual("PREPARED", json.loads((directory / "prepared.json").read_bytes())["state"])
+
+    def test_freeze_consumed_marker_write_failure_records_failed(self):
+        self.main_fixture(stage="prepare")
+        from .test_managed_profile import fixture
+        self.profile.write_bytes(canonical(fixture()[0]))
+        argv = ["build-dev-runtime.py", "freeze", "--task-root", str(self.task), "--owner", "owner",
+                "--store", str(self.store), "--prepared-id", "a" * 32,
+                "--managed-profile", str(self.profile)]
+        helper = str(self.task / ".github/scripts/build-dev-runtime.py")
+        original_open = Path.open
+
+        class BrokenMarker:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def write(self, data):
+                raise OSError("marker write failed")
+
+        def open_path(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            return BrokenMarker(stream) if path.name == "consumed" else stream
+
+        with patch.object(build_dev_runtime, "__file__", helper), \
+                patch.object(sys, "argv", argv), \
+                patch.object(build_dev_runtime, "registered_task", return_value={".github": {}}), \
+                patch.object(build_dev_runtime, "verify_sources"), \
+                patch.object(Path, "open", autospec=True, side_effect=open_path), \
+                patch.object(build_dev_runtime.subprocess, "run") as export:
+            with self.assertRaisesRegex(OSError, "marker write failed"):
+                build_dev_runtime.main()
+        export.assert_not_called()
+        self.assertTrue((self.store / ".prepared" / ("a" * 32) / "consumed").is_file())
+        record_path = self.task.parent / ".build-records/task-41" / ("a" * 32 + ".json")
+        self.assertEqual("FAILED", json.loads(record_path.read_bytes())["state"])
+
+    def test_invalidation_save_failure_keeps_original_and_stale_temp_is_replaced(self):
+        store, directory, _, recipe, _ = self.prepared_fixture()
+        recipe.write_bytes(recipe.read_bytes() + b" ")
+        temporary = directory / "prepared.invalid"
+        temporary.write_text("stale", encoding="utf-8")
+        with patch.object(build_dev_runtime, "invalidate_prepared", side_effect=OSError("invalidation write failed")):
+            with self.assertRaises(ContractError) as raised:
+                build_dev_runtime.load_prepared_for_freeze(
+                    self.root / "worktrees/task-41", store, "a" * 32, "task-41", "owner")
+        self.assertRegex(str(raised.exception), "recipe/source lock")
+        self.assertTrue(any("invalidation write failed" in note for note in raised.exception.__notes__))
+        build_dev_runtime.invalidate_prepared(directory / "prepared.json", raised.exception)
+        self.assertFalse(temporary.exists())
+        self.assertEqual("INVALID", json.loads((directory / "prepared.json").read_bytes())["state"])
+
+    def test_invalid_preparation_keeps_first_failure_reason(self):
+        store, directory, _, _, _ = self.prepared_fixture()
+        path = directory / "prepared.json"
+        state = json.loads(path.read_bytes())
+        state.update(state="INVALID", failure="original validation reason")
+        path.write_bytes(canonical(state))
+        with patch.object(build_dev_runtime, "invalidate_prepared") as invalidate:
+            with self.assertRaisesRegex(ContractError, "original validation reason"):
+                build_dev_runtime.load_prepared_for_freeze(
+                    self.root / "worktrees/task-41", store, "a" * 32, "task-41", "owner")
+        invalidate.assert_not_called()
+
+    def test_freeze_interrupt_does_not_invalidate_preparation(self):
+        store, directory, _, _, _ = self.prepared_fixture()
+        interrupt = KeyboardInterrupt()
+        with patch.object(build_dev_runtime, "load_prepared", side_effect=interrupt), \
+                patch.object(build_dev_runtime, "registered_task"), \
+                patch.object(build_dev_runtime, "invalidate_prepared") as invalidate:
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                build_dev_runtime.load_prepared_for_freeze(
+                    self.root / "worktrees/task-41", store, "a" * 32, "task-41", "owner")
+        self.assertIs(interrupt, raised.exception)
+        invalidate.assert_not_called()
+        self.assertEqual("PREPARED", json.loads((directory / "prepared.json").read_bytes())["state"])
+
+    def test_freeze_rechecks_recipe_hash_immediately_before_exporter(self):
+        self.main_fixture(stage="prepare")
+        from .test_managed_profile import fixture
+        self.profile.write_bytes(canonical(fixture()[0]))
+        recipe = self.task / "SushiEricServerMod/build/dev-runtime/recipe.json"
+        argv = ["build-dev-runtime.py", "freeze", "--task-root", str(self.task), "--owner", "owner",
+                "--store", str(self.store), "--prepared-id", "a" * 32,
+                "--managed-profile", str(self.profile)]
+        helper = str(self.task / ".github/scripts/build-dev-runtime.py")
+
+        def replace_recipe(*args):
+            recipe.write_bytes(recipe.read_bytes() + b" ")
+            return {".github": {}}
+
+        with patch.object(build_dev_runtime, "__file__", helper), \
+                patch.object(sys, "argv", argv), \
+                patch.object(build_dev_runtime, "registered_task", side_effect=replace_recipe), \
+                patch.object(build_dev_runtime, "verify_sources"), \
+                patch.object(build_dev_runtime, "recorded_exporter", return_value=self.exporter.resolve()), \
+                patch.object(build_dev_runtime.subprocess, "run") as export:
+            with self.assertRaisesRegex(ContractError, "直前のrecipe/source lock hash"):
+                build_dev_runtime.main()
+        export.assert_not_called()
+        record_path = self.task.parent / ".build-records/task-41" / ("a" * 32 + ".json")
+        self.assertEqual("FAILED", json.loads(record_path.read_bytes())["state"])
 
     def test_build_failure_is_recorded_and_maven_is_kept(self):
         with self.assertRaisesRegex(RuntimeError, "fixture Gradle failure"):
@@ -271,6 +477,78 @@ class BuildDevRuntimeTests(unittest.TestCase):
         self.assertTrue(any(call.args[0].name == "SushiEricServerManager" for call in calls))
         self.assertTrue(any(call.args[0].name == "SushiEricCombatCore" and "publishDevelopment" in call.args
                             for call in calls))
+
+    def prepared_fixture(self):
+        store = self.root / "store"
+        store.mkdir()
+        lock = self.root / "source-lock.json"
+        publication = self.root / "publication.jar"
+        publication.write_bytes(b"original")
+        lock.write_bytes(canonical({"sourceLockVersion": 1, "sources": [], "publications": [
+            {"path": str(publication), "sha256": digest(b"original")}]}))
+        recipe = self.root / "recipe.json"
+        coordinate = "io.github.sushiericworkspace:sushieric-datamodel-mod-dev:0.1.0-dev.20261010123456789.12345678-1234-1234-1234-123456789abc"
+        recipe.write_bytes(canonical({"dataModelCoordinate": coordinate,
+                                      "profiles": {"server": {"classpath": [coordinate]},
+                                                   "gameTest": {"classpath": []}}}))
+        state = {"preparedVersion": 1, "state": "PREPARED", "taskId": "task-41", "owner": "owner",
+                 "store": str(store.absolute()), "buildId": "a" * 32, "repos": [".github"],
+                 "sourceLock": str(lock), "sourceLockSha256": digest(lock.read_bytes()),
+                 "recipe": str(recipe), "recipeSha256": digest(recipe.read_bytes()),
+                 "dataModelCoordinate": coordinate}
+        build_dev_runtime.save_prepared(store, "a" * 32, state)
+        directory = build_dev_runtime.prepared_directory(store, "a" * 32)
+        return store, directory, lock, recipe, publication
+
+    def test_prepared_state_rechecks_identity_hashes_source_and_single_use(self):
+        store, directory, lock, recipe, _ = self.prepared_fixture()
+        with patch.object(build_dev_runtime, "verify_sources") as verify:
+            state, _ = build_dev_runtime.load_prepared(store, "a" * 32, "task-41", "owner")
+        self.assertEqual("PREPARED", state["state"])
+        verify.assert_called_once()
+        with self.assertRaisesRegex(ContractError, "task/owner/store/ID"):
+            build_dev_runtime.load_prepared(store, "a" * 32, "task-41", "another-owner")
+        recipe.write_bytes(recipe.read_bytes() + b" ")
+        with self.assertRaisesRegex(ContractError, "recipe/source lock"):
+            build_dev_runtime.load_prepared(store, "a" * 32, "task-41", "owner")
+        recipe.write_bytes(canonical({"dataModelCoordinate": state["dataModelCoordinate"],
+                                      "profiles": {"server": {"classpath": []},
+                                                   "gameTest": {"classpath": [state["dataModelCoordinate"]]}}}))
+        (directory / "consumed").write_bytes(b"consumed")
+        with self.assertRaisesRegex(ContractError, "消費済み"):
+            build_dev_runtime.load_prepared(store, "a" * 32, "task-41", "owner")
+
+    def test_prepared_state_rejects_changed_sources_and_publication(self):
+        store, _, _, _, publication = self.prepared_fixture()
+        with patch.object(build_dev_runtime, "verify_sources", side_effect=ContractError("source changed")):
+            with self.assertRaisesRegex(ContractError, "source changed"):
+                build_dev_runtime.load_prepared(store, "a" * 32, "task-41", "owner")
+        publication.write_bytes(b"changed")
+        with patch.object(build_dev_runtime, "verify_sources"):
+            with self.assertRaisesRegex(ContractError, "公開物"):
+                build_dev_runtime.load_prepared(store, "a" * 32, "task-41", "owner")
+
+    def test_prepared_publication_snapshot_is_bound(self):
+        store, directory, _, _, _ = self.prepared_fixture()
+        copied_publication = next((directory / "publications").iterdir())
+        copied_publication.write_bytes(b"tampered")
+        with patch.object(build_dev_runtime, "verify_sources"):
+            with self.assertRaisesRegex(ContractError, "snapshotが変更"):
+                build_dev_runtime.load_prepared(store, "a" * 32, "task-41", "owner")
+
+    def test_integrity_failure_invalidates_preparation_after_input_is_restored(self):
+        store, directory, _, recipe, _ = self.prepared_fixture()
+        original = recipe.read_bytes()
+        recipe.write_bytes(original + b" ")
+        with patch.object(build_dev_runtime, "verify_sources"):
+            with patch.object(build_dev_runtime, "registered_task", return_value={".github": {}}):
+                with self.assertRaisesRegex(ContractError, "recipe/source lock"):
+                    build_dev_runtime.load_prepared_for_freeze(
+                        self.root / "worktrees/task-41", store, "a" * 32, "task-41", "owner")
+            recipe.write_bytes(original)
+            with self.assertRaisesRegex(ContractError, "recipe/source lock"):
+                build_dev_runtime.load_prepared_for_freeze(
+                    self.root / "worktrees/task-41", store, "a" * 32, "task-41", "owner")
 
 
 if __name__ == "__main__":
