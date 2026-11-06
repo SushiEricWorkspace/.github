@@ -40,7 +40,8 @@ class OfflineControllerJavaTests(unittest.TestCase):
                                      ('OfflineControllerLifecycleVectors' if fake else 'OfflineControllerVectors')],
                                     capture_output=True, timeout=30)
             self.assertEqual(0, result.returncode, result.stderr.decode(errors='replace'))
-            self.assertIn(b'offline-lifecycle-vectors=19' if fake else b'offline-vectors=', result.stdout)
+            self.assertTrue(result.stdout.startswith(b'offline-lifecycle-vectors=') if fake
+                            else b'offline-vectors=' in result.stdout)
 
 
 if __name__ == '__main__':

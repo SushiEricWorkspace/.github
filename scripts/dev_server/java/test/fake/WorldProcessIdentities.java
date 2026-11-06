@@ -4,9 +4,14 @@ package io.github.sushiericworkspace.sushiericdatamodel.database.run;
 public final class WorldProcessIdentities {
     public static final WorldProcessIdentities INSTANCE = new WorldProcessIdentities();
     public static boolean parentAlive = true;
-    public WorldProcessIdentity current() { return identity(ProcessHandle.current().pid()); }
+    public static boolean selfMatches = true;
+    public WorldProcessIdentity current() {
+        WorldProcessIdentity current = identity(ProcessHandle.current().pid());
+        return selfMatches ? current : identity(current.getPid() + 1);
+    }
     public void requireAlive(WorldProcessIdentity identity) {
-        if (!parentAlive) throw new IllegalStateException("fixture P死亡");
+        WorldProcessIdentity actual = identity(ProcessHandle.current().parent().orElseThrow().pid());
+        if (!parentAlive || !actual.equals(identity)) throw new IllegalStateException("fixture P本人不一致");
     }
     public static WorldProcessIdentity identity(long pid) {
         return new WorldProcessIdentity("a".repeat(64), "fixture-boot", pid, "fixture-start");
