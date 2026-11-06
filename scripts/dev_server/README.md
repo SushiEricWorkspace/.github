@@ -61,3 +61,5 @@ prepare/template-init/import/restore/resetの世代構築、固定fixtureの検�
 契約テストの成功だけでこれらの実試験や停電耐性を証明しません。
 運用の初期対象はmacOS 15とWindows、Python 3.12/JDK 21です。
 各OSのnative IPC・lock試験と運用適合試験を分け、片方の成功をもう片方の証明にしません。
+
+停止中controller Cの固定入口と未接続範囲は[停止中controllerガイド](offline-controller-guide.md)を参照してください。
