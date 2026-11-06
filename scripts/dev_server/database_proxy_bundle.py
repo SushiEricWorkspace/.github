@@ -55,11 +55,11 @@ def _dependencies(root, coordinate, classpath, kotlin_version):
     return selected
 
 
-def _jar(data):
+def _jar(data, main=MAIN):
     _check_jar(data)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         names = archive.namelist()
-        prefix = MAIN.replace('.', '/')
+        prefix = main.replace('.', '/')
         _require(prefix + '.class' in names and len(names) == len(set(names)), 'helper class集合が不正です')
         for name in names:
             _require(re.fullmatch(re.escape(prefix) + r'(?:\$[A-Za-z0-9]+)*\.class', name), '未知のhelper classです')
@@ -76,24 +76,12 @@ def _classpath(root, names):
     return os.pathsep.join(paths)
 
 
-def freeze_proxy(freezer, lock, recipe, profiles):
-    """登録済み.githubの記録済みsourceを固定JDK21でcompileする。旧bundleへ後付けしない。"""
-    sources = [source for source in lock['sources'] if source['record']['repo'] == '.github']
-    if not sources:
-        return
-    _require(len(sources) == 1 and any(item['path'] == SOURCE and not item.get('deleted')
-                                     for item in sources[0]['inputs']), 'helper sourceが入力記録にありません')
-    source_bytes = freezer.read(Path(sources[0]['root']) / SOURCE)
-    source_name = DIRECTORY + '/DatabaseProxyMain.java'
-    freezer.write(source_name, source_bytes)
-    mod_classes = _mod_classes(freezer.root, profiles['server']['classpath'])
-    libraries = _dependencies(freezer.root, recipe['dataModelCoordinate'],
-                              profiles['server']['classpath'], recipe['kotlinVersion'])
-    dependencies = [mod_classes, *[item['file'] for item in libraries]]
+def _compile(freezer, recipe, dependencies, source_name, directory, main):
+    """固定JDKと収録済み依存だけで専用helperをcompileする。"""
     java_home = Path(recipe['javaHome'])
     compiler = java_home / 'bin' / ('javac.exe' if os.name == 'nt' else 'javac')
     compiler_hash = digest(freezer.read(compiler))
-    work = Path(tempfile.mkdtemp(prefix='.proxy-compile-', dir=freezer.root.parent))
+    work = Path(tempfile.mkdtemp(prefix='.' + directory.rsplit('/', 1)[-1] + '-compile-', dir=freezer.root.parent))
     classes = work / 'classes'
     classes.mkdir()
     arguments = ['--release', '21', '-encoding', 'UTF-8', '-cp', _classpath(freezer.root, dependencies),
@@ -114,7 +102,26 @@ def freeze_proxy(freezer, lock, recipe, profiles):
                 entry.external_attr = 0o100644 << 16
                 archive.writestr(entry, regular_bytes(path))
     jar = data.getvalue()
-    _jar(jar)
+    _jar(jar, main)
+    return jar, compiler_hash
+
+
+
+def freeze_proxy(freezer, lock, recipe, profiles):
+    """登録済み.githubの記録済みsourceを固定JDK21でcompileする。旧bundleへ後付けしない。"""
+    sources = [source for source in lock['sources'] if source['record']['repo'] == '.github']
+    if not sources:
+        return
+    _require(len(sources) == 1 and any(item['path'] == SOURCE and not item.get('deleted')
+                                     for item in sources[0]['inputs']), 'helper sourceが入力記録にありません')
+    source_bytes = freezer.read(Path(sources[0]['root']) / SOURCE)
+    source_name = DIRECTORY + '/DatabaseProxyMain.java'
+    freezer.write(source_name, source_bytes)
+    mod_classes = _mod_classes(freezer.root, profiles['server']['classpath'])
+    libraries = _dependencies(freezer.root, recipe['dataModelCoordinate'],
+                              profiles['server']['classpath'], recipe['kotlinVersion'])
+    dependencies = [mod_classes, *[item['file'] for item in libraries]]
+    jar, compiler_hash = _compile(freezer, recipe, dependencies, source_name, DIRECTORY, MAIN)
     jar_name = DIRECTORY + '/database-proxy.jar'
     freezer.write(jar_name, jar)
     descriptor = {'version': 1, 'mainClass': MAIN, 'source': source_name, 'sourceSha256': digest(source_bytes),
