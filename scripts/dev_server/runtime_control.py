@@ -58,6 +58,11 @@ class RuntimeControl:
                 self._offline = _OfflineOpen(self)
         return self._offline.open(token, operation_id=operation_id, revision=revision, ready=ready, deadline=deadline)
 
+    def _offline_assign(self, token, *, operation_id, deadline):
+        """正本記録済みWを保持C本人へAssigned登録する。W admissionと完了は後続。"""
+        require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
+        return self._offline.assign(token, operation_id=operation_id, deadline=deadline)
+
     def _offline_prepare(self, token, *, operation_id, request, deadline):
         """保持Cの正本予約から単発WをPREPAREDまで進める。編集・終了は未確定。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")

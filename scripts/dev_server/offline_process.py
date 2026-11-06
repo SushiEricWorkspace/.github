@@ -1,6 +1,7 @@
-"""P専用の固定C/W生成と最初のprivate要求。終了・Registry更新は扱わない。"""
+"""P専用の固定C/W生成と限定private要求。終了・Registry更新は扱わない。"""
 
 from copy import deepcopy
+import json
 import os
 from pathlib import Path
 import uuid
@@ -38,6 +39,8 @@ class OfflineProcess:
         self.record_number = 0
         self.started = self.ready = False
         self.startup_acknowledged = False
+        self.assignment_started = self.assignment_ready = self.assignment_acknowledged = False
+        self.assignment_request = self.assignment_response = None
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
 
@@ -64,6 +67,57 @@ class OfflineProcess:
             require(c.process.group != self.process.group and c.process.pid != self.process.pid
                     and c.process.pid not in self.process.members() and self.process.pid not in c.process.members(),
                     'PROCESS_MISMATCH', 'C/Wは独立groupで所有する必要があります')
+
+    def assign(self, worker, deadline, verify):
+        """記録済みPREPAREDの元Wを、同Cの初回Assignedへ一度だけ登録する。
+
+        verifyはPの正本assignment意図を再照合する。本文/本人/元Idleは保持Wから取得し、
+        任意frameを受け付けない。応答は編集成功ではなく、失敗後も再送しない。
+        """
+        require(self.controller is None and worker.controller is self and self.startup_acknowledged
+                and worker.startup_acknowledged and not self.assignment_started,
+                'WRITER_PENDING', '記録済みの元C/Wだけを一度登録します')
+        self.assignment_started = True
+
+        def checked():
+            verify()
+            worker.verify()
+
+        checked()
+        prepared = json.loads(worker.request)
+        frame = dict(command='assign', operationId=prepared['operationId'], requestHash=prepared['requestHash'],
+                     sessionId=self.session, nonce=self.nonce, openOperationId=json.loads(self.request)['operationId'],
+                     expectedStateSha256=prepared['expectedStateSha256'], expectedRevision=prepared['expectedRevision'],
+                     runUuid=prepared['runUuid'], worker=deepcopy(worker.data_identity), request=prepared['request'])
+        self.assignment_request = canonical(frame)
+        self.pipe.send(frame, deadline, checked)
+        response = self.pipe.receive(deadline, checked)
+        self.assignment_response = canonical(response)
+        require(response.keys() == {'status','operationId','requestHash','sessionId','nonce',
+                                    'stateSha256','stateRevision','runUuid','editRequestSha256'}
+                and response['status'] == 'ASSIGNED'
+                and all(response[k] == frame[k] for k in ('operationId','requestHash','sessionId','nonce','runUuid'))
+                and type(response['stateRevision']) is int and response['stateRevision'] == frame['expectedRevision'] + 1,
+                'API_PROTOCOL', 'ASSIGNEDのprivate bindingと遷移が一致しません')
+        _hash(response['stateSha256'])
+        _hash(response['editRequestSha256'])
+        checked()
+        self.record['assignedResponseSha256'] = digest(self.assignment_response)
+        self._record()
+        self.assignment_ready = True
+        return deepcopy(response)
+
+    def acknowledge_assignment(self, response_sha256, worker, verify):
+        """ASSIGNEDの正本記録後だけC pipeを解放する。W admissionや完了は行わない。"""
+        require(self.assignment_ready and not self.assignment_acknowledged
+                and digest(self.assignment_response) == response_sha256,
+                'STALE_OPERATION', '記録済みASSIGNED応答が一致しません')
+        verify()
+        worker.verify()
+        self.record['assignedAcknowledgedSha256'] = response_sha256
+        self._record()
+        self.pipe.acknowledged()
+        self.assignment_acknowledged = True
 
     def acknowledge_startup(self, response_sha256):
         """呼出元が正本へ記録した起動応答hashを照合し、同pipeのbufferを一度だけ解放する。
