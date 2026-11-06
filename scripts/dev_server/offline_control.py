@@ -1,4 +1,4 @@
-"""停止済み管理runの正本予約とC OPEN/W PREPARED。編集・終了確定は後続。"""
+"""停止済み管理runの正本予約とC OPEN/W PREPARED/Assigned。編集・終了確定は後続。"""
 
 from copy import deepcopy
 import json
@@ -88,6 +88,55 @@ class _OfflineOpen:
                 'STALE_OPERATION', '元Cの起動応答と正本記録が一致しません')
         self._reserved(connection, token, opened['operationId'], opened['requestHash'], saved['binding'])
         return opened, response, saved
+
+    def _prepared(self, connection, token, controller, worker, operation_id):
+        opened, response, saved = self._opened(connection, token, controller)
+        require(worker.controller is controller and controller.startup_acknowledged and worker.startup_acknowledged,
+                'WRITER_PENDING', '元Cと正本記録済みWが必要です')
+        frame = json.loads(worker.request)
+        require(saved.get('worker') == {'operationId':operation_id,'requestSha256':frame['requestHash'],
+                                       'startupResponseSha256':digest(worker.response)}
+                and frame['operationId'] == operation_id
+                and all(frame[k] == opened[k] for k in ('leaseId','epoch','generation','drainSha256',
+                                                       'worldRoot','shopDirectory','worldUuid'))
+                and frame['expectedStateSha256'] == response['stateSha256']
+                and frame['expectedRevision'] == response['stateRevision'] and frame['runUuid'] == response['runUuid'],
+                'STALE_OPERATION', '元PREPAREDとCのIdle/管理bindingが一致しません')
+        return opened, saved
+
+    def assign(self, token, *, operation_id, deadline):
+        """保持WのPREPARED原文を正本照合しC本人へ登録する。本文差替・再登録は行わない。"""
+        fields(token, TOKEN)
+        _canonical_uuid(operation_id)
+        token = deepcopy(token)
+        controller, worker = self.controllers.get(token['instanceId']), self.workers.get(token['instanceId'])
+        require(controller is not None and worker is not None, 'WRITER_PENDING', '保持した元C/Wが必要です')
+        assignment = {'operationId':operation_id}
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, saved = self._prepared(connection, token, controller, worker, operation_id)
+                require('assignment' not in saved, 'WRITER_PENDING', '元assignment意図と結果を保全します')
+                saved['assignment'] = assignment
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(saved),opened['operationId']))
+
+            def verify():
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    _, current = self._prepared(connection, token, controller, worker, operation_id)
+                    require(current.get('assignment') == assignment, 'STALE_OPERATION', '元assignment意図が変更されました')
+
+            response = controller.assign(worker, deadline, verify)
+            verify()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                _, current = self._prepared(connection, token, controller, worker, operation_id)
+                require(current.get('assignment') == assignment, 'STALE_OPERATION', '元assignment意図が変更されました')
+                recorded = dict(assignment, responseSha256=digest(canonical(response)))
+                current['assignment'] = recorded
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(current),opened['operationId']))
+            assignment = recorded
+            controller.acknowledge_assignment(assignment['responseSha256'], worker, verify)
+            return response
 
     def prepare(self, token, *, operation_id, request, deadline):
         """元OPENを正本照合して独立Wを一度生成する。PREPAREDはDB作用・完了を表さない。
