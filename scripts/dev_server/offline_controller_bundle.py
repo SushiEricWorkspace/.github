@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import zipfile
 
 from .build_inputs import canonical, digest, regular_bytes
 from .database_adapter import DESCRIPTOR as HOST_DESCRIPTOR, verify_host_adapter
@@ -75,3 +76,12 @@ def offline_controller_command(root):
              'controller作成OS/アーキテクチャが異なります')
     java = root / 'jdk/bin' / ('java.exe' if os.name == 'nt' else 'java')
     return [str(java), '-Xmx256m', '-cp', _classpath(root, value['classpath']), MAIN]
+
+
+def offline_worker_command(root):
+    """P専用の別Wプロセス用固定entrypoint。Cとの別OwnedProcess所有は呼出元が行う。"""
+    arguments = offline_controller_command(root)
+    main = MAIN + '$Worker'
+    with zipfile.ZipFile(root / DIRECTORY / 'offline-controller.jar') as archive:
+        _require(main.replace('.', '/') + '.class' in archive.namelist(), '固定helperにworkerがありません')
+    return [*arguments[:-1], main]

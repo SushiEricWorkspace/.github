@@ -9,7 +9,7 @@ from .build_inputs import canonical
 from .contracts import ContractError
 from .offline_controller_bundle import (MAIN, SOURCE, DESCRIPTOR, DIRECTORY,
                                         freeze_offline_controller, verify_offline_controller,
-                                        offline_controller_command)
+                                        offline_controller_command, offline_worker_command)
 from .runtime_bundle import Freezer, verify_bundle
 from . import test_database_proxy_bundle as fixtures
 
@@ -26,7 +26,7 @@ class OfflineControllerBundleTests(unittest.TestCase):
         self.lock = {'sources': [{'root': str(source_root), 'record': {'repo': '.github'},
                                  'inputs': [{'path': SOURCE}]}]}
 
-    def compile(self, *, exit_code=0, extra=False):
+    def compile(self, *, exit_code=0, extra=False, worker=False):
         def popen(command, *, cwd, stdout, stderr):
             args = [json.loads(line) for line in Path(command[2][1:]).read_text(encoding='utf-8').splitlines()]
             self.assertEqual('--release', args[0])
@@ -37,6 +37,9 @@ class OfflineControllerBundleTests(unittest.TestCase):
             name = MAIN.replace('.', '/') + '.class'
             (target / name).parent.mkdir(parents=True)
             (target / name).write_bytes(b'\xca\xfe\xba\xbe\0\0\0A' + b'synthetic C')
+            if worker:
+                worker_name = MAIN.replace('.', '/') + '$Worker.class'
+                (target / worker_name).write_bytes(b'\xca\xfe\xba\xbe\0\0\0A' + b'synthetic W')
             if extra:
                 (target / 'Worker.class').write_bytes(b'\xca\xfe\xba\xbe\0\0\0A')
             class Process:
@@ -58,6 +61,18 @@ class OfflineControllerBundleTests(unittest.TestCase):
                                               for p in command[command.index('-cp') + 1].split(os.pathsep)])
         self.assertTrue({DESCRIPTOR, value['source'], value['jar']} <=
                         {entry['path'] for entry in verify_bundle(self.bundle)['files']})
+
+    def test_worker_command_uses_fixed_nested_entrypoint_without_request_arguments(self):
+        self.compile(worker=True)
+        controller = offline_controller_command(self.bundle)
+        worker = offline_worker_command(self.bundle)
+        self.assertEqual([*controller[:-1], MAIN + '$Worker'], worker)
+
+    def test_old_controller_verifies_but_worker_entrypoint_is_unavailable(self):
+        self.compile()
+        offline_controller_command(self.bundle)
+        with self.assertRaises(ContractError):
+            offline_worker_command(self.bundle)
 
     def test_freeze_does_not_need_completed_runtime_manifest(self):
         manifest = self.bundle / 'runtime.json'

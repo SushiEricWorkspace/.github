@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1スライスと第2スライス先行部分（CのAssigned登録）。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）と第3スライス先行部分（Wのprivate入口）。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -14,7 +14,7 @@ Cは自分のData121 `openManagedOfflineWriter`／writer `assignWorker`／writer
 
 このmainはprivate inherited stdin/stdout専用です。ネットワークendpoint・任意SQL・Host許可flag・root常駐daemonを追加しません。Pは同じinstance/world境界でstart排他を取得し、元M/全childの終了、最新game sealと既存receipt、他writer受付遮断・accepted drainを確認した後にだけCを起動します。PがCの固定artifact・実PID/start/host/bootを観測し、C専用OwnedProcessと私設pipeを所有する必要があります。
 
-PによるC/Wの独立OwnedProcess生成・認証済private IPCの接続は後続スライスです。Cのopenに渡すdrain hashはPの照合値であり、CがRegistry台帳の完全性を証明するものではありません。C側でもPの完全native identityの生存、実parent PID、C本人を照合します。起動引数は受け付けず、root・秘密・本文をcommand lineへ載せません。
+PによるC/Wの独立OwnedProcess生成・認証済private IPCの実接続は後続スライスです。Cのopenに渡すdrain hashはPの照合値であり、CがRegistry台帳の完全性を証明するものではありません。C側でもPの完全native identityの生存、実parent PID、C本人を照合します。起動引数は受け付けず、root・秘密・本文をcommand lineへ載せません。
 
 ## 私設frame version 1
 
@@ -42,7 +42,7 @@ closeは`command=close, operationId, requestHash, sessionId, nonce, openOperatio
 
 ## Assigned登録（第2スライス先行部分）
 
-`assign`はCが開いた同じownerの初回`OfflineIdle`からだけ受け付けます。PはDB未openで待機するWを固定bundleから独立Job/groupとして所有し、私設IPCの認証と実PID/start/host/bootの観測を完了してから送る必要があります。この起動・認証連携とW自体は未実装です。C側の生存照合だけでWのOwnedProcess所属を証明したとは扱いません。
+`assign`はCが開いた同じownerの初回`OfflineIdle`からだけ受け付けます。PはDB未openで待機するWを固定bundleから独立Job/groupとして所有し、私設IPCの認証と実PID/start/host/bootの観測を完了してから送る必要があります。この起動・認証連携は未実装です。Wのprivate入口とData連携は後述の第3スライスで追加しています。C側の生存照合だけでWのOwnedProcess所属を証明したとは扱いません。
 
 | field | 内容 |
 |---|---|
@@ -58,7 +58,7 @@ root・generation・leaseはopen時のbindingから引き継ぎ、assignでの�
 
 `ASSIGNED`は従来status応答と同じ`operationId, requestHash, sessionId, nonce, stateSha256, stateRevision, runUuid`、およびDataが公開した`OfflineAssigned.requestSha256`を`editRequestSha256`として返します。IPCの`requestHash`と、期限を除外し順序を正規化するDataの商品操作hashを混同しないでください。writerのsession/runUuidは維持し、revision/hashだけが次へ進みます。
 
-一度登録するとこの入口では再登録・worker差替・recoverできません。Assignedのままcloseを要求してもDataが拒否し、ownerを解放しません。Wのadmission・Edit・候補公開・実終了・C completeは後続のため、この先行部分だけではAssignedを完了できません。製品のwriter受付からの呼出元は追加しておらず、通常利用へ公開しません。
+一度登録するとこの入口では再登録・worker差替・recoverできません。Assignedのままcloseを要求してもDataが拒否し、ownerを解放しません。Wのadmission・Edit・候補公開は限定入口として追加していますが、P接続・実終了・C completeは後続のため、現時点のhelperだけではAssignedを完了できません。製品のwriter受付からの呼出元は追加しておらず、通常利用へ公開しません。
 
 ## 失敗時
 
@@ -71,3 +71,21 @@ owner取得を試みる前の拒否だけを`REJECTED`とします。Data取得�
 Python3.12の合成bundle fixtureで収録・改変・外部classpath・欠落を確認します。`SUSHIERIC_OFFLINE_TEST_BUNDLE`に固定Data121 bundleを明示すると、同bundleのJDK21/Host依存でJava compileと非native protocol vectorsを実行します。fake Data/本人APIによるopen/assign/close/EOF/UNKNOWN試験はDBや実worldを作りません。固定Data artifactへのcompile試験とfakeによる状態機械試験を分けて評価してください。
 
 実owner取得、実root、両OSの本人・Job/group・私設pipe、実bundleビルド、Mod/Manager結合、#54のDB snapshotは別途受入が必要です。
+
+
+## 単発worker W（第3スライス先行部分）
+
+`offline_worker_command(bundle)`は同じ固定helperのnested main `OfflineControllerMain$Worker`を返します。Cのmainへ引数を渡してWを同じプロセス内で実行する経路はありません。C/Wは同じJARでもPが各々独立のOwnedProcess Job/groupで所有する必要があり、このP接続は後続です。旧helperにWorker classがない場合はworker commandだけを拒否し、従来のC commandの検証は維持します。
+
+実entrypointのSystem.outはPrintStreamのため、共有frame出力はflush後にcheckErrorも照合し、下位のIOExceptionがPrintStream内で抑止された場合も非正常終了へ進めます。C close後・W候補公開後のPrintStream出力切断をfixtureで検証しています。
+
+Wはprivate inherited stdin/stdoutで2フレームだけを受け取ります。サイズ・UTF-8・余分field・部分frameの規則はCと同じです。Pは認証済private pipeの唯一の相手であること、DB未openで待機する固定Wのartifact/実PID/start/host/bootを先に確認してください。今回のnative生存照合だけでこの認証・所属を証明したとは扱いません。
+
+1. `prepare`: `command, operationId, requestHash, sessionId, nonce, leaseId, epoch, generation, controller, owner, worker, drainSha256, worldRoot, shopDirectory, worldUuid, runUuid, expectedStateSha256, expectedRevision, request`のみ。controller=P、owner=C、worker=Wの完全identityです。operationIdは元Editの標準小文字UUID、requestHashはIPC要求hashです。元CのIdleのhash/revision/runUuid・writer/managementと、型付き119 Editのworld/requestIdを照合します。P実parentとP/C/W本人の生存確認後にPREPAREDを返します。ここではadmissionもDBも開きません。
+2. PがCの既存assignへ同じW/要求を渡し、CのASSIGNED応答を照合してから、`admit`を送ります。admitは`command, operationId, requestHash, sessionId, nonce, preparedStateSha256, expectedStateSha256, expectedRevision, runUuid, editRequestSha256`のみ。preparedStateSha256は元Idle、期待stateはCが公開した初回Assigned、editRequestSha256はDataの商品操作hashです。request本文の差替fieldは受け付けません。
+3. Wは同じwriter・元Idleへのprevious state・W本人/op/Data hash・非recoverを照合し、元prepareの型付き要求を変更せず`beginOfflineEdit`と、本人が開いたDBの`shopDefinitions(...).execute`へ渡します。Dataの各作用gateがP/C生存と同じworld/run/revision/要求を再照合します。Wは全自分の接続close後、既知responseだけを`operation.finish`へ渡します。Dataのowner/seal/state/hash/receipt算法はhelperへ再実装しません。
+4. CANDIDATEは`status, operationId, requestHash, sessionId, nonce, stateSha256, receiptSha256, worldUuid, runUuid, stateRevision, editRequestSha256`を返します。DataではAssigned時点のrunUuidがwriter session、Pending以降は操作UUIDへ変わります。最終SUCCESSやRegistry CLOSEDではありません。Wは最終ACKを読まず終了し、PがW/全child実終了を観測しCが同候補をcompleteするまでManagerへ完了を返してはいけません。
+
+prepare/admitでのREJECTEDはWのadmission未試行を表すだけで、C ownerをcloseしません。admission試行後の例外・Edit UNKNOWN・DBclose失敗・候補公開後の例外/応答喪失はUNKNOWNまたは返答不能の非正常終了として元stateを保全します。再admission・Edit再送・finish再試行・C差替・自動recoverは行いません。EOF・CANDIDATE・Wの終了予定だけで実終了を推測しません。
+
+今回の固定Data compile/非native fakeは、Idle→Assigned→Pending→SavedPendingExitと非空要求の透過性、作用前拒否・公開後失敗を検証します。実DB/実root/両OSの本人・IPC・Job/group・実bundleビルドの受入ではありません。Pの受付遮断/drain・起動認証/所有、実終了→C complete、Registry CLOSED/start gateは後続です。

@@ -1,10 +1,16 @@
 package io.github.sushiericworkspace.sushiericdatamodel.database.run;
 
 import java.nio.file.Path;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterRequest;
 import java.util.UUID;
 
 /** DBもrun-stateも作らない、作用境界と失敗注入だけのfixture。 */
 public final class WorldRunLifecycle {
+    public static int begins, dbOpens, edits, dbCloses, finishes;
+    public static boolean dbOpen, failBeginAfterPublish, unknownEdit, rejectedEdit, failDbClose, failFinishAfterPublish;
+    public static boolean killParentAfterEdit, killControllerAfterEdit;
+    public static HostAdapterRequest expectedRequest, lastBeginRequest, lastEditRequest;
+    public static Path observedShop;
     public static int opens;
     public static int closes;
     public static int assigns;
@@ -18,6 +24,27 @@ public final class WorldRunLifecycle {
     public static final String RUN = "00000000-0000-4000-8000-000000000002";
     public WorldRunLifecycle(Path world, Path shop, UUID uuid, int timeout) {}
     public WorldRunStatus readStatus() { return current; }
+    public WorldOfflineOperation beginOfflineEdit(WorldRunStatus expected, HostAdapterRequest request) {
+        if (expected != current || !(expected.getState().getPayload() instanceof WorldRunPhase.OfflineAssigned phase)
+                || !phase.getWorker().equals(WorldProcessIdentities.INSTANCE.current()) || !request.equals(expectedRequest))
+            throw new IllegalStateException("fixture admission binding不一致");
+        checkWorkerActors();
+        lastBeginRequest=request;
+        begins++;
+        current=advance("f",request.getRequestId(),new WorldRunPhase.OfflinePending(phase.getWriter(),phase.getWorker(),
+                phase.getOperationId(),phase.getRequestSha256(),phase.getPreviousSealSha256(),null));
+        if (failBeginAfterPublish) throw new IllegalStateException("fixture Pending公開後失敗");
+        return new WorldOfflineOperation(current);
+    }
+    public static void checkWorkerActors() {
+        WorldProcessIdentities.INSTANCE.requireAlive(binding.getManagement().getController());
+        WorldProcessIdentities.INSTANCE.requireAlive(binding.getOwner());
+    }
+    public static WorldRunStatus advance(String hash, String run, WorldRunPhase phase) {
+        WorldRunState before=current.getState();
+        return new WorldRunStatus(hash.repeat(64),new WorldRunState(1,before.getWorldUuid(),before.getGeneration(),run,
+                before.getStateRevision()+1,before.getPaths(),before.getOriginSha256(),current.getSha256(),phase));
+    }
     public WorldOfflineWriterSession openManagedOfflineWriter(WorldRunStatus status, WorldOfflineOwnerBinding binding) {
         opens++;
         if (failOpen) throw new IllegalStateException("fixture 公開後応答喪失");
