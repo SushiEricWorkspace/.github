@@ -9,6 +9,8 @@ public final class WorldProcessIdentities {
     public static boolean failAfterOpen;
     public static int parentChecks;
     public static final long WORKER = 9_999_999;
+    public static final long CONTROLLER = 9_999_998;
+    public static boolean controllerAlive = true;
     public WorldProcessIdentity current() {
         WorldProcessIdentity current = identity(ProcessHandle.current().pid());
         return selfMatches ? current : identity(current.getPid() + 1);
@@ -19,6 +21,8 @@ public final class WorldProcessIdentities {
             parentChecks++;
             if (!parentAlive || !actual.equals(identity) || (failAfterOpen && parentChecks>2))
                 throw new IllegalStateException("fixture P本人不一致");
+        } else if (identity.getPid() == CONTROLLER) {
+            if (!controllerAlive || !identity(CONTROLLER).equals(identity)) throw new IllegalStateException("fixture C本人不一致");
         } else if (!workerAlive || !identity(WORKER).equals(identity)) {
             throw new IllegalStateException("fixture W本人不一致");
         }

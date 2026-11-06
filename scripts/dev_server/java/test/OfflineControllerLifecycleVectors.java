@@ -180,7 +180,7 @@ public final class OfflineControllerLifecycleVectors {
         ByteArrayOutputStream onlyOpen=new ByteArrayOutputStream();
         boolean closeResponseLost=false;
         try {
-            new OfflineControllerMain(new ByteArrayInputStream(bytes(open(),close())), new OutputStream() {
+            new OfflineControllerMain(new ByteArrayInputStream(bytes(open(),close())), new PrintStream(new OutputStream() {
                 private int header;
                 private int headerBytes;
                 private int bodyBytes=-1;
@@ -195,7 +195,7 @@ public final class OfflineControllerLifecycleVectors {
                 public void write(byte[] value,int offset,int length) throws IOException {
                     for(int i=offset;i<offset+length;i++) write(value[i]&255);
                 }
-            }).run();
+            },true,StandardCharsets.UTF_8)).run();
         } catch(IOException expected) { closeResponseLost=true; }
         check(closeResponseLost);
         check(WorldRunLifecycle.opens==1);
