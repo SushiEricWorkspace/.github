@@ -1,6 +1,9 @@
 package io.github.sushiericworkspace.devserver;
 
 import io.github.sushiericworkspace.sushiericdatamodel.database.run.*;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterAction;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterCodec;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterRequest;
 import kotlinx.serialization.json.*;
 import java.io.*;
 import java.nio.ByteBuffer;
@@ -56,6 +59,7 @@ public final class OfflineControllerMain {
                 String command = string(frame, "command");
                 JsonObject response;
                 if (command.equals("open")) response = open(frame, id, hash);
+                else if (command.equals("assign")) response = assign(frame, id, hash);
                 else if (command.equals("close")) response = close(frame, id, hash);
                 else throw new IllegalArgumentException("未知のcontroller操作です");
                 write(response);
@@ -96,6 +100,37 @@ public final class OfflineControllerMain {
         effect = true;
         writer = lifecycle.openManagedOfflineWriter(expected, new WorldOfflineOwnerBinding(self, management));
         return status("OPEN", id, hash, writer.getStatus());
+    }
+
+    private JsonObject assign(JsonObject frame, String id, String hash) {
+        require(writer != null);
+        WorldRunStatus expected = writer.getStatus();
+        require(expected.getState().getPayload() instanceof WorldRunPhase.OfflineIdle);
+        fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "openOperationId",
+                "expectedStateSha256", "expectedRevision", "runUuid", "worker", "request");
+        uuid(id);
+        require(!id.equals(openId) && session.equals(string(frame, "sessionId")) &&
+                nonce.equals(string(frame, "nonce")) && openId.equals(string(frame, "openOperationId")) &&
+                expected.getSha256().equals(string(frame, "expectedStateSha256")) &&
+                expected.getState().getStateRevision() == number(frame, "expectedRevision") &&
+                expected.getState().getRunUuid().equals(string(frame, "runUuid")));
+        HostAdapterRequest request = HostAdapterCodec.INSTANCE.decodeRequest(
+                object(frame, "request").toString().getBytes(StandardCharsets.UTF_8));
+        require(request.getRequestId().equals(id) &&
+                request.getWorldUuid().equals(expected.getState().getWorldUuid()) &&
+                request.getAction() instanceof HostAdapterAction.Edit);
+        Long deadline = request.getDeadlineEpochMillis();
+        require(deadline == null || System.currentTimeMillis() < deadline);
+        WorldProcessIdentity worker = identity(object(frame, "worker"));
+        require(worker.getPid() != self.getPid() && worker.getPid() != parent.getPid());
+        require(worker.getHostHash().equals(self.getHostHash()) && worker.getBootId().equals(self.getBootId()));
+        checkActors();
+        WorldProcessIdentities.INSTANCE.requireAlive(worker);
+        WorldRunStatus assigned = writer.assignWorker(worker, request, expected);
+        WorldRunPhase.OfflineAssigned phase = (WorldRunPhase.OfflineAssigned) assigned.getState().getPayload();
+        Map<String, JsonElement> response = new LinkedHashMap<>(status("ASSIGNED", id, hash, assigned));
+        response.put("editRequestSha256", JsonElementKt.JsonPrimitive(phase.getRequestSha256()));
+        return new JsonObject(response);
     }
 
     private JsonObject close(JsonObject frame, String id, String hash) {
