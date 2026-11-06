@@ -106,6 +106,24 @@ def process_identity(native, adapter, pid):
     return value
 
 
+def _closed_writers(connection, instance, run):
+    """同runの全writerについて、耐久closeと実proxy/child退出証拠を列挙する。"""
+    values = connection.execute("SELECT * FROM writer_sessions WHERE instance=? AND run=?", (instance, run)).fetchall()
+    writers = []
+    for value in values:
+        require(value["status"] == "CLOSED" and not value["pending"], "WRITER_PENDING", "未終了writerが残っています")
+        require(not connection.execute("SELECT 1 FROM writer_operations WHERE session=? AND status!='COMPLETED'", (value["id"],)).fetchone(),
+                "WRITER_PENDING", "元writer要求が未完了です")
+        closes = connection.execute("SELECT response FROM writer_operations WHERE session=? AND command='writer-close' AND status='COMPLETED'", (value["id"],)).fetchall()
+        require(len(closes) == 1, "PROOF_REQUIRED", "writer終了の耐久記録が一意ではありません")
+        closed = json.loads(closes[0][0])
+        require(closed.get("proxyExited") is True and closed.get("proxyChildrenExited") is True
+                and type(closed.get("proxyIdentity")) is dict, "PROOF_REQUIRED", "proxy/childの実exit証拠がありません")
+        wire._identity(closed["proxyIdentity"])
+        writers.append({"identity": closed["proxyIdentity"], "state": "CLOSED", "children": []})
+    return writers
+
+
 class ManagedRuntime:
     """inventory各枠に受信threadを一つ保持し、managed-stopとは別に進行する。"""
     def __init__(self, runtime, approvals, *, transport=None):
@@ -386,17 +404,5 @@ class ManagedRuntime:
                 "WRITER_PENDING", "同runの閉門・全writer/child終了が未確認です")
         require(not connection.execute("SELECT 1 FROM reservations WHERE instance=? AND reference LIKE 'writer-call:%'", (instance,)).fetchone(),
                 "WRITER_PENDING", "writer callが残っています")
-        values = connection.execute("SELECT * FROM writer_sessions WHERE instance=? AND run=?", (instance, session["run"])).fetchall()
-        writers = []
-        for value in values:
-            require(value["status"] == "CLOSED" and not value["pending"], "WRITER_PENDING", "未終了writerが残っています")
-            require(not connection.execute("SELECT 1 FROM writer_operations WHERE session=? AND status!='COMPLETED'", (value["id"],)).fetchone(),
-                    "WRITER_PENDING", "元writer要求が未完了です")
-            closes = connection.execute("SELECT response FROM writer_operations WHERE session=? AND command='writer-close' AND status='COMPLETED'", (value["id"],)).fetchall()
-            require(len(closes) == 1, "PROOF_REQUIRED", "writer終了の耐久記録が一意ではありません")
-            closed = json.loads(closes[0][0])
-            require(closed.get("proxyExited") is True and closed.get("proxyChildrenExited") is True
-                    and type(closed.get("proxyIdentity")) is dict, "PROOF_REQUIRED", "proxy/childの実exit証拠がありません")
-            wire._identity(closed["proxyIdentity"])
-            writers.append({"identity": closed["proxyIdentity"], "state": "CLOSED", "children": []})
+        writers = _closed_writers(connection, instance, session["run"])
         return row, gate, writers

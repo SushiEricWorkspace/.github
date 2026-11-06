@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -100,3 +100,11 @@ C/Wの各groupと実PID/start/host/boot、cwd/executable/command/OS ownerを観�
 生成/送受信/応答照合/記録の失敗は例外とし、再送・別helperへの差替をしない。object/handle/pipe/元要求・応答を保持し、本文・秘密は監督記録に残さない。
 この段階ではPの製品呼出元を接続していない。Assigned/admit/候補照合、全child実終了、C complete/close、Registry CLOSED/start gateは後続であり、OPEN/PREPAREDを編集成功や終了証拠に使わない。
 実Windows/macOS本人受入・実root・実bundle起動は未確認。合成native/pipe fixtureと既存Java非native vectorsの成功を実機受入へ拡張しない。
+
+## Registry正本に束縛するC取得（第5スライス先行部分）
+
+P内部の`RuntimeControl._offline_open`は、同lease/epoch/generationの認証済runが正常保存・M/全child退出を完了し、受付BLOCKED・全writerの耐久close/実proxy退出・未完了要求不在が正本で一致する場合だけCを取得する。
+P内部入口でも既存のresource_useでGC/監督停止と調停する。同instance lock内の短txでgate revision、offline-open PENDING、artifact参照、instances.pendingを予約し、DB外で保持Cを起動する。各I/O前に同予約と元run/descriptor/停止proof/drain snapshot・旧M PID不在を再照合する。
+Data Readyのworld/run/hash/revisionは期待値としてCへ渡し、実state・seal/chainはData本人APIが検査する。Registryの正常停止だけからData Readyを推測せず、任意rootや空verifyを渡す入口は作らない。
+OPEN後も予約/PENDINGを保持する。生成/通信/照合/正本記録の失敗で再取得・別Cへの差替・自動rollbackはしない。元Cと生成資源を保持し、start/lease解放を拒否する。
+この入口はP内部用で、Manager/CLIの停止中writer受付は未公開。W PREPARED以降のAssigned/admit/候補照合、実終了/C complete/close、Registry CLOSEDと予約解放は後続である。合成SQLiteと既存Java/native fakeの検証を実OS/実root受入へ広げない。
