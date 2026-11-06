@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1スライス。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1スライスと第2スライス先行部分（CのAssigned登録）。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -8,13 +8,13 @@
 
 新しいsource-lockでbundleを生成すると、`adapter/offline-controller.json`と`adapter/offline-controller/`を収録します。旧bundleの検証は維持しますが、helperのない旧bundleからこの入口を呼べません。既存bundleへ後付けせず、新bundleを生成してください。DB・run-stateの保存形式変更はありません。
 
-Cは自分のData121 `openManagedOfflineWriter`／writer `close`だけを呼びます。ゲームのbeginRun/observeExit、WへのAssigned登録、119 Edit、receiptのcomplete、snapshot操作は受け付けません。元sealと不変chain・Ready・DBcloseの照合はData121へ委ねます。
+Cは自分のData121 `openManagedOfflineWriter`／writer `assignWorker`／writer `close`だけを呼びます。ゲームのbeginRun/observeExit、119 Editの実行、receiptのcomplete、snapshot操作は受け付けません。元sealと不変chain・Ready・DBcloseの照合はData121へ委ねます。
 
 ## P側の前提
 
 このmainはprivate inherited stdin/stdout専用です。ネットワークendpoint・任意SQL・Host許可flag・root常駐daemonを追加しません。Pは同じinstance/world境界でstart排他を取得し、元M/全childの終了、最新game sealと既存receipt、他writer受付遮断・accepted drainを確認した後にだけCを起動します。PがCの固定artifact・実PID/start/host/bootを観測し、C専用OwnedProcessと私設pipeを所有する必要があります。
 
-このP連携は後続スライスです。Cのopenに渡すdrain hashはPの照合値であり、CがRegistry台帳の完全性を証明するものではありません。C側でもPの完全native identityの生存、実parent PID、C本人を照合します。起動引数は受け付けず、root・秘密・本文をcommand lineへ載せません。
+PによるC/Wの独立OwnedProcess生成・認証済private IPCの接続は後続スライスです。Cのopenに渡すdrain hashはPの照合値であり、CがRegistry台帳の完全性を証明するものではありません。C側でもPの完全native identityの生存、実parent PID、C本人を照合します。起動引数は受け付けず、root・秘密・本文をcommand lineへ載せません。
 
 ## 私設frame version 1
 
@@ -40,14 +40,34 @@ closeは`command=close, operationId, requestHash, sessionId, nonce, openOperatio
 
 `OWNER_CLOSED`はDB側のowner終了だけを表します。PがC/全childの実exitを観測し、Registry writer CLOSEDを確定するまでMod startを許可してはいけません。Data ReadyだけでCLOSEDを推測しません。
 
+## Assigned登録（第2スライス先行部分）
+
+`assign`はCが開いた同じownerの初回`OfflineIdle`からだけ受け付けます。PはDB未openで待機するWを固定bundleから独立Job/groupとして所有し、私設IPCの認証と実PID/start/host/bootの観測を完了してから送る必要があります。この起動・認証連携とW自体は未実装です。C側の生存照合だけでWのOwnedProcess所属を証明したとは扱いません。
+
+| field | 内容 |
+|---|---|
+| command | `assign` |
+| operationId | 119 EditのrequestIdと同じ標準小文字UUID。open IDとは別 |
+| requestHash | PのIPC要求を識別するSHA-256。従来open/closeと同様に正本照合はPの責務 |
+| sessionId / nonce / openOperationId | 元openと完全一致するbinding |
+| expectedStateSha256 / expectedRevision / runUuid | 直前OPENのData state。現在値へ自動追従しない |
+| worker | Pが観測したWの完全`hostHash, bootId, pid, startId` |
+| request | Data121 `HostAdapterCodec`形式のJSON object。元worldUuid・operationIdと同じrequestId、`HostAdapterAction.Edit`だけ |
+
+root・generation・leaseはopen時のbindingから引き継ぎ、assignでの上書きを受け付けません。余分field、期限切れ要求、別world・別操作、P/Cと同じPID、別host/boot、生存不明のWをData登録前に拒否します。要求codecと商品操作hashはData実装をそのまま使用します。
+
+`ASSIGNED`は従来status応答と同じ`operationId, requestHash, sessionId, nonce, stateSha256, stateRevision, runUuid`、およびDataが公開した`OfflineAssigned.requestSha256`を`editRequestSha256`として返します。IPCの`requestHash`と、期限を除外し順序を正規化するDataの商品操作hashを混同しないでください。writerのsession/runUuidは維持し、revision/hashだけが次へ進みます。
+
+一度登録するとこの入口では再登録・worker差替・recoverできません。Assignedのままcloseを要求してもDataが拒否し、ownerを解放しません。Wのadmission・Edit・候補公開・実終了・C completeは後続のため、この先行部分だけではAssignedを完了できません。製品のwriter受付からの呼出元は追加しておらず、通常利用へ公開しません。
+
 ## 失敗時
 
-owner取得を試みる前の拒否だけを`REJECTED`とします。Data取得開始後は公開済みの可能性を含め`UNKNOWN`と非正常exitで保全します。取得後の不正close・二重open、close後の応答喪失、EOFで自動close・rollback・再取得しません。UNKNOWNには元ID・本文・processとstate証拠を保持します。新Cで本人APIを代行しません。
+owner取得を試みる前の拒否だけを`REJECTED`とします。Data取得開始後は公開済みの可能性を含め`UNKNOWN`と非正常exitで保全します。取得後の不正assign/close・二重open、Assigned公開後の例外・応答喪失、close後の応答喪失、EOFで自動close・rollback・再登録・再取得しません。UNKNOWNには元ID・本文・processとstate証拠を保持します。新Cで本人APIを代行しません。
 
 同要求と不変終了証拠を照合する正規recover、C/Wの実終了とRegistry CLOSED、start gateは後続スライスです。今回のhelperだけで停止中編集や復旧を完了扱いにしません。
 
 ## 検証
 
-Python3.12の合成bundle fixtureで収録・改変・外部classpath・欠落を確認します。`SUSHIERIC_OFFLINE_TEST_BUNDLE`に固定Data121 bundleを明示すると、同bundleのJDK21/Host依存でJava compileと非native protocol vectorsを実行します。fake Data/本人APIによるopen/close/EOF/UNKNOWN試験はDBや実worldを作りません。固定Data artifactへのcompile試験とfakeによる状態機械試験を分けて評価してください。
+Python3.12の合成bundle fixtureで収録・改変・外部classpath・欠落を確認します。`SUSHIERIC_OFFLINE_TEST_BUNDLE`に固定Data121 bundleを明示すると、同bundleのJDK21/Host依存でJava compileと非native protocol vectorsを実行します。fake Data/本人APIによるopen/assign/close/EOF/UNKNOWN試験はDBや実worldを作りません。固定Data artifactへのcompile試験とfakeによる状態機械試験を分けて評価してください。
 
 実owner取得、実root、両OSの本人・Job/group・私設pipe、実bundleビルド、Mod/Manager結合、#54のDB snapshotは別途受入が必要です。

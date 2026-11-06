@@ -7,6 +7,9 @@ import java.util.UUID;
 public final class WorldRunLifecycle {
     public static int opens;
     public static int closes;
+    public static int assigns;
+    public static boolean failAssignAfterPublish;
+    public static WorldOfflineOwnerBinding binding;
     public static boolean failOpen;
     public static boolean failClose;
     public static boolean failCloseAfterPublish;
@@ -18,6 +21,7 @@ public final class WorldRunLifecycle {
     public WorldOfflineWriterSession openManagedOfflineWriter(WorldRunStatus status, WorldOfflineOwnerBinding binding) {
         opens++;
         if (failOpen) throw new IllegalStateException("fixture 公開後応答喪失");
+        WorldRunLifecycle.binding = binding;
         current = idle(1);
         return new WorldOfflineWriterSession();
     }
@@ -33,11 +37,19 @@ public final class WorldRunLifecycle {
                 new WorldRunPaths("fixture", "fixture-db", "fixture-shop"), "a".repeat(64), null,
                 new WorldRunPhase.Ready(value, value)));
     }
+    public static WorldRunStatus assigned(WorldProcessIdentity worker, String operationId, String requestHash) {
+        WorldRunState idle = current.getState();
+        WorldOfflineWriter writer = ((WorldRunPhase.OfflineIdle)idle.getPayload()).getWriter();
+        return new WorldRunStatus("d".repeat(64), new WorldRunState(1, ID, ID, RUN,
+                idle.getStateRevision()+1, idle.getPaths(), idle.getOriginSha256(), current.getSha256(),
+                new WorldRunPhase.OfflineAssigned(writer, worker, operationId, requestHash, "a".repeat(64), null)));
+    }
+
     public static WorldRunStatus idle(long revision) {
         return new WorldRunStatus("b".repeat(64), new WorldRunState(1, ID, ID, RUN, revision,
                 new WorldRunPaths("fixture", "fixture-db", "fixture-shop"), "a".repeat(64), "a".repeat(64),
-                new WorldRunPhase.OfflineIdle(new WorldOfflineWriter("offline-session",
-                        WorldProcessIdentities.identity(ProcessHandle.current().pid()), null),
+                new WorldRunPhase.OfflineIdle(new WorldOfflineWriter(RUN,
+                        binding.getOwner(), binding.getManagement()),
                         "a".repeat(64), "b".repeat(64))));
     }
 }

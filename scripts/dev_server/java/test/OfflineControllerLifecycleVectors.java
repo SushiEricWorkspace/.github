@@ -1,6 +1,8 @@
 package io.github.sushiericworkspace.devserver;
 
 import io.github.sushiericworkspace.sushiericdatamodel.database.run.*;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterCodec;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterRequest;
 import kotlinx.serialization.json.*;
 import java.io.*;
 import java.nio.file.Path;
@@ -40,8 +42,31 @@ public final class OfflineControllerLifecycleVectors {
                 "\",\"sessionId\":\"sessionid\",\"nonce\":\"nonce\",\"openOperationId\":\"operationid\","+
                 "\"expectedStateSha256\":\""+"b".repeat(64)+"\",\"expectedRevision\":1}");
     }
+    private static JsonObject assign() {
+        Map<String,JsonElement> frame = new LinkedHashMap<>(close());
+        frame.put("command",JsonElementKt.JsonPrimitive("assign"));
+        frame.put("operationId",JsonElementKt.JsonPrimitive(WorldRunLifecycle.ID));
+        frame.put("runUuid",JsonElementKt.JsonPrimitive(WorldRunLifecycle.RUN));
+        frame.put("worker",identity(WorldProcessIdentities.WORKER));
+        frame.put("request",Json.Default.parseToJsonElement("{\"requestId\":\""+WorldRunLifecycle.ID+
+                "\",\"worldUuid\":\""+WorldRunLifecycle.ID+"\",\"action\":{\"type\":\""+
+                "io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterAction.Edit\",\"products\":[]}}"));
+        return new JsonObject(frame);
+    }
+
+    private static JsonObject changed(JsonObject value, String field, JsonElement replacement) {
+        Map<String,JsonElement> result = new LinkedHashMap<>(value);
+        result.put(field,replacement);
+        return new JsonObject(result);
+    }
+
     private static void reset() {
-        WorldRunLifecycle.opens=0; WorldRunLifecycle.closes=0;
+        WorldRunLifecycle.opens=0; WorldRunLifecycle.closes=0; WorldRunLifecycle.assigns=0;
+        WorldRunLifecycle.failAssignAfterPublish=false;
+        WorldOfflineWriterSession.lastRequest=null;
+        WorldProcessIdentities.workerAlive=true;
+        WorldProcessIdentities.failAfterOpen=false;
+        WorldProcessIdentities.parentChecks=0;
         WorldRunLifecycle.failOpen=false; WorldRunLifecycle.failClose=false; WorldRunLifecycle.failCloseAfterPublish=false;
         WorldRunLifecycle.current=WorldRunLifecycle.initialReady();
         WorldProcessIdentities.parentAlive=true;
@@ -179,7 +204,133 @@ public final class OfflineControllerLifecycleVectors {
         JsonObject openPacket=OfflineControllerMain.read(openResponse);
         response(openPacket,"OPEN","operationid","a".repeat(64),"b".repeat(64),1,WorldRunLifecycle.RUN);
         check(openResponse.available()==0);
+        assignmentVectors();
         System.out.println("offline-lifecycle-vectors="+count);
+    }
+
+    private static void assignmentVectors() throws Exception {
+        reset();
+        List<JsonObject> assigned=run(true,open(),assign());
+        check(statuses(assigned).equals(List.of("OPEN","ASSIGNED")));
+        response(assigned.get(1),"ASSIGNED",WorldRunLifecycle.ID,"b".repeat(64),"d".repeat(64),2,WorldRunLifecycle.RUN);
+        check(assigned.get(1).get("editRequestSha256").equals(JsonElementKt.JsonPrimitive("e".repeat(64))));
+        WorldRunPhase.OfflineAssigned phase=(WorldRunPhase.OfflineAssigned)WorldRunLifecycle.current.getState().getPayload();
+        check(phase.getWriter().getSessionId().equals(WorldRunLifecycle.RUN));
+        check(phase.getWorker().equals(WorldProcessIdentities.identity(WorldProcessIdentities.WORKER)));
+        check(phase.getOperationId().equals(WorldRunLifecycle.ID));
+        check(WorldRunLifecycle.assigns==1 && WorldRunLifecycle.closes==0 && WorldRunLifecycle.opens==1);
+        reset();
+        JsonObject nonEmpty=assign();
+        JsonObject requestBody=(JsonObject)nonEmpty.get("request");
+        JsonObject product=(JsonObject)Json.Default.parseToJsonElement("{\"type\":\""+
+                "io.github.sushiericworkspace.sushiericdatamodel.database.host.HostProductChange.Save\","+
+                "\"id\":\"fixture/product\",\"expectedHash\":\""+"a".repeat(64)+"\","+
+                "\"definition\":{\"itemInternalId\":\"minecraft:stone\",\"purchasePrice\":123,"+
+                "\"salePrice\":45,\"increaseStockOnSale\":true,\"displayOrder\":2}}");
+        JsonObject action=changed((JsonObject)requestBody.get("action"),"products",new JsonArray(List.of(product)));
+        nonEmpty=changed(nonEmpty,"request",changed(requestBody,"action",action));
+        HostAdapterRequest original=HostAdapterCodec.INSTANCE.decodeRequest(
+                nonEmpty.get("request").toString().getBytes(StandardCharsets.UTF_8));
+        List<JsonObject> forwarded=run(true,open(),nonEmpty);
+        check(statuses(forwarded).equals(List.of("OPEN","ASSIGNED")));
+        check(original.equals(WorldOfflineWriterSession.lastRequest));
+        response(forwarded.get(1),"ASSIGNED",WorldRunLifecycle.ID,"b".repeat(64),"d".repeat(64),2,WorldRunLifecycle.RUN);
+        check(WorldRunLifecycle.assigns==1 && WorldRunLifecycle.closes==0 && WorldRunLifecycle.opens==1);
+        for (String field:List.of("sessionId","nonce","openOperationId","expectedStateSha256","runUuid")) {
+            reset();
+            check(statuses(run(true,open(),changed(assign(),field,JsonElementKt.JsonPrimitive("old"))))
+                    .equals(List.of("OPEN","UNKNOWN")));
+            check(WorldRunLifecycle.assigns==0 && WorldRunLifecycle.closes==0);
+        }
+        reset();
+        check(statuses(run(false,assign())).equals(List.of("REJECTED")));
+        check(WorldRunLifecycle.assigns==0 && WorldRunLifecycle.opens==0);
+        reset();
+        check(statuses(run(true,open(),changed(assign(),"expectedRevision",JsonElementKt.JsonPrimitive(0))))
+                .equals(List.of("OPEN","UNKNOWN")));
+        check(WorldRunLifecycle.assigns==0);
+        for (String field:List.of("hostHash","bootId","startId","pid")) {
+            reset();
+            JsonObject worker=(JsonObject)assign().get("worker");
+            JsonElement other=field.equals("pid")?JsonElementKt.JsonPrimitive(ProcessHandle.current().pid()):
+                    JsonElementKt.JsonPrimitive(field.equals("hostHash")?"c".repeat(64):"old");
+            check(statuses(run(true,open(),changed(assign(),"worker",changed(worker,field,other))))
+                    .equals(List.of("OPEN","UNKNOWN")));
+            check(WorldRunLifecycle.assigns==0);
+        }
+        reset();
+        check(statuses(run(true,open(),changed(assign(),"worker",identity(ProcessHandle.current().parent().orElseThrow().pid()))))
+                .equals(List.of("OPEN","UNKNOWN")));
+        check(WorldRunLifecycle.assigns==0);
+        reset(); WorldProcessIdentities.workerAlive=false;
+        check(statuses(run(true,open(),assign())).equals(List.of("OPEN","UNKNOWN")));
+        check(WorldRunLifecycle.assigns==0);
+        reset();
+        check(statuses(run(true,open(),assign(),assign())).equals(List.of("OPEN","ASSIGNED","UNKNOWN")));
+        check(WorldRunLifecycle.assigns==1 && WorldRunLifecycle.closes==0);
+        reset();
+        JsonObject assignedClose=changed(close(),"expectedStateSha256",JsonElementKt.JsonPrimitive("d".repeat(64)));
+        assignedClose=changed(assignedClose,"expectedRevision",JsonElementKt.JsonPrimitive(2));
+        check(statuses(run(true,open(),assign(),assignedClose)).equals(List.of("OPEN","ASSIGNED","UNKNOWN")));
+        check(WorldRunLifecycle.assigns==1 && WorldRunLifecycle.closes==0);
+        for(String field:assign().keySet()) {
+            reset();
+            Map<String,JsonElement> missing=new LinkedHashMap<>(assign());
+            missing.remove(field);
+            check(statuses(run(true,open(),new JsonObject(missing))).equals(List.of("OPEN","UNKNOWN")));
+            check(WorldRunLifecycle.assigns==0);
+        }
+        reset();
+        check(statuses(run(true,open(),changed(assign(),"sql",JsonElementKt.JsonPrimitive("delete"))))
+                .equals(List.of("OPEN","UNKNOWN")));
+        check(WorldRunLifecycle.assigns==0);
+        for(String field:List.of("requestId","worldUuid","deadlineEpochMillis","action","extra")) {
+            reset();
+            JsonObject request=(JsonObject)assign().get("request");
+            JsonElement other=switch(field) {
+                case "deadlineEpochMillis" -> JsonElementKt.JsonPrimitive(1);
+                case "action" -> Json.Default.parseToJsonElement("{\"type\":\""+
+                        "io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterAction.Products\",\"ids\":[]}");
+                default -> JsonElementKt.JsonPrimitive("00000000-0000-4000-8000-000000000003");
+            };
+            check(statuses(run(true,open(),changed(assign(),"request",changed(request,field,other))))
+                    .equals(List.of("OPEN","UNKNOWN")));
+            check(WorldRunLifecycle.assigns==0);
+        }
+        reset(); WorldProcessIdentities.failAfterOpen=true;
+        check(statuses(run(true,open(),assign())).equals(List.of("OPEN","UNKNOWN")));
+        check(WorldRunLifecycle.assigns==0 && WorldRunLifecycle.opens==1);
+        reset(); WorldRunLifecycle.failAssignAfterPublish=true;
+        check(statuses(run(true,open(),assign(),assign())).equals(List.of("OPEN","UNKNOWN")));
+        check(WorldRunLifecycle.current.getState().getPayload() instanceof WorldRunPhase.OfflineAssigned);
+        check(WorldRunLifecycle.assigns==1 && WorldRunLifecycle.closes==0 && WorldRunLifecycle.opens==1);
+        reset();
+        boolean lost=false;
+        boolean[] interrupted={false};
+        ByteArrayOutputStream onlyOpen=new ByteArrayOutputStream();
+        try {
+            new OfflineControllerMain(new ByteArrayInputStream(bytes(open(),assign())),new OutputStream() {
+                private int header;
+                private int headerBytes;
+                private int bodyBytes=-1;
+                public void write(int value) throws IOException {
+                    if(bodyBytes==0) {
+                        interrupted[0]=true;
+                        throw new IOException("fixture ASSIGNED応答喪失");
+                    }
+                    onlyOpen.write(value);
+                    if(bodyBytes<0) {
+                        header=(header<<8)|(value&255);
+                        if(++headerBytes==4) bodyBytes=header;
+                    } else bodyBytes--;
+                }
+            }).run();
+        } catch(IOException expected) { lost=true; }
+        check(lost && interrupted[0] && WorldRunLifecycle.assigns==1 && WorldRunLifecycle.opens==1 && WorldRunLifecycle.closes==0);
+        check(WorldRunLifecycle.current.getState().getPayload() instanceof WorldRunPhase.OfflineAssigned);
+        DataInputStream response=new DataInputStream(new ByteArrayInputStream(onlyOpen.toByteArray()));
+        check(OfflineControllerMain.read(response).get("status").equals(JsonElementKt.JsonPrimitive("OPEN")));
+        check(response.available()==0);
     }
 
     private static byte[] bytes(JsonObject... frames) throws IOException {
