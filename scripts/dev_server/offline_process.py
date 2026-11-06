@@ -37,6 +37,7 @@ class OfflineProcess:
         self.record = None
         self.record_number = 0
         self.started = self.ready = False
+        self.startup_acknowledged = False
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
 
@@ -63,6 +64,19 @@ class OfflineProcess:
             require(c.process.group != self.process.group and c.process.pid != self.process.pid
                     and c.process.pid not in self.process.members() and self.process.pid not in c.process.members(),
                     'PROCESS_MISMATCH', 'C/Wは独立groupで所有する必要があります')
+
+    def acknowledge_startup(self, response_sha256):
+        """呼出元が正本へ記録した起動応答hashを照合し、同pipeのbufferを一度だけ解放する。
+
+        失敗時は次frameへ進めず、再送・writer終了扱いもしない。
+        """
+        require(self.ready and not self.startup_acknowledged and digest(self.response) == response_sha256,
+                'STALE_OPERATION', '記録済み起動応答が一致しません')
+        self.verify()
+        self.record['startupAcknowledgedSha256'] = response_sha256
+        self._record()
+        self.pipe.acknowledged()
+        self.startup_acknowledged = True
 
     def start(self, frame, deadline):
         """本人欄・command・session/nonceをPが付け、C OPEN又はW PREPAREDを一度照合する。

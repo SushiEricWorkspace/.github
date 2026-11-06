@@ -58,6 +58,11 @@ class RuntimeControl:
                 self._offline = _OfflineOpen(self)
         return self._offline.open(token, operation_id=operation_id, revision=revision, ready=ready, deadline=deadline)
 
+    def _offline_prepare(self, token, *, operation_id, request, deadline):
+        """保持Cの正本予約から単発WをPREPAREDまで進める。編集・終了は未確定。"""
+        require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
+        return self._offline.prepare(token, operation_id=operation_id, request=request, deadline=deadline)
+
     def _managed_startup(self, token, *, transport, **inputs):
         """独立P入力のprivate受付。通常start/実承認供給元には未接続。"""
         with self._control_lock:

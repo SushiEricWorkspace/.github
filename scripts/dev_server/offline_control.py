@@ -1,4 +1,4 @@
-"""停止済み管理runの正本予約とC本人OPEN。W操作・終了確定は後続。"""
+"""停止済み管理runの正本予約とC OPEN/W PREPARED。編集・終了確定は後続。"""
 
 from copy import deepcopy
 import json
@@ -20,6 +20,7 @@ class _OfflineOpen:
         self.runtime = runtime
         self.registry = runtime.registry
         self.controllers = {}
+        self.workers = {}
 
     def _state(self, connection, token, *, reserved):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -73,6 +74,77 @@ class _OfflineOpen:
         require(not connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND status!='COMPLETED' AND id!=?",
                                        (row['id'], operation_id)).fetchone(), 'WRITER_PENDING', '別の未完了runtime操作があります')
         return run
+
+    def _opened(self, connection, token, controller):
+        require(controller.ready, 'WRITER_PENDING', 'OPEN未照合のCを使えません')
+        opened = json.loads(controller.request)
+        response = json.loads(controller.response)
+        operation = connection.execute('SELECT response FROM runtime_operations WHERE id=?',
+                                       (opened['operationId'],)).fetchone()
+        require(operation is not None, 'STALE_OPERATION', '元取得予約がありません')
+        saved = json.loads(operation['response'])
+        require(digest(canonical(saved['binding'])) == opened['drainSha256']
+                and saved.get('startupResponseSha256') == digest(controller.response),
+                'STALE_OPERATION', '元Cの起動応答と正本記録が一致しません')
+        self._reserved(connection, token, opened['operationId'], opened['requestHash'], saved['binding'])
+        return opened, response, saved
+
+    def prepare(self, token, *, operation_id, request, deadline):
+        """元OPENを正本照合して独立Wを一度生成する。PREPAREDはDB作用・完了を表さない。
+
+        requestはData HostAdapterCodecの型付きEdit本文。元Cのworldと同じ要求IDを渡し、
+        Dataの正規化/hash算法は使わずIPC fingerprintだけを記録する。失敗後は再生成しない。
+        """
+        fields(token, TOKEN)
+        _canonical_uuid(operation_id)
+        token, request = deepcopy(token), deepcopy(request)
+        controller = self.controllers.get(token['instanceId'])
+        require(controller is not None and type(request) is dict,
+                'WRITER_PENDING', '元Cと型付き要求が必要です')
+        fingerprint = digest(canonical({'command':'offline-prepare','request':request}))
+        worker_record = {'operationId':operation_id,'requestSha256':fingerprint}
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, response, saved = self._opened(connection, token, controller)
+                require(request.get('requestId') == operation_id and request.get('worldUuid') == opened['worldUuid'],
+                        'INVALID_INPUT', '元worldの操作IDと要求が一致しません')
+                require('worker' not in saved and token['instanceId'] not in self.workers,
+                        'WRITER_PENDING', '元Wの生成意図と資源を保全します')
+                for table in ('operations','runtime_operations','reference_operations','writer_operations','snapshot_operations'):
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT', '既存operationIdを再使用しません')
+                saved['worker'] = worker_record
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(saved),opened['operationId']))
+
+            def verify():
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    _, _, current = self._opened(connection, token, controller)
+                    require(current.get('worker') == worker_record, 'STALE_OPERATION', '元Wの予約が変更されました')
+
+            verify()
+            controller.acknowledge_startup(saved['startupResponseSha256'])
+            worker = OfflineProcess(controller.bundle, controller.diagnostics / ('worker-' + operation_id),
+                                    native=controller.native, verify=verify, controller=controller,
+                                    process_adapter=self.runtime.process_adapter)
+            self.workers[token['instanceId']] = worker
+            frame = {key:opened[key] for key in ('leaseId','epoch','generation','drainSha256',
+                                                'worldRoot','shopDirectory','worldUuid')}
+            frame.update(operationId=operation_id,requestHash=fingerprint,request=request,
+                         expectedStateSha256=response['stateSha256'],expectedRevision=response['stateRevision'],
+                         runUuid=response['runUuid'])
+            prepared = worker.start(frame, deadline)
+            verify()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                _, _, current = self._opened(connection, token, controller)
+                require(current.get('worker') == worker_record, 'STALE_OPERATION', '元Wの予約が変更されました')
+                completed_record = dict(worker_record, startupResponseSha256=digest(canonical(prepared)))
+                current['worker'] = completed_record
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(current),opened['operationId']))
+            worker_record = completed_record
+            worker.acknowledge_startup(worker_record['startupResponseSha256'])
+            return prepared
 
     def open(self, token, *, operation_id, revision, ready, deadline):
         """同leaseの認証run正常停止後だけCを取得する。例外後も予約と元Cを保全する。
