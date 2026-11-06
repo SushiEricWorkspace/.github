@@ -46,8 +46,17 @@ class RuntimeControl:
         self.processes = {}
         self.managed = None
         self._control = None
+        self._offline = None
         self._control_lock = threading.Lock()
         self._lock_deadline = threading.local()
+
+    def _offline_open(self, token, *, operation_id, revision, ready, deadline):
+        """P内部専用。停止証拠と同instance予約へ束縛してCを一度だけ生成する。"""
+        from .offline_control import _OfflineOpen
+        with self._control_lock:
+            if self._offline is None:
+                self._offline = _OfflineOpen(self)
+        return self._offline.open(token, operation_id=operation_id, revision=revision, ready=ready, deadline=deadline)
 
     def _managed_startup(self, token, *, transport, **inputs):
         """独立P入力のprivate受付。通常start/実承認供給元には未接続。"""
