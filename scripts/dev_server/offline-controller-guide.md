@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）と第3スライス先行部分（Wのprivate入口）。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -14,7 +14,7 @@ Cは自分のData121 `openManagedOfflineWriter`／writer `assignWorker`／writer
 
 このmainはprivate inherited stdin/stdout専用です。ネットワークendpoint・任意SQL・Host許可flag・root常駐daemonを追加しません。Pは同じinstance/world境界でstart排他を取得し、元M/全childの終了、最新game sealと既存receipt、他writer受付遮断・accepted drainを確認した後にだけCを起動します。PがCの固定artifact・実PID/start/host/bootを観測し、C専用OwnedProcessと私設pipeを所有する必要があります。
 
-PによるC/Wの独立OwnedProcess生成・認証済private IPCの実接続は後続スライスです。Cのopenに渡すdrain hashはPの照合値であり、CがRegistry台帳の完全性を証明するものではありません。C側でもPの完全native identityの生存、実parent PID、C本人を照合します。起動引数は受け付けず、root・秘密・本文をcommand lineへ載せません。
+PによるC/Wの独立OwnedProcess生成・本人固定と最初のprivate要求を扱う内部起動部品は、後述の「Pによる限定起動（第4スライス先行部分）」を参照してください。製品呼出元への組込みと実OS受入は後続です。Cのopenに渡すdrain hashはPの照合値であり、CがRegistry台帳の完全性を証明するものではありません。C側でもPの完全native identityの生存、実parent PID、C本人を照合します。起動引数は受け付けず、root・秘密・本文をcommand lineへ載せません。
 
 ## 私設frame version 1
 
@@ -42,7 +42,7 @@ closeは`command=close, operationId, requestHash, sessionId, nonce, openOperatio
 
 ## Assigned登録（第2スライス先行部分）
 
-`assign`はCが開いた同じownerの初回`OfflineIdle`からだけ受け付けます。PはDB未openで待機するWを固定bundleから独立Job/groupとして所有し、私設IPCの認証と実PID/start/host/bootの観測を完了してから送る必要があります。この起動・認証連携は未実装です。Wのprivate入口とData連携は後述の第3スライスで追加しています。C側の生存照合だけでWのOwnedProcess所属を証明したとは扱いません。
+`assign`はCが開いた同じownerの初回`OfflineIdle`からだけ受け付けます。PはDB未openで待機するWを固定bundleから独立Job/groupとして所有し、私設IPCの認証と実PID/start/host/bootの観測を完了してから送る必要があります。内部起動部品は後述の第4スライス節を参照してください。製品呼出元への組込みと実OS受入は後続です。Wのprivate入口とData連携は後述の第3スライスで追加しています。C側の生存照合だけでWのOwnedProcess所属を証明したとは扱いません。
 
 | field | 内容 |
 |---|---|
@@ -75,7 +75,7 @@ Python3.12の合成bundle fixtureで収録・改変・外部classpath・欠落�
 
 ## 単発worker W（第3スライス先行部分）
 
-`offline_worker_command(bundle)`は同じ固定helperのnested main `OfflineControllerMain$Worker`を返します。Cのmainへ引数を渡してWを同じプロセス内で実行する経路はありません。C/Wは同じJARでもPが各々独立のOwnedProcess Job/groupで所有する必要があり、このP接続は後続です。旧helperにWorker classがない場合はworker commandだけを拒否し、従来のC commandの検証は維持します。
+`offline_worker_command(bundle)`は同じ固定helperのnested main `OfflineControllerMain$Worker`を返します。Cのmainへ引数を渡してWを同じプロセス内で実行する経路はありません。C/Wは同じJARでもPが各々独立のOwnedProcess Job/groupで所有する必要があります。その内部起動部品は後述の第4スライス節を参照してください。製品呼出元への組込みと実OS受入は後続です。旧helperにWorker classがない場合はworker commandだけを拒否し、従来のC commandの検証は維持します。
 
 実entrypointのSystem.outはPrintStreamのため、共有frame出力はflush後にcheckErrorも照合し、下位のIOExceptionがPrintStream内で抑止された場合も非正常終了へ進めます。C close後・W候補公開後のPrintStream出力切断をfixtureで検証しています。
 
@@ -88,4 +88,15 @@ Wはprivate inherited stdin/stdoutで2フレームだけを受け取ります。
 
 prepare/admitでのREJECTEDはWのadmission未試行を表すだけで、C ownerをcloseしません。admission試行後の例外・Edit UNKNOWN・DBclose失敗・候補公開後の例外/応答喪失はUNKNOWNまたは返答不能の非正常終了として元stateを保全します。再admission・Edit再送・finish再試行・C差替・自動recoverは行いません。EOF・CANDIDATE・Wの終了予定だけで実終了を推測しません。
 
-今回の固定Data compile/非native fakeは、Idle→Assigned→Pending→SavedPendingExitと非空要求の透過性、作用前拒否・公開後失敗を検証します。実DB/実root/両OSの本人・IPC・Job/group・実bundleビルドの受入ではありません。Pの受付遮断/drain・起動認証/所有、実終了→C complete、Registry CLOSED/start gateは後続です。
+今回の固定Data compile/非native fakeは、Idle→Assigned→Pending→SavedPendingExitと非空要求の透過性、作用前拒否・公開後失敗を検証します。実DB/実root/両OSの本人・IPC・Job/group・実bundleビルドの受入ではありません。起動認証/所有の内部部品は後述の第4スライス節を参照してください。Pの受付遮断/drainを含む製品呼出元への組込みと実OS受入、実終了→C complete、Registry CLOSED/start gateは後続です。
+
+## Pによる限定起動（第4スライス先行部分）
+
+`OfflineProcess`はP内部専用で、CのOPEN、その保持Cへ束縛した別WのPREPAREDまでを扱う。
+生成前に呼出元がobjectを保持し、`verify`でlease/epoch/generation・受付遮断・accepted drain・Mod start排他を再照合する。
+`native`には既存ModControlTransportのnativeを渡す。固定bundle検証、OwnedProcess、private匿名stdio、Data形式本人識別を再利用する。
+C/Wの各groupと実PID/start/host/boot、cwd/executable/command/OS ownerを観測し、私設frameのcontroller/owner/workerとsession/nonceをPが固定する。
+任意commandや本人欄を渡すAPIではなく、Cはopen、Wはprepareだけを一度送る。非空の型付きrequestは変更しない。
+生成/送受信/応答照合/記録の失敗は例外とし、再送・別helperへの差替をしない。object/handle/pipe/元要求・応答を保持し、本文・秘密は監督記録に残さない。
+この段階ではPの製品呼出元を接続していない。Assigned/admit/候補照合、全child実終了、C complete/close、Registry CLOSED/start gateは後続であり、OPEN/PREPAREDを編集成功や終了証拠に使わない。
+実Windows/macOS本人受入・実root・実bundle起動は未確認。合成native/pipe fixtureと既存Java非native vectorsの成功を実機受入へ拡張しない。
