@@ -93,6 +93,25 @@ class _OfflineOpen:
 
     def _prepared(self, connection, token, controller, worker, operation_id):
         opened, response, saved = self._opened(connection, token, controller)
+        history = self.history.get(token['instanceId'], [])
+        require(saved.get('history', []) == [record for _, record in history]
+                and set(controller.operation_history) == {record['worker']['operationId'] for _, record in history},
+                'STALE_OPERATION', '元Cの操作別履歴と正本が一致しません')
+        for previous, record in history:
+            previous_id = record['worker']['operationId']
+            held = controller.operation_history[previous_id]
+            completion = held['completion_response']
+            require(previous.controller is controller and held['assignment_acknowledged']
+                    and held['completion_ready'] and held['completion_acknowledged']
+                    and record['assignment'] == {'operationId':previous_id, 'responseSha256':digest(held['assignment_response'])}
+                    and record['completion'] == {'operationId':previous_id, 'workerExitSha256':digest(previous.exit_response),
+                                                 'responseSha256':digest(completion)}
+                    and held['record'].get('assignedResponseSha256') == held['record'].get('assignedAcknowledgedSha256') == digest(held['assignment_response'])
+                    and held['record'].get('completionResponseSha256') == held['record'].get('completionAcknowledgedSha256') == digest(completion),
+                    'STALE_OPERATION', '元CのAssigned/complete原文と正本記録/ACKを保全します')
+            response = json.loads(completion)
+            require(response['operationId'] == previous_id and response['status'] == 'COMPLETED',
+                    'STALE_OPERATION', '履歴末尾のIdleが元操作と一致しません')
         require(worker.controller is controller and controller.startup_acknowledged and worker.startup_acknowledged,
                 'WRITER_PENDING', '元Cと正本記録済みWが必要です')
         frame = json.loads(worker.request)
@@ -242,6 +261,7 @@ class _OfflineOpen:
             with self.runtime._transaction(token['instanceId']) as connection:
                 _, current = self._assigned(connection, token, controller, worker, operation_id)
                 require(current.get('admission') == admission, 'STALE_OPERATION', '元admission意図が変更されました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W候補の正本照合中に期限を超過しました')
                 current['admission'] = dict(admission, candidateResponseSha256=digest(canonical(response)))
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
                                    (json.dumps(current),opened['operationId']))
@@ -273,12 +293,13 @@ class _OfflineOpen:
             with self.runtime._transaction(token['instanceId']) as connection:
                 _, current = self._prepared(connection, token, controller, worker, operation_id)
                 require(current.get('assignment') == assignment, 'STALE_OPERATION', '元assignment意図が変更されました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C Assigned登録の正本照合中に期限を超過しました')
                 recorded = dict(assignment, responseSha256=digest(canonical(response)))
                 current['assignment'] = recorded
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
                                    (json.dumps(current),opened['operationId']))
             assignment = recorded
-            controller.acknowledge_assignment(assignment['responseSha256'], worker, verify)
+            controller.acknowledge_assignment(assignment['responseSha256'], worker, verify, deadline=deadline)
             return response
 
     def prepare(self, token, *, operation_id, request, deadline):
@@ -336,6 +357,7 @@ class _OfflineOpen:
 
             if previous is not None:
                 self.history.setdefault(token['instanceId'], []).append((previous, deepcopy(history[-1])))
+                controller.archive_completed(previous)
 
             def verify():
                 with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
