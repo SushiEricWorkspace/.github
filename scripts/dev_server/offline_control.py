@@ -22,6 +22,7 @@ class _OfflineOpen:
         self.registry = runtime.registry
         self.controllers = {}
         self.workers = {}
+        self.history = {}
 
     def _state(self, connection, token, *, reserved):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -281,7 +282,7 @@ class _OfflineOpen:
             return response
 
     def prepare(self, token, *, operation_id, request, deadline):
-        """元OPENを正本照合して独立Wを一度生成する。PREPAREDはDB作用・完了を表さない。
+        """記録済みOPEN又は前操作のIdleから独立Wを一度生成する。DBは開かない。
 
         requestはData HostAdapterCodecの型付きEdit本文。元Cのworldと同じ要求IDを渡し、
         Dataの正規化/hash算法は使わずIPC fingerprintだけを記録する。失敗後は再生成しない。
@@ -299,22 +300,55 @@ class _OfflineOpen:
                 opened, response, saved = self._opened(connection, token, controller)
                 require(request.get('requestId') == operation_id and request.get('worldUuid') == opened['worldUuid'],
                         'INVALID_INPUT', '元worldの操作IDと要求が一致しません')
-                require('worker' not in saved and token['instanceId'] not in self.workers,
-                        'WRITER_PENDING', '元Wの生成意図と資源を保全します')
+                previous = self.workers.get(token['instanceId'])
+                history = [record for _, record in self.history.get(token['instanceId'], [])]
+                require(saved.get('history', []) == history, 'STALE_OPERATION', '元操作履歴が一致しません')
+                if previous is None:
+                    require('worker' not in saved, 'WRITER_PENDING', '元Wの生成意図を保全します')
+                else:
+                    require(previous.ready, 'WRITER_PENDING', '未完了Wの生成資源を保全します')
+                    require(time.monotonic() < deadline, 'STOP_TIMEOUT', '次W準備の期限を超過しました')
+                    previous_id = json.loads(previous.request)['operationId']
+                    self._exited(connection, token, controller, previous, previous_id)
+                    response_sha256 = digest(controller.completion_response) if controller.completion_response is not None else None
+                    require(controller.completion_ready and controller.completion_acknowledged
+                            and saved.get('completion') == {'operationId':previous_id,
+                                'workerExitSha256':digest(previous.exit_response), 'responseSha256':response_sha256}
+                            and controller.record.get('completionResponseSha256') == response_sha256
+                            and controller.record.get('completionAcknowledgedSha256') == response_sha256,
+                            'WRITER_PENDING', '元Cの照合済み確定応答と正本記録/ACKが必要です')
+                    response = json.loads(controller.completion_response)
+                    require(response['operationId'] == previous_id and response['status'] == 'COMPLETED',
+                            'STALE_OPERATION', '元操作のIdle応答が一致しません')
+                require(all(record['worker']['operationId'] != operation_id for record in history)
+                        and (previous is None or previous_id != operation_id),
+                        'OPERATION_CONFLICT', '過去のoffline operationIdを再使用しません')
                 for table in ('operations','runtime_operations','reference_operations','writer_operations','snapshot_operations'):
                     require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
                             'OPERATION_CONFLICT', '既存operationIdを再使用しません')
+                if previous is not None:
+                    archived = {key:saved.pop(key) for key in ('worker','assignment','admission','workerExit','completion')}
+                    history = deepcopy(history) + [archived]
+                    saved['history'] = history
                 saved['worker'] = worker_record
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
                                    (json.dumps(saved),opened['operationId']))
 
+            if previous is not None:
+                self.history.setdefault(token['instanceId'], []).append((previous, deepcopy(history[-1])))
+
             def verify():
                 with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
                     _, _, current = self._opened(connection, token, controller)
-                    require(current.get('worker') == worker_record, 'STALE_OPERATION', '元Wの予約が変更されました')
+                    require(current.get('worker') == worker_record and current.get('history', []) == history
+                            and history == [record for _, record in self.history.get(token['instanceId'], [])],
+                            'STALE_OPERATION', '元Wの予約又は操作履歴が変更されました')
 
             verify()
-            controller.acknowledge_startup(saved['startupResponseSha256'])
+            if previous is not None:
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '次W生成前に期限を超過しました')
+            if previous is None:
+                controller.acknowledge_startup(saved['startupResponseSha256'])
             worker = OfflineProcess(controller.bundle, controller.diagnostics / ('worker-' + operation_id),
                                     native=controller.native, verify=verify, controller=controller,
                                     process_adapter=self.runtime.process_adapter)
@@ -328,7 +362,11 @@ class _OfflineOpen:
             verify()
             with self.runtime._transaction(token['instanceId']) as connection:
                 _, _, current = self._opened(connection, token, controller)
-                require(current.get('worker') == worker_record, 'STALE_OPERATION', '元Wの予約が変更されました')
+                require(current.get('worker') == worker_record and current.get('history', []) == history
+                        and history == [record for _, record in self.history.get(token['instanceId'], [])],
+                        'STALE_OPERATION', '元Wの予約又は操作履歴が変更されました')
+                if previous is not None:
+                    require(time.monotonic() < deadline, 'STOP_TIMEOUT', '次Wの正本照合中に期限を超過しました')
                 completed_record = dict(worker_record, startupResponseSha256=digest(canonical(prepared)))
                 current['worker'] = completed_record
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
