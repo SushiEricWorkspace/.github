@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterRequest;
 import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterResponse;
 import java.util.UUID;
+import java.util.List;
 
 /** DBもrun-stateも作らない、作用境界と失敗注入だけのfixture。 */
 public final class WorldRunLifecycle {
@@ -16,6 +17,10 @@ public final class WorldRunLifecycle {
     public static int closes;
     public static int assigns;
     public static int completes, completeCalls;
+    public static int gameExitCalls, gameExits;
+    public static boolean failGameExitAfterPublish;
+    public static WorldRunStatus lastGameCandidate;
+    public static List<WorldProcessIdentity> gameWriters = List.of();
     public static boolean receiptMatches = true, sealMatches = true, failCompleteAfterPublish;
     public static WorldOfflineCandidate lastCandidate;
     public static WorldRunStatus receiptPending;
@@ -29,8 +34,25 @@ public final class WorldRunLifecycle {
     public static WorldRunStatus current = initialReady();
     public static final String ID = "00000000-0000-4000-8000-000000000001";
     public static final String RUN = "00000000-0000-4000-8000-000000000002";
-    public WorldRunLifecycle(Path world, Path shop, UUID uuid, int timeout) {}
+    public static Path observedWorld;
+    public static UUID observedWorldUuid;
+    public WorldRunLifecycle(Path world, Path shop, UUID uuid, int timeout) {
+        observedWorld=world; observedShop=shop; observedWorldUuid=uuid;
+    }
     public WorldRunStatus readStatus() { return current; }
+    public WorldRunStatus observeExit(WorldRunStatus expected) {
+        gameExitCalls++;
+        if (expected != current || !(expected.getState().getPayload() instanceof WorldRunPhase.SavedPendingExit saved))
+            throw new IllegalStateException("fixture 元game候補不一致");
+        WorldProcessIdentities.INSTANCE.requireExited(saved.getOwner());
+        gameWriters.forEach(WorldProcessIdentities.INSTANCE::requireExited);
+        if (dbOpen || !sealMatches) throw new IllegalStateException("fixture DBclose/seal未確認");
+        lastGameCandidate=expected;
+        current=advance("9",expected.getState().getRunUuid(),new WorldRunPhase.Ready("5".repeat(64),"8".repeat(64)));
+        gameExits++;
+        if (failGameExitAfterPublish) throw new IllegalStateException("fixture Ready公開後応答喪失");
+        return current;
+    }
     public WorldOfflineOperation beginOfflineEdit(WorldRunStatus expected, HostAdapterRequest request) {
         if (expected != current || !(expected.getState().getPayload() instanceof WorldRunPhase.OfflineAssigned phase)
                 || !phase.getWorker().equals(WorldProcessIdentities.INSTANCE.current()) || !request.equals(expectedRequest))

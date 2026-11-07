@@ -21,7 +21,10 @@ class OfflineControllerJavaTests(unittest.TestCase):
     def test_complete_with_fake_data_and_identities(self):
         self.vectors(True, complete=True)
 
-    def vectors(self, fake, *, worker=False, complete=False):
+    def test_game_exit_with_fake_data_and_identities(self):
+        self.vectors(True, game_exit=True)
+
+    def vectors(self, fake, *, worker=False, complete=False, game_exit=False):
         bundle = Path(os.environ['SUSHIERIC_OFFLINE_TEST_BUNDLE'])
         host = json.loads((bundle / 'adapter/host.json').read_bytes())
         classpath = os.pathsep.join(str(bundle / name) for name in host['classpath'])
@@ -33,7 +36,7 @@ class OfflineControllerJavaTests(unittest.TestCase):
                     str(root / 'java/OfflineControllerMain.java'),
                     str(root / 'java/test/OfflineControllerVectors.java')]
             if fake:
-                args = args[:-1] + [str(root / ('java/test/OfflineCompleteVectors.java' if complete else 'java/test/OfflineWorkerVectors.java' if worker else 'java/test/OfflineControllerLifecycleVectors.java')),
+                args = args[:-1] + [str(root / ('java/test/OfflineGameExitVectors.java' if game_exit else 'java/test/OfflineCompleteVectors.java' if complete else 'java/test/OfflineWorkerVectors.java' if worker else 'java/test/OfflineControllerLifecycleVectors.java')),
                                     *[str(path) for path in sorted((root / 'java/test/fake').glob('*.java'))]]
             argfile = classes / 'javac.args'
             argfile.write_text('\n'.join(json.dumps(value.replace('\\', '/')) for value in args), encoding='utf-8')
@@ -43,10 +46,10 @@ class OfflineControllerJavaTests(unittest.TestCase):
             result = subprocess.run([str(bundle / ('jdk/bin/java' + suffix)), '-cp',
                                      str(classes) + os.pathsep + classpath,
                                      'io.github.sushiericworkspace.devserver.' +
-                                     ('OfflineCompleteVectors' if complete else 'OfflineWorkerVectors' if worker else 'OfflineControllerLifecycleVectors' if fake else 'OfflineControllerVectors')],
+                                     ('OfflineGameExitVectors' if game_exit else 'OfflineCompleteVectors' if complete else 'OfflineWorkerVectors' if worker else 'OfflineControllerLifecycleVectors' if fake else 'OfflineControllerVectors')],
                                     capture_output=True, timeout=30)
             self.assertEqual(0, result.returncode, result.stderr.decode(errors='replace'))
-            self.assertTrue(result.stdout.startswith(b'offline-complete-vectors=' if complete else b'offline-worker-vectors=' if worker else b'offline-lifecycle-vectors=') if fake
+            self.assertTrue(result.stdout.startswith(b'offline-game-exit-vectors=' if game_exit else b'offline-complete-vectors=' if complete else b'offline-worker-vectors=' if worker else b'offline-lifecycle-vectors=') if fake
                             else b'offline-vectors=' in result.stdout)
 
 
