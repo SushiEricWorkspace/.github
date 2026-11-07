@@ -23,7 +23,7 @@ class OfflineProcess:
 
     Pは呼出前にobjectを保持し、verifyでlease/epoch/generation・遮断/drain・起動排他を
     継続照合する。nativeは既存transportの本人観測を使う。start後もhandleとpipeを保持し、
-    例外時は再起動・再送しない。W実終了はobserve_exit、C complete/Registry終端は後続。
+    例外時は再起動・再送しない。W実終了はobserve_exit、候補確定はcompleteで行う。
     """
     def __init__(self, bundle, diagnostics, *, native, verify, controller=None, process_adapter=runtime_process):
         self.bundle = Path(bundle)
@@ -46,6 +46,8 @@ class OfflineProcess:
         self.admission_request = self.candidate_response = None
         self.exit_started = False
         self.exit_response = None
+        self.completion_started = self.completion_ready = self.completion_acknowledged = False
+        self.completion_request = self.completion_response = None
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
 
@@ -72,6 +74,66 @@ class OfflineProcess:
             require(c.process.group != self.process.group and c.process.pid != self.process.pid
                     and c.process.pid not in self.process.members() and self.process.pid not in c.process.members(),
                     'PROCESS_MISMATCH', 'C/Wは独立groupで所有する必要があります')
+
+    def complete(self, worker, deadline, verify):
+        """正本記録済み元Wの同候補だけを保持C本人へ一度送る。
+
+        verifyはPの元終了証拠・予約とcompletion意図を照合する。旧W PIDへ再attachせず、
+        Data応答は本文を変えず返す。正本記録後のackまで同pipeのbufferを保持する。
+        """
+        require(self.controller is None and worker.controller is self and self.assignment_acknowledged
+                and worker.exit_started and worker.exit_response is not None and not self.completion_started,
+                'WRITER_PENDING', '元Wの記録済み終了証拠だけを一度確定します')
+        self.completion_started = True
+
+        def checked():
+            verify()
+            self.verify()
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C候補確定の期限を超過しました')
+
+        checked()
+        prepared, candidate = json.loads(worker.request), json.loads(worker.candidate_response)
+        assigned = json.loads(self.assignment_response)
+        frame = {k:prepared[k] for k in ('operationId','requestHash','sessionId','nonce')}
+        frame.update(command='complete', openOperationId=json.loads(self.request)['operationId'],
+                     expectedStateSha256=candidate['stateSha256'], expectedRevision=candidate['stateRevision'],
+                     worldUuid=candidate['worldUuid'], runUuid=candidate['runUuid'],
+                     receiptSha256=candidate['receiptSha256'], editRequestSha256=assigned['editRequestSha256'])
+        self.completion_request = canonical(frame)
+        self.pipe.send(frame, deadline, checked)
+        response = self.pipe.receive(deadline, checked)
+        self.completion_response = canonical(response)
+        require(response.keys() == {'status','operationId','requestHash','sessionId','nonce','stateSha256',
+                                    'stateRevision','runUuid','candidateStateSha256','receiptSha256','result'}
+                and response['status'] == 'COMPLETED'
+                and all(response[k] == frame[k] for k in ('operationId','requestHash','sessionId','nonce','receiptSha256'))
+                and response['candidateStateSha256'] == frame['expectedStateSha256']
+                and type(response['stateRevision']) is int and response['stateRevision'] == frame['expectedRevision'] + 1
+                and response['runUuid'] == json.loads(self.response)['runUuid'],
+                'API_PROTOCOL', 'COMPLETEDの元候補/private bindingとIdle遷移が一致しません')
+        _hash(response['stateSha256'])
+        result = response['result']
+        require(type(result) is dict and result.get('requestId') == frame['operationId']
+                and result.get('status') in {'SUCCESS','REJECTED'},
+                'API_PROTOCOL', 'Dataの元要求に対応した確定応答が必要です')
+        checked()
+        self.record['completionResponseSha256'] = digest(self.completion_response)
+        self._record()
+        self.completion_ready = True
+        return deepcopy(response)
+
+    def acknowledge_completion(self, response_sha256, deadline, verify):
+        """同COMPLETEDの正本記録後だけC pipeを解放する。writerは終了しない。"""
+        require(self.completion_ready and not self.completion_acknowledged
+                and digest(self.completion_response) == response_sha256,
+                'STALE_OPERATION', '記録済みCOMPLETED応答が一致しません')
+        verify()
+        self.verify()
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C確定応答記録後に期限を超過しました')
+        self.record['completionAcknowledgedSha256'] = response_sha256
+        self._record()
+        self.pipe.acknowledged()
+        self.completion_acknowledged = True
 
     def observe_exit(self, deadline, verify):
         """記録済み候補の元W/全child終了を保持handle/groupで一度観測する。
