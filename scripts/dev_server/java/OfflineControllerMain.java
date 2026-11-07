@@ -16,7 +16,7 @@ import java.util.*;
 
 /**
  * Pが所有するprivate stdio専用の停止中controller。受付遮断・drain・start排他は起動元Pの責務。
- * EOFや作用後失敗でownerを自動closeしない。CLOSEの返答はCの実終了やRegistry CLOSEDの証明ではない。
+ * EOFや作用後失敗でownerを自動closeしない。complete/CLOSEの返答はRegistry結果やCの実終了・Registry CLOSEDの証明ではない。
  */
 public final class OfflineControllerMain {
     static final int FRAME = 65_536;
@@ -27,6 +27,8 @@ public final class OfflineControllerMain {
     private WorldProcessIdentity parent;
     private WorldProcessIdentity self;
     private WorldOfflineWriterSession writer;
+    private WorldRunLifecycle lifecycle;
+    private String operationHash;
     private String session;
     private String nonce;
     private String openId;
@@ -65,6 +67,7 @@ public final class OfflineControllerMain {
                 JsonObject response;
                 if (command.equals("open")) response = open(frame, id, hash);
                 else if (command.equals("assign")) response = assign(frame, id, hash);
+                else if (command.equals("complete")) response = complete(frame, id, hash);
                 else if (command.equals("close")) response = close(frame, id, hash);
                 else throw new IllegalArgumentException("未知のcontroller操作です");
                 write(response);
@@ -89,7 +92,7 @@ public final class OfflineControllerMain {
         WorldManagementBinding management = new WorldManagementBinding(
                 string(frame, "leaseId"), number(frame, "epoch"), string(frame, "generation"),
                 parent, string(frame, "drainSha256"));
-        WorldRunLifecycle lifecycle = new WorldRunLifecycle(
+        lifecycle = new WorldRunLifecycle(
                 Path.of(string(frame, "worldRoot")), Path.of(string(frame, "shopDirectory")),
                 UUID.fromString(string(frame, "worldUuid")), 5000);
         WorldRunStatus expected = lifecycle.readStatus();
@@ -132,9 +135,40 @@ public final class OfflineControllerMain {
         checkActors();
         WorldProcessIdentities.INSTANCE.requireAlive(worker);
         WorldRunStatus assigned = writer.assignWorker(worker, request, expected);
+        operationHash = hash;
         WorldRunPhase.OfflineAssigned phase = (WorldRunPhase.OfflineAssigned) assigned.getState().getPayload();
         Map<String, JsonElement> response = new LinkedHashMap<>(status("ASSIGNED", id, hash, assigned));
         response.put("editRequestSha256", JsonElementKt.JsonPrimitive(phase.getRequestSha256()));
+        return new JsonObject(response);
+    }
+
+    private JsonObject complete(JsonObject frame, String id, String hash) {
+        require(writer != null);
+        WorldRunStatus assigned = writer.getStatus();
+        require(assigned.getState().getPayload() instanceof WorldRunPhase.OfflineAssigned);
+        WorldRunPhase.OfflineAssigned phase = (WorldRunPhase.OfflineAssigned) assigned.getState().getPayload();
+        fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "openOperationId",
+                "expectedStateSha256", "expectedRevision", "worldUuid", "runUuid", "receiptSha256", "editRequestSha256");
+        require(session.equals(string(frame, "sessionId")) && nonce.equals(string(frame, "nonce")) &&
+                openId.equals(string(frame, "openOperationId")) && phase.getOperationId().equals(id) &&
+                operationHash.equals(hash) && phase.getRequestSha256().equals(string(frame, "editRequestSha256")) &&
+                assigned.getState().getWorldUuid().equals(string(frame, "worldUuid")) &&
+                id.equals(string(frame, "runUuid")) &&
+                number(frame, "expectedRevision") == assigned.getState().getStateRevision() + 2);
+        checkActors();
+        WorldRunStatus expected = lifecycle.readStatus();
+        require(expected.getState().getPayload() instanceof WorldRunPhase.OfflineSavedPendingExit);
+        WorldRunPhase.OfflineSavedPendingExit saved = (WorldRunPhase.OfflineSavedPendingExit) expected.getState().getPayload();
+        require(saved.getWorker().equals(phase.getWorker()));
+        WorldOfflineCandidate candidate = new WorldOfflineCandidate(string(frame, "expectedStateSha256"), string(frame, "receiptSha256"),
+                string(frame, "worldUuid"), string(frame, "runUuid"), number(frame, "expectedRevision"));
+        checkActors();
+        HostAdapterResponse completed = writer.complete(candidate);
+        require(id.equals(completed.getRequestId()) && completed.getStatus() != HostAdapterStatus.UNKNOWN);
+        Map<String, JsonElement> response = new LinkedHashMap<>(status("COMPLETED", id, hash, writer.getStatus()));
+        response.put("candidateStateSha256", JsonElementKt.JsonPrimitive(candidate.getStateSha256()));
+        response.put("receiptSha256", JsonElementKt.JsonPrimitive(candidate.getReceiptSha256()));
+        response.put("result", JSON.parseToJsonElement(new String(HostAdapterCodec.INSTANCE.encodeResponse(completed), StandardCharsets.UTF_8)));
         return new JsonObject(response);
     }
 

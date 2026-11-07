@@ -2,6 +2,7 @@ package io.github.sushiericworkspace.sushiericdatamodel.database.run;
 
 import java.nio.file.Path;
 import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterRequest;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterResponse;
 import java.util.UUID;
 
 /** DBもrun-stateも作らない、作用境界と失敗注入だけのfixture。 */
@@ -14,6 +15,12 @@ public final class WorldRunLifecycle {
     public static int opens;
     public static int closes;
     public static int assigns;
+    public static int completes, completeCalls;
+    public static boolean receiptMatches = true, sealMatches = true, failCompleteAfterPublish;
+    public static WorldOfflineCandidate lastCandidate;
+    public static WorldRunStatus receiptPending;
+    public static final String RECEIPT_SEAL = "5".repeat(64);
+    public static HostAdapterResponse completedResponse;
     public static boolean failAssignAfterPublish;
     public static WorldOfflineOwnerBinding binding;
     public static boolean failOpen;
@@ -53,6 +60,11 @@ public final class WorldRunLifecycle {
         return new WorldOfflineWriterSession();
     }
     public static WorldRunStatus ready(long revision) {
+        if (revision > 2 && current.getState().getPayload() instanceof WorldRunPhase.OfflineIdle idle) {
+            WorldRunState before = current.getState();
+            return new WorldRunStatus("9".repeat(64),new WorldRunState(1,before.getWorldUuid(),before.getGeneration(),RUN,revision,
+                    before.getPaths(),before.getOriginSha256(),current.getSha256(),new WorldRunPhase.Ready(idle.getSealSha256(),"0".repeat(64))));
+        }
         return ready(revision, "c", RUN);
     }
     public static WorldRunStatus initialReady() {

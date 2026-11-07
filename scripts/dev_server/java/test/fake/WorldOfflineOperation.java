@@ -21,6 +21,8 @@ public final class WorldOfflineOperation {
             throw new IllegalStateException("fixture 未closeまたは結果不明");
         WorldRunLifecycle.checkWorkerActors();
         WorldRunPhase.OfflinePending pending=(WorldRunPhase.OfflinePending)status.getState().getPayload();
+        WorldRunLifecycle.receiptPending = status;
+        WorldRunLifecycle.completedResponse = response;
         WorldRunLifecycle.finishes++;
         WorldRunLifecycle.current=WorldRunLifecycle.advance("c",status.getState().getRunUuid(),
                 new WorldRunPhase.OfflineSavedPendingExit(pending.getWriter(),pending.getWorker(),"1".repeat(64)));
