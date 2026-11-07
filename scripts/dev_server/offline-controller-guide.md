@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -58,7 +58,7 @@ root・generation・leaseはopen時のbindingから引き継ぎ、assignでの�
 
 `ASSIGNED`は従来status応答と同じ`operationId, requestHash, sessionId, nonce, stateSha256, stateRevision, runUuid`、およびDataが公開した`OfflineAssigned.requestSha256`を`editRequestSha256`として返します。IPCの`requestHash`と、期限を除外し順序を正規化するDataの商品操作hashを混同しないでください。writerのsession/runUuidは維持し、revision/hashだけが次へ進みます。
 
-一度登録するとこの入口では再登録・worker差替・recoverできません。Assignedのままcloseを要求してもDataが拒否し、ownerを解放しません。Wのadmission・Edit・候補公開は限定入口として追加していますが、P接続・実終了・C completeは後続のため、現時点のhelperだけではAssignedを完了できません。製品のwriter受付からの呼出元は追加しておらず、通常利用へ公開しません。
+一度登録するとこの入口では再登録・worker差替・recoverできません。Assignedのままcloseを要求してもDataが拒否し、ownerを解放しません。Wのadmission・Edit・候補公開は限定入口として追加していますが、実終了・C completeは後続のため、現時点のhelperだけではAssignedを完了できません。製品のwriter受付からの呼出元は追加しておらず、通常利用へ公開しません。
 
 ## 失敗時
 
@@ -98,7 +98,7 @@ prepare/admitでのREJECTEDはWのadmission未試行を表すだけで、C owner
 C/Wの各groupと実PID/start/host/boot、cwd/executable/command/OS ownerを観測し、私設frameのcontroller/owner/workerとsession/nonceをPが固定する。
 任意commandや本人欄を渡すAPIではなく、Cはopen、Wはprepareだけを一度送る。非空の型付きrequestは変更しない。
 生成/送受信/応答照合/記録の失敗は例外とし、再送・別helperへの差替をしない。object/handle/pipe/元要求・応答を保持し、本文・秘密は監督記録に残さない。
-Registry内部呼出元は第5・第6スライスで接続している。公開writer受付は後続である。Assigned登録は後述の第7スライスで接続する。admit/候補照合、全child実終了、C complete/close、Registry CLOSED/start gateは後続であり、OPEN/PREPAREDを編集成功や終了証拠に使わない。
+Registry内部呼出元は第5・第6スライスで接続している。公開writer受付は後続である。Assigned登録は後述の第7スライスで接続する。admit/候補packetは第8スライスで接続する。全child実終了、C complete/close、Registry CLOSED/start gateは後続であり、OPEN/PREPAREDを編集成功や終了証拠に使わない。
 実Windows/macOS本人受入・実root・実bundle起動は未確認。合成native/pipe fixtureと既存Java非native vectorsの成功を実機受入へ拡張しない。
 
 ## Registry正本に束縛するC取得（第5スライス先行部分）
@@ -107,7 +107,7 @@ P内部の`RuntimeControl._offline_open`は、同lease/epoch/generationの認証
 P内部入口でも既存のresource_useでGC/監督停止と調停する。同instance lock内の短txでgate revision、offline-open PENDING、artifact参照、instances.pendingを予約し、DB外で保持Cを起動する。各I/O前に同予約と元run/descriptor/停止proof/drain snapshot・旧M PID不在を再照合する。
 Data Readyのworld/run/hash/revisionは期待値としてCへ渡し、実state・seal/chainはData本人APIが検査する。Registryの正常停止だけからData Readyを推測せず、任意rootや空verifyを渡す入口は作らない。
 OPEN後も予約/PENDINGを保持する。生成/通信/照合/正本記録の失敗で再取得・別Cへの差替・自動rollbackはしない。元Cと生成資源を保持し、start/lease解放を拒否する。
-この入口はP内部用で、Manager/CLIの停止中writer受付は未公開。正本予約からW PREPAREDまでは第6スライスで接続している。Assigned登録は第7スライスで接続する。admit/候補照合、実終了/C complete/close、Registry CLOSEDと予約解放は後続である。合成SQLiteと既存Java/native fakeの検証を実OS/実root受入へ広げない。
+この入口はP内部用で、Manager/CLIの停止中writer受付は未公開。正本予約からW PREPAREDまでは第6スライスで接続している。Assigned登録は第7スライスで接続する。admit/候補packetは第8スライスで接続する。実終了/C complete/close、Registry CLOSEDと予約解放は後続である。合成SQLiteと既存Java/native fakeの検証を実OS/実root受入へ広げない。
 
 ## 正本予約からW待機（第6スライス先行部分）
 
@@ -115,7 +115,7 @@ P内部の`RuntimeControl._offline_prepare(token, operation_id=..., request=...,
 
 `OfflineProcess.acknowledge_startup`は、呼出元が正本へ記録したOPEN/PREPARED応答hashを照合し、本人再検証とローカル記録後にだけ既存ProxyPipeのbufferを解放する。送受信失敗・応答不一致・記録失敗なら次frameへ進まず、別要求・再生成・再送で回避しない。W応答が返ってもoffline-open PENDINGとartifact参照を保持する。
 
-Assigned登録は後述の第7スライスで接続する。W admitはまだ送らない。WはDB未openで待機し、実終了・C complete/close・Registry CLOSEDを完了扱いにしない。game候補のData退出→Ready供給と公開writer受付は後続で、今回もReady期待値をC本人が検査する。実OS/native受入は未確認。
+Assigned登録は後述の第7スライスで接続する。W admitは第8スライスで接続する。WはDB未openで待機し、実終了・C complete/close・Registry CLOSEDを完了扱いにしない。game候補のData退出→Ready供給と公開writer受付は後続で、今回もReady期待値をC本人が検査する。実OS/native受入は未確認。
 
 ## 正本PREPAREDからC Assigned（第7スライス先行部分）
 
@@ -123,4 +123,14 @@ P内部の`RuntimeControl._offline_assign(token, operation_id=..., deadline=...)
 
 CのASSIGNEDでは同op/IPC hash/session/nonce/runとrevision+1、state hashとData editRequestSha256を照合する。元OPEN/PREPARED原文は維持し、ASSIGNEDの正本記録と本人再照合・ローカル記録後だけC pipeを解放する。失敗時は例外で元要求/応答・C/W・PENDING/参照を保持し、再登録・再送・差替しない。
 
-この入口からW admitは送らない。WはPREPAREDのままDB未openで待機する。W admit/候補照合、game候補のData退出→Ready供給、実終了/receipt/CLOSEDと公開受付は後続。実OS/native本人受入は未確認。
+W admitと候補packetの内部接続は後述の第8スライスを参照する。WはPREPAREDのままDB未openで待機する。game候補のData退出→Ready供給、実終了/receipt/CLOSEDと公開受付は後続。実OS/native本人受入は未確認。
+
+## 記録済みAssignedから候補packet（第8スライス先行部分）
+
+P内部の`RuntimeControl._offline_admit(token, operation_id=..., deadline=...)`は、元C/Wと記録済みASSIGNED・ACKを再照合し、同instance lock内の短transactionでadmission意図を先行記録する。元worker/assignment記録を維持し、WへはC本人のAssigned hash/revision/run・Data editRequestSha256と元PREPARED hashだけを送る。本文を再受領せず、Java Wが保持する元HostAdapterRequestをData119へ渡す。
+
+WはDBclose・候補公開後にACKを待たず終了する。送信前は元Wの本人も照合し、候補受信中は元専用pipe/OwnedProcess handleへのbindingとP/C・Registryを検証する。poll0なら旧W PIDを再解決せず受信でき、PID再利用で別processを採用しない。非zero exitは拒否する。poll0だけで全child終了やC completeを確定しない。
+
+CANDIDATEは同op/IPC hash/session/nonce/world、run=操作UUID、Assigned revision+2、Data editRequestSha256とstate/receipt hash形式を照合し、正本へ応答hashを記録する。候補後はWへACK/次frameを送らずbufferとhandleを保持する。PENDING/参照を解放せず、packetだけで最終SUCCESSへ昇格しない。失敗時の再admit・再生成・差替・自動rollbackはない。
+
+候補実体/hashのC本人照合、W/全child実終了、receipt complete、game候補のData退出→Ready供給、C close/Registry CLOSEDと公開受付は後続。Ready期待値を自動確定せず、実OS/native本人受入は未確認。
