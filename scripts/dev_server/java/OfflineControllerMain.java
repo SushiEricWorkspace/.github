@@ -57,6 +57,7 @@ public final class OfflineControllerMain {
                 if (effect) throw new IOException("controller入力不明。元stateを保全してください");
                 return;
             }
+            boolean gameExit = JsonElementKt.JsonPrimitive("observe-game-exit").equals(frame.get("command"));
             String id = null;
             String hash = null;
             try {
@@ -66,19 +67,64 @@ public final class OfflineControllerMain {
                 String command = string(frame, "command");
                 JsonObject response;
                 if (command.equals("open")) response = open(frame, id, hash);
+                else if (command.equals("observe-game-exit")) response = observeGameExit(frame, id, hash);
                 else if (command.equals("assign")) response = assign(frame, id, hash);
                 else if (command.equals("complete")) response = complete(frame, id, hash);
                 else if (command.equals("close")) response = close(frame, id, hash);
                 else throw new IllegalArgumentException("未知のcontroller操作です");
                 write(response);
-                if (command.equals("close")) return;
+                if (command.equals("close") || command.equals("observe-game-exit")) return;
             } catch (Exception failure) {
                 write(packet(effect ? "UNKNOWN" : "REJECTED", id, hash));
                 // Dataのcurrent公開後に返答だけ失われた可能性も含め、再取得しない。
-                if (effect) throw new IOException("controller結果不明。元stateを保全してください");
+                if (effect || gameExit) throw new IOException("controller結果不明。元stateを保全してください");
                 return;
             }
         }
+    }
+
+    /** Pの全child/全writer観測後専用。返却Readyから次openの期待値を自動決定しない。 */
+    private JsonObject observeGameExit(JsonObject frame, String id, String hash) {
+        fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "leaseId", "epoch",
+                "generation", "controller", "owner", "drainSha256", "worldRoot", "shopDirectory",
+                "worldUuid", "runUuid", "expectedStateSha256", "expectedRevision", "gameOwner",
+                "saveProofSha256", "requestedStateSha256");
+        validateStart(frame);
+        sha256(string(frame, "saveProofSha256")); sha256(string(frame, "requestedStateSha256"));
+        require(writer == null && !effect);
+        self = identity(object(frame, "owner"));
+        parent = identity(object(frame, "controller"));
+        require(self.equals(WorldProcessIdentities.INSTANCE.current()));
+        require(ProcessHandle.current().parent().orElseThrow().pid() == parent.getPid());
+        checkActors();
+        WorldProcessIdentity game = identity(object(frame, "gameOwner"));
+        require(!game.equals(self) && !game.equals(parent) &&
+                game.getHostHash().equals(self.getHostHash()) && game.getBootId().equals(self.getBootId()));
+        WorldManagementBinding management = new WorldManagementBinding(string(frame, "leaseId"),
+                number(frame, "epoch"), string(frame, "generation"), parent, string(frame, "drainSha256"));
+        lifecycle = new WorldRunLifecycle(Path.of(string(frame, "worldRoot")), Path.of(string(frame, "shopDirectory")),
+                UUID.fromString(string(frame, "worldUuid")), 5000);
+        WorldRunStatus expected = lifecycle.readStatus();
+        WorldRunState state = expected.getState();
+        require(expected.getSha256().equals(string(frame, "expectedStateSha256")) &&
+                state.getStateRevision() == number(frame, "expectedRevision") &&
+                state.getWorldUuid().equals(string(frame, "worldUuid")) &&
+                state.getRunUuid().equals(string(frame, "runUuid")) &&
+                state.getGeneration().equals(management.getGeneration()) &&
+                string(frame, "requestedStateSha256").equals(state.getPreviousStateSha256()) &&
+                state.getPayload() instanceof WorldRunPhase.SavedPendingExit);
+        WorldRunPhase.SavedPendingExit saved = (WorldRunPhase.SavedPendingExit) state.getPayload();
+        require(game.equals(saved.getOwner()) && management.equals(saved.getManagement()) &&
+                saved.getSaveProofSha256().equals(string(frame, "saveProofSha256")));
+        session = string(frame, "sessionId"); nonce = string(frame, "nonce");
+        checkActors();
+        effect = true;
+        WorldRunStatus ready = lifecycle.observeExit(expected);
+        Map<String, JsonElement> response = new LinkedHashMap<>(status("GAME_EXITED", id, hash, ready));
+        response.put("worldUuid", JsonElementKt.JsonPrimitive(ready.getState().getWorldUuid()));
+        response.put("candidateStateSha256", JsonElementKt.JsonPrimitive(expected.getSha256()));
+        response.put("saveProofSha256", JsonElementKt.JsonPrimitive(saved.getSaveProofSha256()));
+        return new JsonObject(response);
     }
 
     private JsonObject open(JsonObject frame, String id, String hash) {
@@ -203,6 +249,10 @@ public final class OfflineControllerMain {
                 "generation", "controller", "owner", "drainSha256", "worldRoot", "shopDirectory",
                 "worldUuid", "runUuid", "expectedStateSha256", "expectedRevision");
         require(string(frame, "command").equals("open"));
+        validateStart(frame);
+    }
+
+    private static void validateStart(JsonObject frame) {
         identifier(string(frame, "operationId")); identifier(string(frame, "sessionId"));
         identifier(string(frame, "nonce")); sha256(string(frame, "requestHash"));
         uuid(string(frame, "leaseId")); uuid(string(frame, "generation"));

@@ -6,6 +6,7 @@ import java.util.Set;
 /** native問い合わせを行わない、controller protocol専用fixture。 */
 public final class WorldProcessIdentities {
     public static final WorldProcessIdentities INSTANCE = new WorldProcessIdentities();
+    private static final long PARENT_PID = ProcessHandle.current().parent().orElseThrow().pid();
     public static boolean parentAlive = true;
     public static long actorPid = ProcessHandle.current().pid();
     public static boolean selfMatches = true;
@@ -21,7 +22,7 @@ public final class WorldProcessIdentities {
         return selfMatches ? current : identity(current.getPid() + 1);
     }
     public void requireAlive(WorldProcessIdentity identity) {
-        WorldProcessIdentity actual = identity(ProcessHandle.current().parent().orElseThrow().pid());
+        WorldProcessIdentity actual = identity(PARENT_PID);
         if (actual.getPid() == identity.getPid()) {
             parentChecks++;
             if (!parentAlive || !actual.equals(identity) || (failAfterOpen && parentChecks>2))

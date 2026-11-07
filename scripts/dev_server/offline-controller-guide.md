@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -8,7 +8,7 @@
 
 新しいsource-lockでbundleを生成すると、`adapter/offline-controller.json`と`adapter/offline-controller/`を収録します。旧bundleの検証は維持しますが、helperのない旧bundleからこの入口を呼べません。既存bundleへ後付けせず、新bundleを生成してください。DB・run-stateの保存形式変更はありません。
 
-Cは自分のData121 `openManagedOfflineWriter`／writer `assignWorker`／writer `complete`／writer `close`だけを呼びます。completeの限定入口は後述の第10スライス節を参照してください。ゲームのbeginRun/observeExit、119 Editの実行、snapshot操作は受け付けません。元sealと不変chain・Ready・DBcloseの照合はData121へ委ねます。
+CはData121 `observeExit`／`openManagedOfflineWriter`／writer `assignWorker`／writer `complete`／writer `close`を限定して呼びます。game退出の単発入口は第14スライス節、completeは第10スライス節を参照してください。ゲームのbeginRun/finishSaves、119 Editの実行、snapshot操作は受け付けません。元sealと不変chain・Ready・DBcloseの照合はData121へ委ねます。
 
 ## P側の前提
 
@@ -180,3 +180,13 @@ I/O中と局所記録前にP/C本人・元予約/閉門/drain・completion意図
 失敗後は元操作履歴・新意図・C/Wのhandle/pipe・PENDING/参照を保全し、再送/自動差替/終了再観測をしない。製品公開入口への組込み、game本人のData退出→明示期待値によるReady供給、C close/Registry CLOSED/start gateは後続。Ready期待値を自動確定しない。実OS/native/実root受入は未確認。
 
 assign/admitも操作全体を同じdeadlineの対象とし、応答受領後の本人/正本照合完了時、Registry最終照合後かつ成功結果更新前、assignのACK前に期限を検査する。期限超過時はSTOP_TIMEOUTとし、元要求・応答・意図・作用後のstateを保全する。自動再送・kill・rollbackを行わない。ProxyPipeの完成bufferを先に返す契約は維持し、操作側で最終期限を確認する。
+
+## game候補のData退出入口（第14スライス先行部分）
+
+新Cの最初のprivate frame `observe-game-exit` は単発です。`open`と同じ起動bindingの各fieldに、`gameOwner`（元MのhostHash/bootId/pid/startId）、`saveProofSha256`、`requestedStateSha256`を加えます。`expectedStateSha256`/`expectedRevision`/`runUuid`はReadyではなく元SavedPendingExit候補の明示期待値です。CはP/C本人と実parent、候補world/run/generation/revision/hash/元Requested hash、元M本人、元management全fieldとsaveproof hashを照合してから、固定Data `observeExit(expected)`を一度だけ呼びます。
+
+M本人のfinishSavesによる保存候補の公開は固定Mod597の責務です。Dataが元chain/seal・全DBclose・元Mと必要writer本人の死亡を照合し、Readyを公開します。CはDBをopenせず、保存/hash/recover算法を実装しません。PによるM正常終了/全child/全writerの列挙・実観測は呼出元の必須前提です。Dataの本人死亡検証はPの全child観測を代用しません。
+
+応答`GAME_EXITED`はoperationId/requestHash/sessionId/nonce、ReadyのstateSha256/stateRevision/worldUuid/runUuid、元candidateStateSha256/saveProofSha256を返して終了します。同じCで次frameを読みません。作用前拒否はREJECTEDと非正常終了、Data呼出開始後の不明はUNKNOWNと非正常終了です。応答喪失でも元候補/Readyを保持し、再観測・再送・writer取得・kill・rollbackへ進みません。
+
+この入口はPへ未接続です。既存Pの停止/受付/Registry経路に変更はありません。Pの終了証拠と正本予約を照合した起動・結果記録を後続で接続します。返却Readyは観測結果であり、次openの期待値の自動承認ではありません。次openは引き続き独立して明示したReady期待値を要求し、候補からhash/revisionを推測しません。Pの操作全体deadlineも後続の実接続時に適用します。実OS/native/実root受入は未確認です。
