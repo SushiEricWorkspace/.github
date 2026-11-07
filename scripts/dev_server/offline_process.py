@@ -1,8 +1,9 @@
-"""P専用の固定C/W生成と限定private要求。終了・Registry更新は扱わない。"""
+"""P専用の固定C/W生成・限定private要求とW終了観測。Registry更新は呼出元が担う。"""
 
 from copy import deepcopy
 import json
 import os
+import time
 from pathlib import Path
 import uuid
 
@@ -22,7 +23,7 @@ class OfflineProcess:
 
     Pは呼出前にobjectを保持し、verifyでlease/epoch/generation・遮断/drain・起動排他を
     継続照合する。nativeは既存transportの本人観測を使う。start後もhandleとpipeを保持し、
-    例外時は再起動・再送しない。実終了/C complete/Registry終端は別途必要。
+    例外時は再起動・再送しない。W実終了はobserve_exit、C complete/Registry終端は後続。
     """
     def __init__(self, bundle, diagnostics, *, native, verify, controller=None, process_adapter=runtime_process):
         self.bundle = Path(bundle)
@@ -43,6 +44,8 @@ class OfflineProcess:
         self.assignment_request = self.assignment_response = None
         self.admission_started = self.candidate_ready = False
         self.admission_request = self.candidate_response = None
+        self.exit_started = False
+        self.exit_response = None
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
 
@@ -69,6 +72,49 @@ class OfflineProcess:
             require(c.process.group != self.process.group and c.process.pid != self.process.pid
                     and c.process.pid not in self.process.members() and self.process.pid not in c.process.members(),
                     'PROCESS_MISMATCH', 'C/Wは独立groupで所有する必要があります')
+
+    def observe_exit(self, deadline, verify):
+        """記録済み候補の元W/全child終了を保持handle/groupで一度観測する。
+
+        旧W PIDを再解決せず、P/Cと正本を待機中も照合する。非zero終了・不明・期限切れは
+        保全して拒否し、kill/再送/pipe解放しない。Cの候補確定とwriter終了は別途必要。
+        """
+        require(self.controller is not None and self.candidate_ready and not self.exit_started,
+                'WRITER_PENDING', '元Wの記録済み候補だけを一度終了観測します')
+        self.exit_started = True
+
+        def checked():
+            verify()
+            self.controller.verify()
+            require(self.process.pid == self.identity['pid'] == self.data_identity['pid']
+                    and self.record['identity'] == self.identity
+                    and self.record['controlIdentity'] == self.data_identity
+                    and self.record['creation']['pid'] == self.process.pid
+                    and self.record['creation']['ownerGroup'] == self.process.group
+                    and self.process.group != self.controller.process.group,
+                    'PROCESS_MISMATCH', '元Wの生成記録と保持groupが一致しません')
+
+        while True:
+            checked()
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W/全child終了期限を超過しました。自動killしません')
+            code = self.process.poll()
+            require(code is None or type(code) is int and code == 0,
+                    'WRITER_PENDING', 'Wの非正常終了を保全します')
+            members = self.process.members()
+            if type(code) is int and code == 0 and members == []:
+                break
+            time.sleep(0.1)
+        checked()
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W/全child終了の照合中に期限を超過しました')
+        prepared = json.loads(self.request)
+        response = dict(status='WORKER_EXITED', operationId=prepared['operationId'],
+                        candidateResponseSha256=digest(self.candidate_response),
+                        worker=deepcopy(self.data_identity), ownerGroup=self.process.group,
+                        exitCode=code, allChildrenExited=True)
+        self.exit_response = canonical(response)
+        self.record['workerExit'] = response
+        self._record()
+        return deepcopy(response)
 
     def admit(self, deadline, verify):
         """記録済み元CのAssignedをWへ一度渡し、候補packetを照合する。

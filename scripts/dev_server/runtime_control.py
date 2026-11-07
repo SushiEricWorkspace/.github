@@ -58,6 +58,11 @@ class RuntimeControl:
                 self._offline = _OfflineOpen(self)
         return self._offline.open(token, operation_id=operation_id, revision=revision, ready=ready, deadline=deadline)
 
+    def _offline_observe_worker_exit(self, token, *, operation_id, deadline):
+        """保持W/全childの正常終了だけを記録する。候補実体確定・writer終了は後続。"""
+        require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
+        return self._offline.observe_worker_exit(token, operation_id=operation_id, deadline=deadline)
+
     def _offline_admit(self, token, *, operation_id, deadline):
         """記録済みAssignedから候補packetまで。編集完了やwriter終了は未確定。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
