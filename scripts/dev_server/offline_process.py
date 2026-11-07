@@ -48,8 +48,27 @@ class OfflineProcess:
         self.exit_response = None
         self.completion_started = self.completion_ready = self.completion_acknowledged = False
         self.completion_request = self.completion_response = None
+        self.operation_history = {}
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
+
+    def archive_completed(self, worker):
+        """正本履歴へ移した元操作のC原文とACKを保持し、次操作枠を作る。I/Oは行わない。"""
+        operation_id = json.loads(worker.request)['operationId']
+        require(self.controller is None and worker.controller is self
+                and self.assignment_acknowledged and self.completion_ready and self.completion_acknowledged
+                and json.loads(self.assignment_request)['operationId'] == operation_id
+                and json.loads(self.completion_response)['operationId'] == operation_id
+                and operation_id not in self.operation_history,
+                'WRITER_PENDING', '正本記録とACK済みの元C操作だけを履歴へ保持します')
+        names = ('assignment_started','assignment_ready','assignment_acknowledged','assignment_request','assignment_response',
+                 'completion_started','completion_ready','completion_acknowledged','completion_request','completion_response')
+        self.operation_history[operation_id] = {name:getattr(self, name) for name in names}
+        self.operation_history[operation_id]['record'] = deepcopy(self.record)
+        for name in names:
+            setattr(self, name, None if name.endswith(('_request','_response')) else False)
+        for name in ('assignedResponseSha256','assignedAcknowledgedSha256','completionResponseSha256','completionAcknowledgedSha256'):
+            self.record.pop(name, None)
 
     def _record(self):
         write_json(self.diagnostics / f'creation-{self.record_number:02d}.json', self.record)
@@ -192,6 +211,7 @@ class OfflineProcess:
         def sending():
             verify()
             self.verify()
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W admission送信の期限を超過しました')
 
         def receiving():
             verify()
@@ -199,6 +219,7 @@ class OfflineProcess:
             code = self.process.poll()
             require(code is None or type(code) is int and code == 0,
                     'WRITER_PENDING', 'Wの非正常終了を保全します')
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W候補応答照合の期限を超過しました')
 
         sending()
         prepared, assigned = json.loads(self.request), json.loads(c.assignment_response)
@@ -226,7 +247,7 @@ class OfflineProcess:
         return deepcopy(response)
 
     def assign(self, worker, deadline, verify):
-        """記録済みPREPAREDの元Wを、同Cの初回Assignedへ一度だけ登録する。
+        """記録済みPREPAREDの元Wを、同Cの現在の操作枠へ一度だけ登録する。
 
         verifyはPの正本assignment意図を再照合する。本文/本人/元Idleは保持Wから取得し、
         任意frameを受け付けない。応答は編集成功ではなく、失敗後も再送しない。
@@ -239,6 +260,7 @@ class OfflineProcess:
         def checked():
             verify()
             worker.verify()
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C Assigned登録の期限を超過しました')
 
         checked()
         prepared = json.loads(worker.request)
@@ -264,13 +286,14 @@ class OfflineProcess:
         self.assignment_ready = True
         return deepcopy(response)
 
-    def acknowledge_assignment(self, response_sha256, worker, verify):
+    def acknowledge_assignment(self, response_sha256, worker, verify, *, deadline):
         """ASSIGNEDの正本記録後だけC pipeを解放する。W admissionや完了は行わない。"""
         require(self.assignment_ready and not self.assignment_acknowledged
                 and digest(self.assignment_response) == response_sha256,
                 'STALE_OPERATION', '記録済みASSIGNED応答が一致しません')
         verify()
         worker.verify()
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C Assigned記録後に期限を超過しました')
         self.record['assignedAcknowledgedSha256'] = response_sha256
         self._record()
         self.pipe.acknowledged()

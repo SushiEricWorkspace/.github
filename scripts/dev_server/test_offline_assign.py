@@ -90,9 +90,9 @@ class OfflineAssignTests(unittest.TestCase):
         saved_before = self.saved()
         self.before_assign = lambda:self.assertEqual({'operationId':self.f.operation},self.saved()['assignment'])
         original = self.c.acknowledge_assignment
-        def ack(value,worker,verify):
+        def ack(value,worker,verify,*,deadline):
             self.assertEqual(digest(self.c.assignment_response),self.saved()['assignment']['responseSha256'])
-            return original(value,worker,verify)
+            return original(value,worker,verify,deadline=deadline)
         with patch.object(self.c,'acknowledge_assignment',ack): result = self.assign()
         self.assertEqual(('ASSIGNED',2,processes.RUN),(result['status'],result['stateRevision'],result['runUuid']))
         self.assertEqual((1,'Assigned2'),(self.assigns,self.phase))
@@ -290,19 +290,19 @@ class AssignmentAcknowledgementTests(unittest.TestCase):
 
     def test_real_buffer_advances_after_verified_record_and_never_twice(self):
         verify=Mock()
-        self.c.acknowledge_assignment(digest(self.c.assignment_response),self.worker,verify)
+        self.c.acknowledge_assignment(digest(self.c.assignment_response),self.worker,verify,deadline=time.monotonic()+1)
         verify.assert_called_once()
         self.c._record.assert_called_once()
         self.assertIsNone(self.pipe.outgoing)
         self.assertFalse(self.pipe.incoming)
         self.pipe.send(dict(command='next'),time.monotonic()+1,lambda:None)
-        with self.assertRaises(RegistryError): self.c.acknowledge_assignment(digest(self.c.assignment_response),self.worker,verify)
+        with self.assertRaises(RegistryError): self.c.acknowledge_assignment(digest(self.c.assignment_response),self.worker,verify,deadline=time.monotonic()+1)
         self.assertIsNotNone(self.pipe.outgoing)
 
     def test_wrong_hash_and_record_failure_retain_real_buffer(self):
         before=(self.pipe.outgoing,bytes(self.pipe.incoming))
-        with self.assertRaises(RegistryError): self.c.acknowledge_assignment('e'*64,self.worker,lambda:None)
+        with self.assertRaises(RegistryError): self.c.acknowledge_assignment('e'*64,self.worker,lambda:None,deadline=time.monotonic()+1)
         self.c._record.side_effect=OSError('journal')
-        with self.assertRaises(OSError): self.c.acknowledge_assignment(digest(self.c.assignment_response),self.worker,lambda:None)
+        with self.assertRaises(OSError): self.c.acknowledge_assignment(digest(self.c.assignment_response),self.worker,lambda:None,deadline=time.monotonic()+1)
         self.assertFalse(self.c.assignment_acknowledged)
         self.assertEqual(before,(self.pipe.outgoing,bytes(self.pipe.incoming)))

@@ -140,10 +140,10 @@ class OfflineNextPrepareTests(unittest.TestCase):
         self.assertEqual(self.original,self.saved())
         self.assertEqual(2,len(self.f.p.adapter.processes))
 
-    def test_late_old_stages_and_next_assign_do_not_send_frames(self):
+    def test_late_old_stages_do_not_send_frames(self):
         self.prepare()
         before = [len(pipe.sent) for pipe in self.f.p.pipes]
-        for name,op in (('_offline_assign',NEXT),('_offline_assign',self.f.operation),('_offline_admit',self.f.operation),
+        for name,op in (('_offline_assign',self.f.operation),('_offline_admit',self.f.operation),
                         ('_offline_observe_worker_exit',self.f.operation),('_offline_complete',self.f.operation)):
             with self.subTest(stage=name,operation=op):
                 with self.assertRaises(RegistryError): getattr(self.runtime,name)(self.token,operation_id=op,deadline=time.monotonic()+10)
