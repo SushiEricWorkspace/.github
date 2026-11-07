@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -189,4 +189,14 @@ M本人のfinishSavesによる保存候補の公開は固定Mod597の責務で�
 
 応答`GAME_EXITED`はoperationId/requestHash/sessionId/nonce、ReadyのstateSha256/stateRevision/worldUuid/runUuid、元candidateStateSha256/saveProofSha256を返して終了します。同じCで次frameを読みません。作用前拒否はREJECTEDと非正常終了、Data呼出開始後の不明はUNKNOWNと非正常終了です。応答喪失でも元候補/Readyを保持し、再観測・再送・writer取得・kill・rollbackへ進みません。
 
-この入口はPへ未接続です。既存Pの停止/受付/Registry経路に変更はありません。Pの終了証拠と正本予約を照合した起動・結果記録を後続で接続します。返却Readyは観測結果であり、次openの期待値の自動承認ではありません。次openは引き続き独立して明示したReady期待値を要求し、候補からhash/revisionを推測しません。Pの操作全体deadlineも後続の実接続時に適用します。実OS/native/実root受入は未確認です。
+P内部の単発接続部品は第15スライス節を参照してください。既存Pの停止/受付/Registry経路への組込みは後続です。返却Readyは観測結果であり、次openの期待値の自動承認ではありません。次openは引き続き独立して明示したReady期待値を要求し、候補からhash/revisionを推測しません。単発接続のdeadlineは第15スライスで検査し、Registry最終結果更新までの接続は後続です。実OS/native/実root受入は未確認です。
+
+## game退出観測CのP内部部品（第15スライス先行部分）
+
+未使用の`OfflineProcess.observe_game_exit(frame, game_process=..., game_identity=..., game_group=..., deadline=...)`は、元Mの生成時native identityと保持handle/groupから正常exit・全child不在を確認し、固定Cの第14スライス入口へ同候補bindingを一度だけ送ります。呼出元はこのobjectと元Mを作用前から保持し、constructorの必須`verify` callbackでlease/epoch/generation・正本予約・BLOCKED/accepted drain・全writer終了・認証済Requested/COMPLETIONと候補原本の対応を継続照合する必要があります。callbackだけを用意したこの部品を、製品停止経路への組込み済みとは扱いません。
+
+`frame`は元SavedPendingExitの明示hash/revision/world/run、元M全identity、saveproof/Requested hash、元managementとrootを含み、C/P本人欄とprivate session/nonceだけを生成時に補います。GAME_EXITEDの厳密field集合・要求binding・元候補/proof参照・同world/runと候補revision+1・Ready hash形式を照合します。Ready hashは実観測C本人を含むData退出証拠に依存するため、起動前の期待hashを要求しません。返却Readyは局所観測値であり、次openの期待値として自動採用しません。次openには観測後の独立した明示Ready期待値を別途供給する必要があります。Data保存/hash/退出算法はC本人APIへ委譲し、PはDB/119操作をしません。
+
+応答送信直後のC正常exitを受信中も許容し、Cと全childの終了を保持handle/groupで確認します。生存照会の結果は生成snapshotへ照合します。照会中に本人が不在になった場合だけ、同じ保持handleを再pollし、正常exit0と固定bindingを確認できれば終了済み経路へ移ります。取得できた本人情報の不一致、非zero・不明終了は拒否します。終了確認後の旧PID再照会・別process採用・再attachは行いません。既存writer用verifyの生存必須契約は変更しません。観測Cは送信時点の独立した要求とnative生成snapshotへ固定し、PID/start/host/bootを応答後・局所記録完了後も照合します。操作全体の同deadlineをOS観測後、対応応答照合後、局所証拠書込み前後まで検査します。失敗/期限超過時は元要求・応答・生成記録と作用後のReadyを保全し、再入口・既存startへの切替・再送・kill・rollbackをしません。書込み後に期限を跨いだ場合は局所観測証拠を保全しますが、受理済み結果を返しません。
+
+成功時もpipe buffer/handleを保持し、`game_exit_result`と戻り値は局所観測結果です。Registry確定・writer CLOSED・次openの許可を表しません。製品呼出元の正本予約/台帳/元Mhandle供給、最終transactionでの再照合・期限検査・結果記録、明示Ready供給を後続で接続します。稼働RuntimeControl/ManagedRuntime/Registryを変更していません。実OS/native/実root受入は未確認です。
