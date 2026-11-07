@@ -1,4 +1,4 @@
-"""停止済み管理runの正本予約とC OPEN/W PREPARED/Assigned。編集・終了確定は後続。"""
+"""停止済み管理runの正本予約とC OPEN/W PREPARED/Assignedと候補packet。実終了・確定は後続。"""
 
 from copy import deepcopy
 import json
@@ -103,6 +103,46 @@ class _OfflineOpen:
                 and frame['expectedRevision'] == response['stateRevision'] and frame['runUuid'] == response['runUuid'],
                 'STALE_OPERATION', '元PREPAREDとCのIdle/管理bindingが一致しません')
         return opened, saved
+
+    def _assigned(self, connection, token, controller, worker, operation_id):
+        opened, saved = self._prepared(connection, token, controller, worker, operation_id)
+        require(controller.assignment_ready and controller.assignment_acknowledged
+                and saved.get('assignment') == {'operationId':operation_id,
+                                               'responseSha256':digest(controller.assignment_response)},
+                'STALE_OPERATION', '元Assignedの応答と正本記録が一致しません')
+        return opened, saved
+
+    def admit(self, token, *, operation_id, deadline):
+        """保持Assignedを元Wへadmitし候補packetを記録する。実終了/receipt確定は行わない。"""
+        fields(token, TOKEN)
+        _canonical_uuid(operation_id)
+        token = deepcopy(token)
+        controller, worker = self.controllers.get(token['instanceId']), self.workers.get(token['instanceId'])
+        require(controller is not None and worker is not None, 'WRITER_PENDING', '保持した元C/Wが必要です')
+        admission = {'operationId':operation_id}
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, saved = self._assigned(connection, token, controller, worker, operation_id)
+                require('admission' not in saved, 'WRITER_PENDING', '元admission意図と候補を保全します')
+                saved['admission'] = admission
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(saved),opened['operationId']))
+
+            def verify():
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    _, current = self._assigned(connection, token, controller, worker, operation_id)
+                    require(current.get('admission') == admission, 'STALE_OPERATION', '元admission意図が変更されました')
+
+            response = worker.admit(deadline, verify)
+            verify()
+            controller.verify()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                _, current = self._assigned(connection, token, controller, worker, operation_id)
+                require(current.get('admission') == admission, 'STALE_OPERATION', '元admission意図が変更されました')
+                current['admission'] = dict(admission, candidateResponseSha256=digest(canonical(response)))
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(current),opened['operationId']))
+            return response
 
     def assign(self, token, *, operation_id, deadline):
         """保持WのPREPARED原文を正本照合しC本人へ登録する。本文差替・再登録は行わない。"""

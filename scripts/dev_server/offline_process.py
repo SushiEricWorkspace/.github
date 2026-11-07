@@ -41,6 +41,8 @@ class OfflineProcess:
         self.startup_acknowledged = False
         self.assignment_started = self.assignment_ready = self.assignment_acknowledged = False
         self.assignment_request = self.assignment_response = None
+        self.admission_started = self.candidate_ready = False
+        self.admission_request = self.candidate_response = None
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
 
@@ -67,6 +69,53 @@ class OfflineProcess:
             require(c.process.group != self.process.group and c.process.pid != self.process.pid
                     and c.process.pid not in self.process.members() and self.process.pid not in c.process.members(),
                     'PROCESS_MISMATCH', 'C/Wは独立groupで所有する必要があります')
+
+    def admit(self, deadline, verify):
+        """記録済み元CのAssignedをWへ一度渡し、候補packetを照合する。
+
+        本文は元prepareを使う。Wは候補送信直後にexitできるため、受信中はP/Cと正本を
+        検証し、旧W PIDへ再attachしない。実終了/全child・C completeは別途必要。
+        """
+        c = self.controller
+        require(c is not None and self.startup_acknowledged and c.assignment_acknowledged
+                and not self.admission_started, 'WRITER_PENDING', '記録済みの元Assignedだけを一度admitします')
+        self.admission_started = True
+
+        def sending():
+            verify()
+            self.verify()
+
+        def receiving():
+            verify()
+            c.verify()
+            code = self.process.poll()
+            require(code is None or type(code) is int and code == 0,
+                    'WRITER_PENDING', 'Wの非正常終了を保全します')
+
+        sending()
+        prepared, assigned = json.loads(self.request), json.loads(c.assignment_response)
+        frame = {k:prepared[k] for k in ('operationId','requestHash','sessionId','nonce')}
+        frame.update(command='admit', preparedStateSha256=prepared['expectedStateSha256'],
+                     expectedStateSha256=assigned['stateSha256'], expectedRevision=assigned['stateRevision'],
+                     runUuid=assigned['runUuid'], editRequestSha256=assigned['editRequestSha256'])
+        self.admission_request = canonical(frame)
+        self.pipe.send(frame, deadline, sending)
+        response = self.pipe.receive(deadline, receiving)
+        self.candidate_response = canonical(response)
+        require(response.keys() == {'status','operationId','requestHash','sessionId','nonce','stateSha256',
+                                    'receiptSha256','worldUuid','runUuid','stateRevision','editRequestSha256'}
+                and response['status'] == 'CANDIDATE'
+                and all(response[k] == frame[k] for k in ('operationId','requestHash','sessionId','nonce','editRequestSha256'))
+                and response['worldUuid'] == prepared['worldUuid'] and response['runUuid'] == frame['operationId']
+                and type(response['stateRevision']) is int and response['stateRevision'] == assigned['stateRevision'] + 2,
+                'API_PROTOCOL', 'CANDIDATEのbindingと遷移が一致しません')
+        _hash(response['stateSha256'])
+        _hash(response['receiptSha256'])
+        receiving()
+        self.record['candidateResponseSha256'] = digest(self.candidate_response)
+        self._record()
+        self.candidate_ready = True
+        return deepcopy(response)
 
     def assign(self, worker, deadline, verify):
         """記録済みPREPAREDの元Wを、同Cの初回Assignedへ一度だけ登録する。
