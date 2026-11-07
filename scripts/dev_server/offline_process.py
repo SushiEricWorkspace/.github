@@ -12,9 +12,9 @@ from .build_inputs import canonical, digest
 from .database_proxy_pipe import ProxyPipe
 from .local_ipc import MAX_MESSAGE, encode, make_private, plain_path
 from .mod_control_runtime import process_identity
-from .mod_control_wire import _hash, _canonical_uuid
+from .mod_control_wire import _hash, _canonical_uuid, _identity
 from .offline_controller_bundle import offline_controller_command, offline_worker_command
-from .registry import require
+from .registry import RegistryError, require
 from .runtime_control import write_json
 
 
@@ -48,6 +48,8 @@ class OfflineProcess:
         self.exit_response = None
         self.completion_started = self.completion_ready = self.completion_acknowledged = False
         self.completion_request = self.completion_response = None
+        self.game_exit_started = False
+        self.game_exit_response = self.game_exit_result = None
         self.operation_history = {}
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
@@ -312,17 +314,12 @@ class OfflineProcess:
         self.pipe.acknowledged()
         self.startup_acknowledged = True
 
-    def start(self, frame, deadline):
-        """本人欄・command・session/nonceをPが付け、C OPEN又はW PREPAREDを一度照合する。
-
-        frameは既存Java契約の残りの項目。型付きrequest本文は変更しない。
-        戻り値は照合済み起動応答のコピーであり、編集成功・writer終了の証拠ではない。
-        """
+    def _launch(self, frame, command, verify):
         require(not self.started, 'WRITER_PENDING', '同じhelperを再生成しません')
         self.started = True
         require(not set(frame) & {'command', 'controller', 'owner', 'worker', 'sessionId', 'nonce'},
                 'INVALID_INPUT', '起動本人とprivate bindingはPが指定します')
-        self.verify_owner()
+        verify()
         if self.controller is not None:
             require(self.controller.controller is None and self.controller.ready,
                     'WRITER_PENDING', 'WにはOPEN照合済みの元Cが必要です')
@@ -330,8 +327,8 @@ class OfflineProcess:
         require(not any(os.environ.get(name) for name in
                         ('JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS', 'CLASSPATH')),
                 'UNREPRODUCIBLE_ENVIRONMENT', '暗黙のJVM入力を使用できません')
-        command = offline_controller_command if self.controller is None else offline_worker_command
-        arguments = command(self.bundle)
+        factory = offline_controller_command if self.controller is None else offline_worker_command
+        arguments = factory(self.bundle)
         self.parent = deepcopy(self.adapter.identity(os.getpid()))
         require(self.parent is not None, 'PROCESS_MISMATCH', 'P本人を取得できません')
         self.parent_data = process_identity(self.native, self.adapter, os.getpid())
@@ -363,6 +360,8 @@ class OfflineProcess:
             self.record.update(identity=self.identity, controlIdentity=self.data_identity)
             self._record()
 
+        if command == 'observe-game-exit':
+            verify()
         with (self.diagnostics / 'stderr.log').open('xb') as log:
             make_private(self.diagnostics / 'stderr.log')
             self.process.start(arguments, self.bundle, log, 'offline-' + role + '-' + uuid.uuid4().hex, created,
@@ -372,13 +371,19 @@ class OfflineProcess:
         self._record()
         self.verify()
         request = deepcopy(frame)
-        request.update(command='open' if self.controller is None else 'prepare', controller=self.parent_data,
+        request.update(command=command, controller=self.parent_data,
                        owner=self.data_identity if self.controller is None else self.controller.data_identity,
                        sessionId=self.session, nonce=self.nonce)
         if self.controller is not None:
             request['worker'] = self.data_identity
         require(len(encode(request)) + 4 <= MAX_MESSAGE, 'MESSAGE_TOO_LARGE', '起動frameが上限外です')
         self.request = canonical(request)
+        return request
+
+    def start(self, frame, deadline):
+        """C OPEN又はW PREPAREDを一度照合する。型付き要求本文は変更しない。"""
+        require(not self.game_exit_started, 'WRITER_PENDING', '元game退出観測を保全します')
+        request = self._launch(frame, 'open' if self.controller is None else 'prepare', self.verify_owner)
         self.pipe.send(request, deadline, self.verify)
         response = self.pipe.receive(deadline, self.verify)
         self.response = canonical(response)
@@ -401,3 +406,124 @@ class OfflineProcess:
         self._record()
         self.ready = True
         return deepcopy(response)
+
+    def observe_game_exit(self, frame, *, game_process, game_identity, game_group, deadline):
+        """元Mと単発観測Cの正常exit/全child不在から同候補のReadyを局所観測する。
+
+        呼出元はこのobjectと元Mの生成handle/identity/groupを保持し、verify callbackで
+        正本予約・遮断/drain・全writer終了・認証済Requested/COMPLETION・候補原本を
+        継続照合する。返却Readyは観測値であり、次openの期待値を自動承認しない。
+        Registryへの記録/次openは行わず、失敗時は資源と原文を保持して再入口を拒否する。
+        """
+        require(self.controller is None and not self.started and not self.game_exit_started,
+                'WRITER_PENDING', '未使用Cで元game退出を一度だけ観測します')
+        self.game_exit_started = True
+        frame, game_identity = deepcopy(frame), deepcopy(game_identity)
+        game = frame['gameOwner']
+        _identity(game)
+        require(game_process.pid == game_identity['pid'] == game['pid']
+                and game_identity['startId'] == game['startId'] and game_group is not None,
+                'PROCESS_MISMATCH', '元Mの生成本人が一致しません')
+        parent = deepcopy(self.adapter.identity(os.getpid()))
+        parent_data = process_identity(self.native, self.adapter, os.getpid())
+        require(game != parent_data and all(game[k] == parent_data[k] for k in ('hostHash','bootId')),
+                'PROCESS_MISMATCH', '元MとPのhost/boot/本人が一致しません')
+        self.game_exit_frame = frame
+        self.game_exit_process = game_process
+        self.game_exit_identity = game_identity
+        self.game_exit_group = game_group
+
+        def checked():
+            self.verify_owner()
+            runtime_process.require_identity(parent, self.adapter.identity(os.getpid()))
+            require(process_identity(self.native, self.adapter, os.getpid()) == parent_data,
+                    'PROCESS_MISMATCH', 'Pのhost/boot/startが一致しません')
+            require(game_process.pid == game['pid'] and game_process.group == game_group,
+                    'PROCESS_MISMATCH', '元Mの保持handle/groupが一致しません')
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'game退出観測の期限を超過しました')
+
+        def normal_exit(process):
+            code = process.poll()
+            require(type(code) is int and code == 0,
+                    'WRITER_PENDING', '本人不在の元handleに正常終了証拠がありません')
+            return code
+
+        def observe_process(process, expected_identity, expected_data):
+            code = process.poll()
+            require(code is None or type(code) is int and code == 0,
+                    'WRITER_PENDING', '元processの非正常終了を保全します')
+            if code is not None:
+                return code
+            actual = self.adapter.identity(process.pid)
+            if actual is None:
+                return normal_exit(process)
+            runtime_process.require_identity(expected_identity, actual)
+            try:
+                observed_data = process_identity(self.native, self.adapter, process.pid)
+            except RegistryError as error:
+                if error.code != 'PROCESS_MISMATCH':
+                    raise
+                return normal_exit(process)
+            require(observed_data == expected_data,
+                    'PROCESS_MISMATCH', '生存照会の元process本人が一致しません')
+            members = process.members()
+            require(type(members) is list, 'PROCESS_MISMATCH', '所有groupの観測が不明です')
+            if process.pid not in members:
+                return normal_exit(process)
+            return None
+
+        def exited(process, expected_identity, expected_data):
+            while True:
+                checked()
+                code = observe_process(process, expected_identity, expected_data)
+                members = process.members()
+                checked()
+                if type(code) is int and code == 0 and members == []:
+                    return
+                time.sleep(0.1)
+
+        exited(game_process, game_identity, game)
+        request = deepcopy(self._launch(frame, 'observe-game-exit', checked))
+        identity = deepcopy(self.identity)
+
+        def observing():
+            checked()
+            observe_process(self.process, identity, request['owner'])
+            checked()
+            require(self.process.pid == identity['pid'] == self.data_identity['pid']
+                    and self.identity == identity and self.record['identity'] == identity
+                    and self.record['controlIdentity'] == self.data_identity
+                    and self.data_identity == request['owner']
+                    and self.record['creation']['pid'] == self.process.pid
+                    and self.record['creation']['ownerGroup'] == self.process.group
+                    and self.process.group != game_group,
+                    'PROCESS_MISMATCH', '観測Cの保持本人/groupが一致しません')
+
+        observing()
+        self.pipe.send(request, deadline, observing)
+        response = self.pipe.receive(deadline, observing)
+        self.game_exit_response = canonical(response)
+        require(response.keys() == {'status','operationId','requestHash','sessionId','nonce','stateSha256',
+                                    'stateRevision','worldUuid','runUuid','candidateStateSha256','saveProofSha256'}
+                and response['status'] == 'GAME_EXITED'
+                and all(response[k] == request[k] for k in ('operationId','requestHash','sessionId','nonce','saveProofSha256'))
+                and response['candidateStateSha256'] == request['expectedStateSha256']
+                and all(response[k] == request[k] for k in ('worldUuid','runUuid'))
+                and type(response['stateRevision']) is int
+                and response['stateRevision'] == request['expectedRevision'] + 1,
+                'API_PROTOCOL', '同game候補に対応するReady応答が必要です')
+        _hash(response['stateSha256'])
+        ready = {k:response[k] for k in ('worldUuid','runUuid','stateSha256','stateRevision')}
+        observing()
+        exited(self.process, identity, request['owner'])
+        observing()
+        result = dict(status='GAME_EXIT_OBSERVED', operationId=request['operationId'],
+                      requestSha256=digest(self.request), responseSha256=digest(self.game_exit_response),
+                      gameOwner=deepcopy(request['gameOwner']), gameGroup=game_group, observer=deepcopy(self.data_identity),
+                      observerGroup=self.process.group, exitCode=0, allChildrenExited=True, ready=ready)
+        observing()
+        self.record['gameExit'] = result
+        self._record()
+        observing()
+        self.game_exit_result = canonical(result)
+        return deepcopy(result)
