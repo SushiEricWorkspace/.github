@@ -1,4 +1,4 @@
-"""停止済み管理runの正本予約・候補packet・W終了観測。Cの候補確定は後続。"""
+"""停止済み管理runの正本予約・候補・元W終了証拠とC本人確定を接続する。"""
 
 from copy import deepcopy
 import json
@@ -120,6 +120,66 @@ class _OfflineOpen:
                 and worker.record.get('candidateResponseSha256') == digest(worker.candidate_response),
                 'STALE_OPERATION', '元候補packetのローカル記録と正本が一致しません')
         return opened, saved
+
+    def _exited(self, connection, token, controller, worker, operation_id):
+        opened, saved = self._candidate(connection, token, controller, worker, operation_id)
+        require(worker.exit_started and worker.exit_response is not None,
+                'WRITER_PENDING', '元Wの正常終了証拠が必要です')
+        exited = json.loads(worker.exit_response)
+        require(saved.get('workerExit') == {'operationId':operation_id,'responseSha256':digest(worker.exit_response)}
+                and worker.record.get('workerExit') == exited
+                and exited.keys() == {'status','operationId','candidateResponseSha256','worker','ownerGroup','exitCode','allChildrenExited'}
+                and exited['status'] == 'WORKER_EXITED' and exited['operationId'] == operation_id
+                and exited['candidateResponseSha256'] == digest(worker.candidate_response)
+                and type(exited['exitCode']) is int and exited['exitCode'] == 0 and exited['allChildrenExited'] is True
+                and exited['worker'] == worker.data_identity == json.loads(controller.assignment_request)['worker']
+                and worker.record['controlIdentity'] == worker.data_identity and worker.record['identity'] == worker.identity
+                and worker.process.pid == worker.identity['pid'] == worker.data_identity['pid'] == worker.record['creation']['pid']
+                and exited['ownerGroup'] == worker.process.group == worker.record['creation']['ownerGroup']
+                and worker.process.group != controller.process.group,
+                'STALE_OPERATION', '元W/全child終了証拠と同候補・生成binding・正本が一致しません')
+        return opened, saved
+
+    def complete(self, token, *, operation_id, deadline):
+        """記録済み元W終了証拠からC本人completeを接続し、応答hashを正本へ記録する。
+
+        例外後も元意図・C/W・予約を保全し、再送しない。戻り値はData確定応答であり、
+        writer CLOSEDや次W生成の許可ではない。要求/応答本文はRegistryへ保存しない。
+        """
+        fields(token, TOKEN)
+        _canonical_uuid(operation_id)
+        token = deepcopy(token)
+        controller, worker = self.controllers.get(token['instanceId']), self.workers.get(token['instanceId'])
+        require(controller is not None and worker is not None, 'WRITER_PENDING', '保持した元C/Wが必要です')
+        completion = {'operationId':operation_id}
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, saved = self._exited(connection, token, controller, worker, operation_id)
+                require('completion' not in saved, 'WRITER_PENDING', '元completion意図と結果を保全します')
+                completion['workerExitSha256'] = digest(worker.exit_response)
+                saved['completion'] = completion
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(saved),opened['operationId']))
+
+            def verify():
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    _, current = self._exited(connection, token, controller, worker, operation_id)
+                    require(current.get('completion') == completion, 'STALE_OPERATION', '元completion意図が変更されました')
+
+            response = controller.complete(worker, deadline, verify)
+            verify()
+            controller.verify()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                _, current = self._exited(connection, token, controller, worker, operation_id)
+                require(current.get('completion') == completion, 'STALE_OPERATION', '元completion意図が変更されました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C候補確定の正本照合中に期限を超過しました')
+                recorded = dict(completion, responseSha256=digest(canonical(response)))
+                current['completion'] = recorded
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(current),opened['operationId']))
+            completion = recorded
+            controller.acknowledge_completion(completion['responseSha256'], deadline, verify)
+            return response
 
     def observe_worker_exit(self, token, *, operation_id, deadline):
         """記録済み候補のW/全child正常終了を正本へ記録する。C complete/結果終端は行わない。"""
