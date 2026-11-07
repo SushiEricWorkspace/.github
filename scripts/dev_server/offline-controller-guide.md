@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -161,4 +161,14 @@ P内部の`RuntimeControl._offline_complete(token, operation_id=..., deadline=..
 
 I/O中と局所記録前にP/C本人・元予約/閉門/drain・completion意図を照合し、同じdeadlineを検査する。Registry最終transactionでも元証拠/意図を再照合した後・結果更新前に期限を検査する。対応応答hashを正本へ記録してからだけ`OfflineProcess.acknowledge_completion`がローカル記録後に同C pipeを解放する。Registryにはhash/参照だけを残し、要求・応答本文やsession/nonceを残さない。Wの候補bufferと保持C/W、offline-open PENDING・pending・artifact参照は維持する。
 
-部分送信・候補不一致・応答喪失・記録/ack失敗・期限切れは元意図と証拠を保全し、自動complete再送・再生成・kill・close/recoverを行わない。Cの成功応答だけではManager公開結果・Ready・Registry CLOSEDへ進めない。今回の戻り値はP内部の照合/記録済みData結果であり、公開受付・次W取得・同接続連続操作、game退出→Ready、C close/実終了/CLOSEDは後続。Ready期待値を自動確定しない。実Registry競合・合成OS/IPCと固定Java vectorsの検証を、実OS/native/実root/receipt実体受入へ拡張しない。
+部分送信・候補不一致・応答喪失・記録/ack失敗・期限切れは元意図と証拠を保全し、自動complete再送・再生成・kill・close/recoverを行わない。Cの成功応答だけではManager公開結果・Ready・Registry CLOSEDへ進めない。今回の戻り値はP内部の照合/記録済みData結果である。次W待機は第12スライスを参照する。公開受付・次Assigned以降の同接続連続操作、game退出→Ready、C close/実終了/CLOSEDは後続。Ready期待値を自動確定しない。実Registry競合・合成OS/IPCと固定Java vectorsの検証を、実OS/native/実root/receipt実体受入へ拡張しない。
+
+## 記録済みIdleから次W待機（第12スライス先行部分）
+
+同じ`RuntimeControl._offline_prepare`は、前W/全child正常終了と同候補のC completeについて、元局所/Registryの応答hashとACKまで一致した場合、次の独立WをPREPAREDへ進める。最新Idleのhash/revision/runは照合・記録済みCOMPLETED原文を使い、初回OPENへ戻さない。元C/session/nonceとlease/epoch/generation/root/worldは維持し、Cの再open・起動ACK再送をしない。型付き非空要求は変更せず次Wへ渡す。PREPAREDはDB未openの待機である。
+
+短transaction内で旧worker/assignment/admission/workerExit/completionのhash参照を`history`へ移し、次worker意図を記録する。Pは旧Wのhandle/pipe/要求・応答をメモリ履歴へ保持し、再解決・終了再観測・kill・解放しない。Registryの履歴には本文・session/nonceを保存しない。I/O前と最終結果transactionで元予約・閉門/drain・次worker意図・正本/メモリ履歴を再照合する。次WのPREPAREDを正本記録してからだけ次W pipeを解放する。PENDING/pending/参照は維持する。
+
+元操作ID・過去history・既存operation表とのID再利用、未完了W、未記録/未ACK complete、旧PREPARED応答、履歴/本人不一致、期限切れを拒否する。部分生成/送信、応答喪失、局所/正本記録/ACK失敗後も旧証拠と新意図・元C/旧W/新W資源を保全し、再送・再生成・自動close/recoverをしない。次W生成前と最終Registry照合後/更新前にも同deadlineを確認する。
+
+今回の接続は次W待機まで。Cはまだ一操作分のAssigned/complete保持であり、次Assigned以降は後続。旧操作や旧応答で次段階へ進めない。複数編集の完了・game退出→Data Ready供給、C close/実終了/Registry CLOSED/start gate・公開受付は後続で、Ready期待値を自動確定しない。合成OS/IPC・実Registryと固定Java vectorsの検証を実OS/native/実root受入へ拡張しない。
