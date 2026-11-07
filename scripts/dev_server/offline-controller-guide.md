@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -8,7 +8,7 @@
 
 新しいsource-lockでbundleを生成すると、`adapter/offline-controller.json`と`adapter/offline-controller/`を収録します。旧bundleの検証は維持しますが、helperのない旧bundleからこの入口を呼べません。既存bundleへ後付けせず、新bundleを生成してください。DB・run-stateの保存形式変更はありません。
 
-Cは自分のData121 `openManagedOfflineWriter`／writer `assignWorker`／writer `close`だけを呼びます。ゲームのbeginRun/observeExit、119 Editの実行、receiptのcomplete、snapshot操作は受け付けません。元sealと不変chain・Ready・DBcloseの照合はData121へ委ねます。
+Cは自分のData121 `openManagedOfflineWriter`／writer `assignWorker`／writer `complete`／writer `close`だけを呼びます。completeの限定入口は後述の第10スライス節を参照してください。ゲームのbeginRun/observeExit、119 Editの実行、snapshot操作は受け付けません。元sealと不変chain・Ready・DBcloseの照合はData121へ委ねます。
 
 ## P側の前提
 
@@ -36,7 +36,7 @@ openは次のfieldだけを持ちます。
 
 応答`OPEN`は同じoperationId/requestHashとsessionId/nonceに加え、Data owner取得後の`stateSha256, stateRevision, runUuid`を返します。Data自身がwriter UUIDを発行するため、このrunUuidはopen前と異なります。
 
-closeは`command=close, operationId, requestHash, sessionId, nonce, openOperationId, expectedStateSha256, expectedRevision`だけを持ちます。openOperationIdは元open ID、期待stateは直前OPEN応答と一致させます。closeのoperationIdはopenと別にします。C本人close後の`OWNER_CLOSED`は新Readyのhash/revision/runUuidを返します。
+closeは`command=close, operationId, requestHash, sessionId, nonce, openOperationId, expectedStateSha256, expectedRevision`だけを持ちます。openOperationIdは元open ID、期待stateは照合・正本記録済みの最新Idle（初回OPENまたはCOMPLETED応答）と一致させます。closeのoperationIdはopenと別にします。C本人close後の`OWNER_CLOSED`は新Readyのhash/revision/runUuidを返します。
 
 `OWNER_CLOSED`はDB側のowner終了だけを表します。PがC/全childの実exitを観測し、Registry writer CLOSEDを確定するまでMod startを許可してはいけません。Data ReadyだけでCLOSEDを推測しません。
 
@@ -58,7 +58,7 @@ root・generation・leaseはopen時のbindingから引き継ぎ、assignでの�
 
 `ASSIGNED`は従来status応答と同じ`operationId, requestHash, sessionId, nonce, stateSha256, stateRevision, runUuid`、およびDataが公開した`OfflineAssigned.requestSha256`を`editRequestSha256`として返します。IPCの`requestHash`と、期限を除外し順序を正規化するDataの商品操作hashを混同しないでください。writerのsession/runUuidは維持し、revision/hashだけが次へ進みます。
 
-一度登録するとこの入口では再登録・worker差替・recoverできません。Assignedのままcloseを要求してもDataが拒否し、ownerを解放しません。Wのadmission・Edit・候補公開は限定入口として追加しています。W/全child終了のP観測は後述の第9スライスを参照してください。C completeは後続のため、現時点のhelperだけではAssignedを完了できません。製品のwriter受付からの呼出元は追加しておらず、通常利用へ公開しません。
+未完了Assignedの再登録・worker差替・recoverはこの入口ではできません。Assignedのままcloseを要求してもDataが拒否し、ownerを解放しません。Wのadmission・Edit・候補公開は限定入口として追加しています。W/全child終了のP観測は後述の第9スライスを参照してください。C本人completeの限定入口は第10スライスにあります。Pの終了証拠からの呼出し・応答正本記録と連続操作の接続は後続です。製品のwriter受付からの呼出元は追加しておらず、通常利用へ公開しません。
 
 ## 失敗時
 
@@ -88,7 +88,7 @@ Wはprivate inherited stdin/stdoutで2フレームだけを受け取ります。
 
 prepare/admitでのREJECTEDはWのadmission未試行を表すだけで、C ownerをcloseしません。admission試行後の例外・Edit UNKNOWN・DBclose失敗・候補公開後の例外/応答喪失はUNKNOWNまたは返答不能の非正常終了として元stateを保全します。再admission・Edit再送・finish再試行・C差替・自動recoverは行いません。EOF・CANDIDATE・Wの終了予定だけで実終了を推測しません。
 
-今回の固定Data compile/非native fakeは、Idle→Assigned→Pending→SavedPendingExitと非空要求の透過性、作用前拒否・公開後失敗を検証します。実DB/実root/両OSの本人・IPC・Job/group・実bundleビルドの受入ではありません。起動認証/所有の内部部品は後述の第4スライス節を参照してください。W/全child終了のP観測は第9スライスを参照してください。Pの受付遮断/drainを含む製品呼出元への組込みと実OS受入、C complete、Registry CLOSED/start gateは後続です。
+今回の固定Data compile/非native fakeは、Idle→Assigned→Pending→SavedPendingExitと非空要求の透過性、作用前拒否・公開後失敗を検証します。実DB/実root/両OSの本人・IPC・Job/group・実bundleビルドの受入ではありません。起動認証/所有の内部部品は後述の第4スライス節を参照してください。W/全child終了のP観測は第9スライスを参照してください。C completeの限定入口は第10スライスを参照してください。Pの受付遮断/drainを含む製品呼出元への組込みと実OS受入、completeのP呼出し/正本記録、Registry CLOSED/start gateは後続です。
 
 ## Pによる限定起動（第4スライス先行部分）
 
@@ -98,7 +98,7 @@ prepare/admitでのREJECTEDはWのadmission未試行を表すだけで、C owner
 C/Wの各groupと実PID/start/host/boot、cwd/executable/command/OS ownerを観測し、私設frameのcontroller/owner/workerとsession/nonceをPが固定する。
 任意commandや本人欄を渡すAPIではなく、Cはopen、Wはprepareだけを一度送る。非空の型付きrequestは変更しない。
 生成/送受信/応答照合/記録の失敗は例外とし、再送・別helperへの差替をしない。object/handle/pipe/元要求・応答を保持し、本文・秘密は監督記録に残さない。
-Registry内部呼出元は第5・第6スライスで接続している。公開writer受付は後続である。Assigned登録は後述の第7スライスで接続する。admit/候補packetは第8スライスで接続する。W/全child終了のP観測は第9スライスで接続する。C実終了、C complete/close、Registry CLOSED/start gateは後続であり、OPEN/PREPAREDを編集成功や終了証拠に使わない。
+Registry内部呼出元は第5・第6スライスで接続している。公開writer受付は後続である。Assigned登録は後述の第7スライスで接続する。admit/候補packetは第8スライスで接続する。W/全child終了のP観測は第9スライスで接続する。C completeの限定入口は第10スライスで追加する。C実終了、complete/closeのP接続、Registry CLOSED/start gateは後続であり、OPEN/PREPAREDを編集成功や終了証拠に使わない。
 実Windows/macOS本人受入・実root・実bundle起動は未確認。合成native/pipe fixtureと既存Java非native vectorsの成功を実機受入へ拡張しない。
 
 ## Registry正本に束縛するC取得（第5スライス先行部分）
@@ -107,7 +107,7 @@ P内部の`RuntimeControl._offline_open`は、同lease/epoch/generationの認証
 P内部入口でも既存のresource_useでGC/監督停止と調停する。同instance lock内の短txでgate revision、offline-open PENDING、artifact参照、instances.pendingを予約し、DB外で保持Cを起動する。各I/O前に同予約と元run/descriptor/停止proof/drain snapshot・旧M PID不在を再照合する。
 Data Readyのworld/run/hash/revisionは期待値としてCへ渡し、実state・seal/chainはData本人APIが検査する。Registryの正常停止だけからData Readyを推測せず、任意rootや空verifyを渡す入口は作らない。
 OPEN後も予約/PENDINGを保持する。生成/通信/照合/正本記録の失敗で再取得・別Cへの差替・自動rollbackはしない。元Cと生成資源を保持し、start/lease解放を拒否する。
-この入口はP内部用で、Manager/CLIの停止中writer受付は未公開。正本予約からW PREPAREDまでは第6スライスで接続している。Assigned登録は第7スライスで接続する。admit/候補packetは第8スライスで接続する。W/全child終了のP観測は第9スライスを参照する。C実終了/complete/close、Registry CLOSEDと予約解放は後続である。合成SQLiteと既存Java/native fakeの検証を実OS/実root受入へ広げない。
+この入口はP内部用で、Manager/CLIの停止中writer受付は未公開。正本予約からW PREPAREDまでは第6スライスで接続している。Assigned登録は第7スライスで接続する。admit/候補packetは第8スライスで接続する。W/全child終了のP観測は第9スライスを参照する。C completeの限定入口は第10スライスを参照する。C実終了、complete/closeのP接続、Registry CLOSEDと予約解放は後続である。合成SQLiteと既存Java/native fakeの検証を実OS/実root受入へ広げない。
 
 ## 正本予約からW待機（第6スライス先行部分）
 
@@ -133,7 +133,7 @@ WはDBclose・候補公開後にACKを待たず終了する。送信前は元W�
 
 CANDIDATEは同op/IPC hash/session/nonce/world、run=操作UUID、Assigned revision+2、Data editRequestSha256とstate/receipt hash形式を照合し、正本へ応答hashを記録する。候補後はWへACK/次frameを送らずbufferとhandleを保持する。PENDING/参照を解放せず、packetだけで最終SUCCESSへ昇格しない。失敗時の再admit・再生成・差替・自動rollbackはない。
 
-W/全child終了のP観測は後述の第9スライスを参照する。候補実体/hashのC本人照合、receipt complete、game候補のData退出→Ready供給、C close/Registry CLOSEDと公開受付は後続。Ready期待値を自動確定せず、実OS/native本人受入は未確認。
+W/全child終了のP観測は後述の第9スライスを参照する。候補実体/hashのC本人照合・receipt completeの限定入口は第10スライスを参照する。Pからのcomplete呼出し/正本記録、game候補のData退出→Ready供給、C close/Registry CLOSEDと公開受付は後続。Ready期待値を自動確定せず、実OS/native本人受入は未確認。
 
 ## 記録済み候補からW/全child終了観測（第9スライス先行部分）
 
@@ -141,4 +141,14 @@ P内部の`RuntimeControl._offline_observe_worker_exit(token, operation_id=..., 
 
 非zero/不明終了、残child、期限切れ、正本/本人不一致、記録失敗・応答喪失は例外で元証拠・C/W・PENDING/pending/参照を保全し、自動kill・再生成・再観測/replayを行わない。Wの候補pipeは解放せず、Cへ追加frameも送らない。戻り値`WORKER_EXITED`はPによる内部の途中観測結果だけであり、候補実体/receiptのC本人照合・complete、編集SUCCESS、Data Ready、Registry CLOSEDを表さない。
 
-C本人による同候補/receipt実体照合・complete、同接続連続操作、game候補のData退出→Ready供給、C終了とRegistry CLOSEDは後続。Ready期待値を自動確定しない。実OS/nativeの本人/Job/group/child終了受入は未確認。
+C本人による同候補/receipt実体照合・completeの限定入口は後述の第10スライスを参照する。Pの終了証拠からの実接続・対応応答の正本記録、同接続連続操作、game候補のData退出→Ready供給、C終了とRegistry CLOSEDは後続。Ready期待値を自動確定しない。実OS/nativeの本人/Job/group/child終了受入は未確認。
+
+## C本人の候補確定入口（第10スライス先行部分）
+
+Pが保持する同じCのprivate stdioへ`complete`を送る入口を追加した。呼出前にPは第9スライスの元W/全child正常終了証拠と正本候補、元予約/閉門/drain/本人を検証する必要がある。このP側呼出しとRegistry結果記録は後続で、現時点の製品受付からは呼ばない。CのData側W死亡検査はPの全child観測を代用しない。
+
+frameは`command=complete, operationId, requestHash, sessionId, nonce, openOperationId, expectedStateSha256, expectedRevision, worldUuid, runUuid, receiptSha256, editRequestSha256`のみ。op/IPC hash/Data edit hashは元Assigned、session/nonce/open IDは元接続と一致させ、world/run/revisionとstate/receipt hashは同候補packetの値を渡す。runは操作UUID、revisionは元Assigned+2。本文・root・worker差替・終了済み自己申告flagは受け付けない。
+
+Cは保持Assignedと現在SavedPendingExitの元Wを照合する。候補値を現在値へ置換せず、そのまま`WorldOfflineWriterSession.complete`へ渡す。元writer・C本人・W死亡・DBclose・候補/receipt実体・元sealの再照合とIdle確定はData121の責務で、helperは保存/hash/recover算法を持たない。Dataが返すHostAdapterResponseをcodecのまま`result`へ載せ、`COMPLETED`と元candidateStateSha256/receiptSha256、更新後IdleのstateSha256/stateRevision/runUuidを返す。Idleではwriter session/runへ復帰し、Readyは作らない。
+
+取得後の不正complete、作用後失敗、応答喪失、EOFはUNKNOWN/非正常終了で保全し、再complete・自動close/recover・C差替をしない。COMPLETEDはC本人のData確定までを表し、Pの対応応答照合・正本記録と元W/全child終了証拠が揃うまでManagerへ最終結果を返さない。同pipeを次frameへ進めるP側接続・連続操作、game退出→Ready供給、C実終了/Registry CLOSEDは後続。実OS/native・実root・実helper bundle起動は未確認。

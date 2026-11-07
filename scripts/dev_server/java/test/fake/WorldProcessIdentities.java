@@ -1,18 +1,23 @@
 package io.github.sushiericworkspace.sushiericdatamodel.database.run;
 
+import java.util.HashSet;
+import java.util.Set;
+
 /** native問い合わせを行わない、controller protocol専用fixture。 */
 public final class WorldProcessIdentities {
     public static final WorldProcessIdentities INSTANCE = new WorldProcessIdentities();
     public static boolean parentAlive = true;
+    public static long actorPid = ProcessHandle.current().pid();
     public static boolean selfMatches = true;
     public static boolean workerAlive = true;
+    public static final Set<WorldProcessIdentity> exited = new HashSet<>();
     public static boolean failAfterOpen;
     public static int parentChecks;
     public static final long WORKER = 9_999_999;
     public static final long CONTROLLER = 9_999_998;
     public static boolean controllerAlive = true;
     public WorldProcessIdentity current() {
-        WorldProcessIdentity current = identity(ProcessHandle.current().pid());
+        WorldProcessIdentity current = identity(actorPid);
         return selfMatches ? current : identity(current.getPid() + 1);
     }
     public void requireAlive(WorldProcessIdentity identity) {
@@ -21,11 +26,15 @@ public final class WorldProcessIdentities {
             parentChecks++;
             if (!parentAlive || !actual.equals(identity) || (failAfterOpen && parentChecks>2))
                 throw new IllegalStateException("fixture P本人不一致");
-        } else if (identity.getPid() == CONTROLLER) {
-            if (!controllerAlive || !identity(CONTROLLER).equals(identity)) throw new IllegalStateException("fixture C本人不一致");
+        } else if (identity.getPid() == CONTROLLER || (WorldRunLifecycle.binding != null && identity.getPid() == WorldRunLifecycle.binding.getOwner().getPid())) {
+            if (!controllerAlive || !identity(identity.getPid()).equals(identity)) throw new IllegalStateException("fixture C本人不一致");
         } else if (!workerAlive || !identity(WORKER).equals(identity)) {
             throw new IllegalStateException("fixture W本人不一致");
         }
+    }
+    public void requireExited(WorldProcessIdentity identity) {
+        if (!exited.contains(identity) && (workerAlive || !identity(WORKER).equals(identity)))
+            throw new IllegalStateException("fixture 元Wの死亡未確認");
     }
     public static WorldProcessIdentity identity(long pid) {
         return new WorldProcessIdentity("a".repeat(64), "fixture-boot", pid, "fixture-start");
