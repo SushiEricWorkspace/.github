@@ -1,7 +1,8 @@
-"""停止済み管理runの正本予約とC OPEN/W PREPARED/Assignedと候補packet。実終了・確定は後続。"""
+"""停止済み管理runの正本予約・候補packet・W終了観測。Cの候補確定は後続。"""
 
 from copy import deepcopy
 import json
+import time
 
 from .build_inputs import canonical, digest, regular_bytes
 from .mod_control_runtime import _closed_writers
@@ -111,6 +112,47 @@ class _OfflineOpen:
                                                'responseSha256':digest(controller.assignment_response)},
                 'STALE_OPERATION', '元Assignedの応答と正本記録が一致しません')
         return opened, saved
+
+    def _candidate(self, connection, token, controller, worker, operation_id):
+        opened, saved = self._assigned(connection, token, controller, worker, operation_id)
+        require(worker.candidate_ready and saved.get('admission') == {
+                    'operationId':operation_id, 'candidateResponseSha256':digest(worker.candidate_response)}
+                and worker.record.get('candidateResponseSha256') == digest(worker.candidate_response),
+                'STALE_OPERATION', '元候補packetのローカル記録と正本が一致しません')
+        return opened, saved
+
+    def observe_worker_exit(self, token, *, operation_id, deadline):
+        """記録済み候補のW/全child正常終了を正本へ記録する。C complete/結果終端は行わない。"""
+        fields(token, TOKEN)
+        _canonical_uuid(operation_id)
+        token = deepcopy(token)
+        controller, worker = self.controllers.get(token['instanceId']), self.workers.get(token['instanceId'])
+        require(controller is not None and worker is not None, 'WRITER_PENDING', '保持した元C/Wが必要です')
+        observation = {'operationId':operation_id}
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, saved = self._candidate(connection, token, controller, worker, operation_id)
+                require('workerExit' not in saved, 'WRITER_PENDING', '元Wの終了観測意図と結果を保全します')
+                saved['workerExit'] = observation
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(saved),opened['operationId']))
+
+            def verify():
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    _, current = self._candidate(connection, token, controller, worker, operation_id)
+                    require(current.get('workerExit') == observation, 'STALE_OPERATION', '元Wの終了観測意図が変更されました')
+
+            response = worker.observe_exit(deadline, verify)
+            verify()
+            controller.verify()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                _, current = self._candidate(connection, token, controller, worker, operation_id)
+                require(current.get('workerExit') == observation, 'STALE_OPERATION', '元Wの終了観測意図が変更されました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W終了観測の正本照合中に期限を超過しました')
+                current['workerExit'] = dict(observation, responseSha256=digest(canonical(response)))
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(current),opened['operationId']))
+            return response
 
     def admit(self, token, *, operation_id, deadline):
         """保持Assignedを元Wへadmitし候補packetを記録する。実終了/receipt確定は行わない。"""
