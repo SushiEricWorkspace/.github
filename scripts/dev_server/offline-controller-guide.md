@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）、第18スライス先行部分（保存原文と保持元Mの結束）、第19スライス先行部分（不変候補原本の入力結束）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）、第18スライス先行部分（保存原文と保持元Mの結束）、第19スライス先行部分（不変候補原本の入力結束）、第20スライス先行部分（同stopから観測Cへの単発接続）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -228,7 +228,7 @@ P内部の単発接続部品は第15スライス節を参照してください�
 
 初回の保存原文参照の記録前と、公共stop/直接stopの最終transactionで同じ照合を行い、その完了後に元deadlineを検査します。不一致・期限超過では原文・PENDING/参照・保持資源を保全し、追加IPC/生成・自動再送・再attach・killへ進みません。既存stopの返却形式とcontrol slot終端は維持します。
 
-この照合は元Mの実終了、候補/退出証拠、Ready/CLOSEDを表しません。候補原本・全writer・正本予約の観測Cへの供給、C退出証拠の最終Registry確定、明示Readyの次open供給と元handle正常解放は後続です。実OS/native/実root受入は未確認です。
+この照合は元Mの実終了、候補/退出証拠、Ready/CLOSEDを表しません。候補原本・全writer・正本予約を供給するP内部の観測Cへの単発接続は[第20節「同stopから観測Cへの単発接続」](#同stopから観測cへの単発接続第20スライス先行部分)で実装済みです。既存stopへの組込み、C退出証拠の最終Registry確定、明示Readyの次open供給と元handle正常解放は後続です。実OS/native/実root受入は未確認です。
 
 ## 不変game候補原本の入力結束（第19スライス先行部分）
 
@@ -238,4 +238,14 @@ P内部の`ManagedRuntime.game_exit_inputs(instance, session, candidate, deadlin
 
 戻り値は観測C向けの管理/candidate欄、候補原bytes、saveproof原bytesのtupleです。operationId/requestHash、P/C本人、private session/nonceは含めず、後続の正本予約と起動時に補います。原本I/O後に元保存原文/正本予約/保持Mを再照合し、最終境界で同deadlineを検査します。不一致・原本欠落/変更・期限超過は例外で保全し、別候補/currentへのfallback、DB更新、IPC、生成、終了観測、kill、handle解放を行いません。
 
-この読取り入口は既存stopからまだ自動呼出ししません。候補原本の供給境界を独立に実装したもので、観測Cの実接続/退出確定・Registry記録、独立明示Readyの次open供給と元handle正常解放は後続です。戻り値をReadyやCLOSEDへ自動昇格しません。実OS/native本人受入・実root/Mod/実bundleビルドは未確認です。
+この読取り入口を用いるP内部の観測Cへの単発接続は[第20節「同stopから観測Cへの単発接続」](#同stopから観測cへの単発接続第20スライス先行部分)で実装済みです。既存stopへの組込み、退出証拠の最終Registry確定、独立明示Readyの次open供給と元handle正常解放は後続です。戻り値をReadyやCLOSEDへ自動昇格しません。実OS/native本人受入・実root/Mod/実bundleビルドは未確認です。
+
+## 同stopから観測Cへの単発接続（第20スライス先行部分）
+
+P内部の`ManagedRuntime.observe_game_exit(instance, session, candidate, deadline)`は、保持sessionに作用前から単発slotを確保し、第19スライスの原bytes/要求欄と同stop ID/fingerprint/control ID・保持元M/生成snapshotを固定します。固定generation/runtimeのartifactとData世代を既存検証へ通し、独立OwnedProcessの未使用Cをslotへ保持してから、既存`OfflineProcess.observe_game_exit`へ一度だけ渡します。operationIdは元stop ID、requestHashはcommand/stopFingerprint/inputsから既存canonical/digestで固定します。P/C本人とprivate session/nonceは生成部品が補います。
+
+callbackは元session/slot、stop識別、同原本/要求欄、保持M object/生成snapshotとslot記録の一致を継続照合します。第19スライスの原文照合を通し、BLOCKED/drain/全writerと元PENDING/参照を維持します。原本I/OとOS/IPCは短いtransactionの外です。元Mの正常exit/全child不在→C本人Data退出→C正常exit/全child不在は既存単発部品へ委ね、旧PIDへ再attachしません。
+
+同deadlineをcallbackとC完了後、局所結果保持の前後まで検査します。失敗後もslot/原文/元M/観測Cを残し、別候補への変更・再生成・再送・再観測・kill・rollbackをしません。局所結果保持後に期限を跨いだ場合は証拠を保持しますが、成功として返しません。
+
+返却`GAME_EXIT_OBSERVED`とslotのresultは局所観測です。既存公共/直接stopからの自動呼出し、最終transactionのRegistry退出確定、独立明示Readyの次open供給、元M/Cの正常handle解放は後続です。呼出元Pが元stop予約とsessionを保持する前提で、解除/差替はcallbackで拒否します。Ready/CLOSEDへ自動昇格しません。実OS/native本人/実Job/group/実IPC結合と保持資源量は未確認です。

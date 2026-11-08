@@ -18,7 +18,7 @@ from .local_ipc import MAX_MESSAGE, decode, plain_path, require_private
 from .mod_control_startup import _Startup, _admission, _change
 from .mod_control_transport import ModControlTransport, _WindowsNative
 from .registry import RegistryError, fields, require
-from .runtime_bundle import _read_managed_profile, _expand_managed_launch, verify_bundle
+from .runtime_bundle import _read_managed_profile, _expand_managed_launch, verify_bundle, require_data_generation
 
 
 def approved_input(path, expected_hash, root, inventory):
@@ -461,6 +461,68 @@ class ManagedRuntime:
                         "STALE_OPERATION", "原本読取り中に元stop/保存原文が変更されました")
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "game候補入力の最終照合後に期限を超過しました")
             return frame, state_raw, proof_raw
+
+    def observe_game_exit(self, instance, session, candidate, deadline):
+        """保持元Mと同stopの原本を単発Cへ渡す。局所観測を返し、Registry/Readyは確定しない。
+
+        呼出元は元stop予約とsessionを保持する。失敗後もslot/C/原本を残し再入口を拒否する。
+        """
+        from .offline_process import OfflineProcess
+
+        candidate = deepcopy(candidate)
+        deadline = min(deadline, session["stop_deadline"])
+        with self.lock:
+            require(self.sessions.get(instance) is session and "game_exit" not in session,
+                    "CONTROL_PENDING", "保持した同sessionでgame退出を一度だけ観測します")
+            slot = {"candidate": deepcopy(candidate)}
+            session["game_exit"] = slot
+        with self.runtime._lock_wait(deadline):
+            inputs = self.game_exit_inputs(instance, session, candidate, deadline)
+            stop = tuple(session[k] for k in ("stop_operation", "stop_fingerprint", "control_operation"))
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                row = dict(self.registry._instance(connection, instance))
+                run = json.loads(connection.execute("SELECT record FROM runs WHERE id=?", (session["run"],)).fetchone()[0])
+                process, snapshot = self.runtime._game_process(run)
+            fixed = canonical(snapshot)
+            slot.update(inputs=deepcopy(inputs), stop=stop, process=process, snapshot=fixed)
+            generation = self.runtime._active_generation(row)
+            bundle = generation / "runtime"
+            manifest = verify_bundle(bundle)
+            require(manifest["artifactId"] == row["artifact"], "ARTIFACT_MISMATCH", "元runの固定artifactが一致しません")
+            require_data_generation(manifest, row["generation"])
+
+            def verify():
+                with self.lock:
+                    require(self.sessions.get(instance) is session and session.get("game_exit") is slot,
+                            "STALE_OPERATION", "元game退出slotが変更されました")
+                require(tuple(session[k] for k in ("stop_operation", "stop_fingerprint", "control_operation")) == stop,
+                        "STALE_OPERATION", "元stopの操作識別が変更されました")
+                require(self.game_exit_inputs(instance, session, candidate, deadline) == inputs,
+                        "STALE_OPERATION", "固定した候補/保存原文が変更されました")
+                with self.runtime._transaction(instance, read_only=True) as connection:
+                    current = json.loads(connection.execute("SELECT record FROM runs WHERE id=?", (session["run"],)).fetchone()[0])
+                    held, born = self.runtime._game_process(current)
+                require(held is process and canonical(born) == fixed
+                        and slot["process"] is process and slot["snapshot"] == fixed
+                        and slot["inputs"] == inputs and slot["stop"] == stop and slot["candidate"] == candidate,
+                        "PROCESS_MISMATCH", "元Mの保持object/生成snapshotが変更されました")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出接続の照合期限を超過しました")
+
+            verify()
+            observer = OfflineProcess(bundle, self.runtime._paths(instance) / "diagnostics" / ("game-exit-" + stop[0]),
+                                      native=self.transport.native, verify=verify, process_adapter=self.runtime.process_adapter)
+            slot["observer"] = observer
+            frame = deepcopy(inputs[0])
+            frame.update(operationId=stop[0], requestHash=digest(canonical({"command": "observe-game-exit",
+                         "stopFingerprint": stop[1], "inputs": inputs[0]})))
+            result = observer.observe_game_exit(frame, game_process=process, game_identity=snapshot["run"]["identity"],
+                                               game_group=snapshot["run"]["creation"]["ownerGroup"], deadline=deadline)
+            verify()
+            require(observer.game_exit_result == canonical(result), "STALE_OPERATION", "観測Cの局所原本が一致しません")
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出接続の最終照合後に期限を超過しました")
+            slot["result"] = canonical(result)
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出局所結果の保持後に期限を超過しました")
+            return deepcopy(result)
 
     def release(self, instance, run_id):
         with self.lock:
