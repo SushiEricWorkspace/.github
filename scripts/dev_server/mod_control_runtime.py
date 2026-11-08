@@ -217,6 +217,7 @@ class ManagedRuntime:
             observed=session["observed"], context=context, revision=revision, deadline=deadline,
             endpoint=session["endpoint"], defer_ready=True)
         session.update(context=context, token=deepcopy(token))
+        self.runtime._remember_game_process(run, session)
 
     def ready(self, row, connection):
         session = self.startup.sessions[row["id"]]
