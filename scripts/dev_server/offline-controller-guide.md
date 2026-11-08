@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -189,7 +189,7 @@ M本人のfinishSavesによる保存候補の公開は固定Mod597の責務で�
 
 応答`GAME_EXITED`はoperationId/requestHash/sessionId/nonce、ReadyのstateSha256/stateRevision/worldUuid/runUuid、元candidateStateSha256/saveProofSha256を返して終了します。同じCで次frameを読みません。作用前拒否はREJECTEDと非正常終了、Data呼出開始後の不明はUNKNOWNと非正常終了です。応答喪失でも元候補/Readyを保持し、再観測・再送・writer取得・kill・rollbackへ進みません。
 
-P内部の単発接続部品は第15スライス節を参照してください。既存Pの停止/受付/Registry経路への組込みは後続です。返却Readyは観測結果であり、次openの期待値の自動承認ではありません。次openは引き続き独立して明示したReady期待値を要求し、候補からhash/revisionを推測しません。単発接続のdeadlineは第15スライスで検査し、Registry最終結果更新までの接続は後続です。実OS/native/実root受入は未確認です。
+P内部の単発接続部品は第15スライス節を参照してください。認証済保存原文を既存stop結果へ引き継ぐ前段は第16スライス節を参照してください。観測Cと既存Pの停止/受付/Registry経路への実接続は後続です。返却Readyは観測結果であり、次openの期待値の自動承認ではありません。次openは引き続き独立して明示したReady期待値を要求し、候補からhash/revisionを推測しません。単発接続のdeadlineは第15スライスで検査し、Registry最終結果更新までの接続は後続です。実OS/native/実root受入は未確認です。
 
 ## game退出観測CのP内部部品（第15スライス先行部分）
 
@@ -199,4 +199,15 @@ P内部の単発接続部品は第15スライス節を参照してください�
 
 応答送信直後のC正常exitを受信中も許容し、Cと全childの終了を保持handle/groupで確認します。生存照会の結果は生成snapshotへ照合します。照会中に本人が不在になった場合だけ、同じ保持handleを再pollし、正常exit0と固定bindingを確認できれば終了済み経路へ移ります。取得できた本人情報の不一致、非zero・不明終了は拒否します。終了確認後の旧PID再照会・別process採用・再attachは行いません。既存writer用verifyの生存必須契約は変更しません。観測Cは送信時点の独立した要求とnative生成snapshotへ固定し、PID/start/host/bootを応答後・局所記録完了後も照合します。操作全体の同deadlineをOS観測後、対応応答照合後、局所証拠書込み前後まで検査します。失敗/期限超過時は元要求・応答・生成記録と作用後のReadyを保全し、再入口・既存startへの切替・再送・kill・rollbackをしません。書込み後に期限を跨いだ場合は局所観測証拠を保全しますが、受理済み結果を返しません。
 
-成功時もpipe buffer/handleを保持し、`game_exit_result`と戻り値は局所観測結果です。Registry確定・writer CLOSED・次openの許可を表しません。製品呼出元の正本予約/台帳/元Mhandle供給、最終transactionでの再照合・期限検査・結果記録、明示Ready供給を後続で接続します。稼働RuntimeControl/ManagedRuntime/Registryを変更していません。実OS/native/実root受入は未確認です。
+成功時もpipe buffer/handleを保持し、`game_exit_result`と戻り値は局所観測結果です。Registry確定・writer CLOSED・次openの許可を表しません。製品呼出元の正本予約/台帳/元Mhandle供給、最終transactionでの再照合・期限検査・結果記録、明示Ready供給を後続で接続します。第15スライスでは稼働RuntimeControl/ManagedRuntime/Registryを変更していません。認証済保存原文を停止結果へ引き継ぐ第16スライスの前段と、観測C自体の製品接続は区別します。実OS/native/実root受入は未確認です。
+
+
+## 認証済保存原文とstop正本の接続（第16スライス先行部分）
+
+既存ManagedRuntimeは認証済SAVE_REQUESTED/COMPLETIONの原frameを元sessionへ保持します。COMPLETIONの送信とpeer/endpoint close後、同じtransaction内で元descriptor・lease/epoch/generation/run、RunningからのRequested、原文readback、最新BLOCKED revision・全writer台帳、元stop PENDINGと参照予約を照合してから、そのstop意図へhash参照を記録します。close不明・応答喪失では再送せず、原文と元予約を保全します。
+
+`ManagedRuntime.save_evidence(connection, instance, session, deadline)`は呼出元のtransactionでこの対応を再照合し、hash参照と元stop予約本文を返す内部APIです。`managedSave`はSAVE_REQUESTEDの`operationId`、要求/応答bodyの`requestBodySha256`/`responseBodySha256`、`descriptorSha256`です。本文は既存mod-control台帳を参照し、追加保存しません。公共stopと直接stopの最終結果transactionでも同一参照を再照合し、結果へ引き継ぎます。
+
+元STOP_BLOCKのdeadlineをSAVE_REQUESTEDの受信・close・直接stopの結果確定まで引き継ぎ、phaseごとに再起算しません。公共stopは通常待機・直接stopへの合流予約と待機にも、呼出元の固定期限と元STOP_BLOCKのいずれか早い期限を渡します。記録前・照合直後・commit後・返却前まで同deadlineを検査します。確定前の失敗は元参照と原文を保全し、公共stopのRECOVERY_REQUIRED記録にも保存原文参照を残します。commit後の期限超過では確定記録を巻き戻さず、正常応答を返しません。 同じ確定済みstopから旧control slotを終端するため、timeout後の同要求readbackと次startに旧slotを残しません。合流は元stopの確定証拠を変更せず、自分の予約前・最終照合後・commit後・返却前を検査します。新規合流の初回応答と、同一の確定済み要求のreadbackを区別します。元要求のreadbackは追加作用をしません。Pの原要求/応答に対する自動再送・kill・rollbackは追加しません。
+
+この参照は認証済台帳の由来を表すもので、元M/全childの実終了、Data候補・saveproof実体、観測C終了、Ready、writer CLOSEDの証明ではありません。元Mhandle保持・候補原本取得・観測C実接続・最終退出証拠のRegistry記録・独立明示Ready供給は後続です。現在のstop結果や局所Readyから、次openの期待値を自動確定しません。実OS/native・実root受入は未確認です。

@@ -258,17 +258,20 @@ class ManagedRuntime:
                             "CONTROL_PENDING", "元ACK原文がありません")
                 require(channel.send_frame(saved, time.monotonic() + 30) == len(saved), "CONTROL_UNKNOWN", "ACK読戻し送信が不明です")
             require(message["phase"] == "STOP_BLOCK", "INVALID_INPUT", "停止要求が必要です")
+            session["stop_request"] = request
             session["stop"].set()
             deadline = time.monotonic() + 30
+            session["stop_deadline"] = deadline
             with self.runtime._lock_wait(deadline):
                 self.reserve_stop(instance, session)
                 with self.runtime._transaction(instance) as connection:
                     require(operations.reserve(connection, instance, request) is None,
                             "CONTROL_PENDING", "停止要求の再作用を許可しません")
                     row = self.registry._instance(connection, instance)
-                    parent = connection.execute("SELECT id FROM runtime_operations WHERE instance=? AND command='stop' AND status='PENDING'", (instance,)).fetchone()
+                    parent = connection.execute("SELECT id,fingerprint FROM runtime_operations WHERE instance=? AND command='stop' AND status='PENDING'", (instance,)).fetchone()
                     session["direct_stop"] = parent is None
                     session["stop_operation"] = parent[0] if parent else "direct-stop-" + uuid.uuid4().hex
+                    session["stop_fingerprint"] = parent[1] if parent else digest(session["raw"])
                     session["control_operation"] = message["operationId"]
                     pending = {"runId": session["run"], "controlOperationId": message["operationId"]}
                     if parent is None:
@@ -285,11 +288,11 @@ class ManagedRuntime:
                                                               "registryRevision": gate["revision"]})
                     operations.complete(connection, instance, request, reply)
                 require(channel.send_frame(reply, deadline) == len(reply), "CONTROL_UNKNOWN", "BLOCKED送信が不明です")
-            request = channel.receive_frame(time.monotonic() + 30)
-            deadline = time.monotonic() + 30
+            request = channel.receive_frame(deadline)
             with self.runtime._lock_wait(deadline):
                 message = wire.correlate_binding_v3(request, session["context"])
                 require(message["phase"] == "SAVE_REQUESTED", "INVALID_INPUT", "Requestedが必要です")
+                session["save_request"] = request
                 requested = wire._inner(message["payload"], "requestJson", "requestSha256")
                 bound = wire._status(wire._inner(wire.decode_frame_v3(self.startup.sessions[instance]["request"])["payload"],
                                                "statusJson", "statusJsonSha256"), "Running")
@@ -305,9 +308,18 @@ class ManagedRuntime:
                                   "acceptance": "BLOCKED", "drain": "COMPLETE", "pendingCount": 0, "writers": writers}
                     reply = self.reply(request, "COMPLETION", {"requestSha256": message["payload"]["requestSha256"], "completion": completion})
                     operations.complete(connection, instance, request, reply)
+                session["completion_response"] = reply
                 require(channel.send_frame(reply, deadline) == len(reply), "CONTROL_UNKNOWN", "COMPLETION送信が不明です")
                 require(channel.wait_peer_close(deadline) is True, "CONTROL_UNKNOWN", "Mのcontrol closeが未確認です")
                 require(session["endpoint"].close(deadline), "CONTROL_UNKNOWN", "control closeが未確認です")
+                with self.runtime._transaction(instance) as connection:
+                    evidence, pending = self.save_evidence(connection, instance, session, deadline)
+                    require("managedSave" not in pending, "CONTROL_PENDING", "保存原文の再確定を許可しません")
+                    require(time.monotonic() < deadline, "STOP_TIMEOUT", "保存原文の記録前に期限を超過しました")
+                    connection.execute("UPDATE runtime_operations SET response=? WHERE id=?",
+                                       (json.dumps(dict(pending, managedSave=evidence)), session["stop_operation"]))
+                session["save_evidence"] = evidence
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "保存原文の記録後に期限を超過しました")
                 session["done"].set()
                 self.runtime._direct_stop(instance, session)
         except BaseException as error:
@@ -324,6 +336,55 @@ class ManagedRuntime:
                     connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED' WHERE id=?", (instance,))
             except BaseException as preserve_error:
                 session["preservationError"] = preserve_error
+
+    def save_evidence(self, connection, instance, session, deadline):
+        """認証済保存原文と同stop予約をtx内で再照合し、hash参照と元予約本文を返す。
+
+        元M/Cの実終了・Data候補・Readyを証明しない。原文と予約は失敗時も保持する。
+        """
+        deadline = min(deadline, session["stop_deadline"])
+        row, gate, writers = self.snapshot(connection, instance, session)
+        self.registry._token(row, session["token"], allow_expired=True)
+        descriptor = wire.decode_descriptor(session["raw"])
+        require(gate["descriptor_hash"] == wire.sha256(session["raw"])
+                and all(descriptor[k] == row[v] for k,v in
+                        (("instanceId","id"),("leaseId","lease"),("epoch","epoch"),
+                         ("generationId","generation"),("runtimeRunId","run_id"))),
+                "STALE_RUN", "保存原文と元descriptor/正本bindingが一致しません")
+        request = session["save_request"]
+        reply = session["completion_response"]
+        message = wire.correlate_binding_v3(request, session["context"])
+        response = wire.correlate_response_v3(request, reply)
+        require(message["phase"] == "SAVE_REQUESTED" and response["phase"] == "COMPLETION"
+                and operations.readback(connection, instance, request) == reply,
+                "STALE_OPERATION", "認証済Requested/COMPLETION原文が変更されました")
+        requested = wire._inner(message["payload"], "requestJson", "requestSha256")
+        state = wire._status(requested["status"], "ManagedSaveRequested")
+        bound = wire._status(wire._inner(wire.decode_frame_v3(self.startup.sessions[instance]["request"])["payload"],
+                                        "statusJson", "statusJsonSha256"), "Running")
+        completion = response["payload"]["completion"]
+        require(all(wire._same_json(state[k], bound[k]) for k in ("worldUuid","runUuid","generation","paths"))
+                and state["stateRevision"] > bound["stateRevision"]
+                and completion["registryRevision"] == gate["revision"] and completion["writers"] == writers,
+                "STALE_OPERATION", "保存元Runningまたは最新閉門/全writer台帳が変更されました")
+        stop = wire.correlate_binding_v3(session["stop_request"], session["context"])
+        blocked = operations.readback(connection, instance, session["stop_request"])
+        require(stop["phase"] == "STOP_BLOCK" and stop["operationId"] == session["control_operation"]
+                and blocked is not None and wire.decode_frame_v3(blocked)["phase"] == "BLOCKED",
+                "STALE_OPERATION", "元STOP_BLOCK/BLOCKED原文が一致しません")
+        parent = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (session["stop_operation"],)).fetchone()
+        require(parent is not None and parent["instance"] == instance and parent["command"] == "stop"
+                and parent["status"] == "PENDING" and parent["fingerprint"] == session["stop_fingerprint"],
+                "STALE_OPERATION", "元stopの正本予約がありません")
+        pending = json.loads(parent["response"])
+        ref = connection.execute("SELECT * FROM reservations WHERE operation=? AND reference=?",
+                                 (session["control_operation"], "stop:" + session["stop_operation"])).fetchone()
+        require(pending.get("runId") == session["run"] and pending.get("controlOperationId") == stop["operationId"]
+                and ref is not None and ref["instance"] == instance and ref["lease"] == row["lease"] and ref["epoch"] == row["epoch"],
+                "STALE_OPERATION", "元stop意図と参照予約が一致しません")
+        require(time.monotonic() < deadline, "STOP_TIMEOUT", "保存原文の最終照合中に期限を超過しました")
+        return {"operationId":message["operationId"], "requestBodySha256":wire.sha256(request[4:]),
+                "responseBodySha256":wire.sha256(reply[4:]), "descriptorSha256":wire.sha256(session["raw"])}, pending
 
     def release(self, instance, run_id):
         with self.lock:

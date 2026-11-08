@@ -367,7 +367,7 @@ class StartupTests(unittest.TestCase):
             self.assertEqual('OPEN', self.gate()['gate'])
             self.assertIsNone(self.runtime._control)
             self.runtime.processes[self.run['runId']] = Mock()
-            def stop(row, payload, generation):
+            def stop(row, payload, generation, deadline=None):
                 self.assertEqual('BLOCKED', self.gate()['gate'])
                 self.assertEqual(0, self.depth)
                 return {'instanceId': 'slot-a', 'runId': self.run['runId']}
