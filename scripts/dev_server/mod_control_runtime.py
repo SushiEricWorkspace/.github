@@ -397,6 +397,71 @@ class ManagedRuntime:
         return {"operationId":message["operationId"], "requestBodySha256":wire.sha256(request[4:]),
                 "responseBodySha256":wire.sha256(reply[4:]), "descriptorSha256":wire.sha256(session["raw"])}, pending
 
+    def game_exit_inputs(self, instance, session, candidate, deadline):
+        """明示候補の不変原本を同stopの保存原文へ結束し、C向け欄と原bytesを返す。
+
+        candidateはworldUuid/runUuid/stateSha256/stateRevisionの固定期待値。元stop予約を
+        事前/最終の短いtxで照合し、原本I/Oはtx外で行う。currentへの追従・C生成・Data退出・Ready承認は行わない。
+        """
+        candidate = deepcopy(candidate)
+        fields(candidate, {"worldUuid", "runUuid", "stateSha256", "stateRevision"})
+        for key in ("worldUuid", "runUuid"):
+            wire._canonical_uuid(candidate[key])
+        wire._hash(candidate["stateSha256"])
+        wire._integer(candidate["stateRevision"])
+        deadline = min(deadline, session["stop_deadline"])
+        with self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                require(session["done"].is_set() and session["error"] is None,
+                        "CONTROL_UNKNOWN", "認証済保存原文が未終端です")
+                evidence, pending = self.save_evidence(connection, instance, session, deadline)
+                require(evidence == session["save_evidence"] == pending.get("managedSave"),
+                        "STALE_OPERATION", "元stopへ記録した保存原文参照が一致しません")
+                message = wire.decode_frame_v3(session["save_request"])
+                requested = wire._inner(message["payload"], "requestJson", "requestSha256")["status"]
+                previous = wire._status(requested, "ManagedSaveRequested")
+                descriptor = wire.decode_descriptor(session["raw"])
+            directory = Path(descriptor["worldRoot"]) / "sushieric/run-state"
+            path = directory / "states" / (candidate["stateSha256"] + ".json")
+            plain_path(path)
+            state_raw = regular_bytes(path)
+            require(digest(state_raw) == candidate["stateSha256"],
+                    "PROOF_MISMATCH", "明示候補の不変原本hashが一致しません")
+            state = wire._status({"sha256": candidate["stateSha256"], "state": wire._json(state_raw)}, "SavedPendingExit")
+            require(all(state[k] == candidate[k] for k in ("worldUuid", "runUuid", "stateRevision"))
+                    and all(wire._same_json(state[k], previous[k]) for k in ("worldUuid", "runUuid", "generation", "paths"))
+                    and state["stateRevision"] == previous["stateRevision"] + 1
+                    and state["previousStateSha256"] == requested["sha256"]
+                    and all(wire._same_json(state["payload"][k], previous["payload"][k]) for k in ("owner", "management")),
+                    "PROOF_MISMATCH", "元Requestedと同Mの保存候補bindingが一致しません")
+            proof_hash = state["payload"]["saveProofSha256"]
+            wire._hash(proof_hash)
+            path = directory / "saveproofs" / (proof_hash + ".json")
+            plain_path(path)
+            proof_raw = regular_bytes(path)
+            require(digest(proof_raw) == proof_hash, "PROOF_MISMATCH", "saveproof原本hashが一致しません")
+            proof = wire._json(proof_raw)
+            completion = wire.decode_frame_v3(session["completion_response"])["payload"]["completion"]
+            require(proof["sourceStateSha256"] == requested["sha256"]
+                    and all(wire._same_json(proof[k], previous[k]) for k in ("worldUuid", "runUuid", "stateRevision"))
+                    and wire._same_json(proof["owner"], previous["payload"]["owner"])
+                    and wire._same_json(proof["managementCompletion"], completion),
+                    "PROOF_MISMATCH", "saveproofと認証済Requested/COMPLETION原文が一致しません")
+            management = previous["payload"]["management"]
+            frame = {key: deepcopy(management[key]) for key in ("leaseId", "epoch", "generation", "drainSha256")}
+            frame.update(worldRoot=descriptor["worldRoot"], shopDirectory=descriptor["shopDirectory"],
+                         worldUuid=state["worldUuid"], runUuid=state["runUuid"],
+                         expectedStateSha256=candidate["stateSha256"], expectedRevision=state["stateRevision"],
+                         gameOwner=deepcopy(state["payload"]["owner"]), saveProofSha256=proof_hash,
+                         requestedStateSha256=requested["sha256"])
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                current, reserved = self.save_evidence(connection, instance, session, deadline)
+                require(current == evidence == session["save_evidence"] == reserved.get("managedSave")
+                        and reserved == pending and session["done"].is_set() and session["error"] is None,
+                        "STALE_OPERATION", "原本読取り中に元stop/保存原文が変更されました")
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "game候補入力の最終照合後に期限を超過しました")
+            return frame, state_raw, proof_raw
+
     def release(self, instance, run_id):
         with self.lock:
             session = self.sessions[instance]
