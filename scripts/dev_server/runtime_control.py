@@ -44,6 +44,7 @@ class RuntimeControl:
         self.registry = registry
         self.process_adapter = process_adapter
         self.processes = {}
+        self.game_processes = {}
         self.managed = None
         self._control = None
         self._offline = None
@@ -599,7 +600,45 @@ class RuntimeControl:
 
         return expected
 
+    def _remember_game_process(self, run, session):
+        """認証済Mの元handleと生成snapshotを保持する。退出確定・Readyを表さない。"""
+        process = self.processes[run["runId"]]
+        fixed = {key: run[key] for key in ("runId", "instanceId", "generationId", "artifactId", "nonce", "identity", "creation")}
+        owner = session["context"]["owner"]
+        boot = owner["bootId"] if os.name == "nt" else str(uuid.UUID(owner["bootId"]))
+        require(process.pid == fixed["creation"]["pid"] == fixed["identity"]["pid"] == owner["pid"]
+                and process.group == fixed["creation"]["ownerGroup"] and process.group is not None
+                and fixed["creation"]["stage"] == "RUNNING"
+                and fixed["identity"]["startId"] == owner["startId"]
+                and fixed["identity"]["bootId"] == boot,
+                "PROCESS_MISMATCH", "認証済Mと元生成snapshotが一致しません")
+        snapshot = canonical({"run": fixed, "owner": owner,
+                              "descriptorSha256": digest(session["raw"])})
+        with self._control_lock:
+            require(run["runId"] not in self.game_processes, "STALE_RUN", "元Mの保持資源を差し替えません")
+            self.game_processes[run["runId"]] = (process, snapshot)
+
+    def _game_process(self, run):
+        """元runの保持Mと生成snapshotのcopyを返す。台帳/候補/Readyの認証は呼出元で行う。"""
+        with self._control_lock:
+            held = self.game_processes.get(run["runId"])
+            require(held is not None, "PROCESS_UNVERIFIED", "元Mの生成handleを保持していません")
+            process, raw = held
+            snapshot = json.loads(raw)
+            fixed = snapshot["run"]
+            require(all(run.get(key) == value for key, value in fixed.items())
+                    and process.pid == fixed["creation"]["pid"] == fixed["identity"]["pid"]
+                    and process.group == fixed["creation"]["ownerGroup"],
+                    "PROCESS_MISMATCH", "元Mの生成handleまたはsnapshotが変更されました")
+            return process, snapshot
+
     def _wait_exit(self, run, process, timeout, *, expected, verify=None):
+        with self._control_lock:
+            retained = run["runId"] in self.game_processes
+            require(retained or not any(held is process for held, _ in self.game_processes.values()),
+                    "PROCESS_MISMATCH", "元Mのrun識別が変更されました")
+        if retained:
+            require(self._game_process(run)[0] is process, "PROCESS_MISMATCH", "別handleで元Mの終了を記録しません")
         deadline = time.monotonic() + timeout
         while True:
             running = process.poll() is None
@@ -611,6 +650,8 @@ class RuntimeControl:
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "JVM/child終了期限を超過しました。自動killしません")
             time.sleep(0.1)
         run["exitCode"] = process.poll()
+        if retained:
+            require(self._game_process(run)[0] is process, "PROCESS_MISMATCH", "終了観測中に元Mの保持資源が変更されました")
         run["jvmAndChildrenExited"] = True
         run["exitedAt"] = self.registry.clock()
         expected = self._record(run, expected=expected)
@@ -618,7 +659,8 @@ class RuntimeControl:
                        else self._transaction(run["instanceId"]))
         with transaction as connection:
             connection.execute("DELETE FROM endpoint_reservations WHERE run=?", (run["runId"],))
-        process.close()
+        if not retained:
+            process.close()
         self.processes.pop(run["runId"], None)
         return expected
 

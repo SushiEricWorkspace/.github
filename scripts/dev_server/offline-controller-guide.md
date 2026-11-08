@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -210,4 +210,13 @@ P内部の単発接続部品は第15スライス節を参照してください�
 
 元STOP_BLOCKのdeadlineをSAVE_REQUESTEDの受信・close・直接stopの結果確定まで引き継ぎ、phaseごとに再起算しません。公共stopは通常待機・直接stopへの合流予約と待機にも、呼出元の固定期限と元STOP_BLOCKのいずれか早い期限を渡します。記録前・照合直後・commit後・返却前まで同deadlineを検査します。確定前の失敗は元参照と原文を保全し、公共stopのRECOVERY_REQUIRED記録にも保存原文参照を残します。commit後の期限超過では確定記録を巻き戻さず、正常応答を返しません。 同じ確定済みstopから旧control slotを終端するため、timeout後の同要求readbackと次startに旧slotを残しません。合流は元stopの確定証拠を変更せず、自分の予約前・最終照合後・commit後・返却前を検査します。新規合流の初回応答と、同一の確定済み要求のreadbackを区別します。元要求のreadbackは追加作用をしません。Pの原要求/応答に対する自動再送・kill・rollbackは追加しません。
 
-この参照は認証済台帳の由来を表すもので、元M/全childの実終了、Data候補・saveproof実体、観測C終了、Ready、writer CLOSEDの証明ではありません。元Mhandle保持・候補原本取得・観測C実接続・最終退出証拠のRegistry記録・独立明示Ready供給は後続です。現在のstop結果や局所Readyから、次openの期待値を自動確定しません。実OS/native・実root受入は未確認です。
+この参照は認証済台帳の由来を表すもので、元M/全childの実終了、Data候補・saveproof実体、観測C終了、Ready、writer CLOSEDの証明ではありません。元Mhandle保持部品は第17スライスを参照します。候補原本取得・観測C実接続・最終退出証拠のRegistry記録・独立明示Ready供給は後続です。現在のstop結果や局所Readyから、次openの期待値を自動確定しません。実OS/native・実root受入は未確認です。
+
+
+## 認証済Mの生成handle保持（第17スライス先行部分）
+
+認証済handshake後、Pは元MのOwnedProcessと生成時のrun/instance/generation/artifact/nonce/native identity/creation、Data owner、descriptor hashを固定します。macOSのboot照合は生成identityと同じUUID表現へ正規化し、Data ownerと生成snapshotの原値は保持します。停止時は同じ保持objectと生成snapshotを照合し、既存の終了観測・Registry停止記録を続けます。認証済Mは停止後もhandleをcloseせず、稼働process mapからだけ退避します。通常control slotの終端と次startは維持し、元Mと次Mをrun別に保持します。従来の非認証通信fixture境界とGameTestのcloseは変更しません。
+
+`RuntimeControl._game_process(run)`は保持した元handleと生成snapshotのcopyを返す内部取得です。PIDからの再attach・別processの採用・native本人再照会を行いません。この取得だけで停止・保存・全writer・候補・Registry退出・Ready/CLOSEDを証明しません。原要求hash参照/候補原本を再照合して観測Cへ供給し、C退出を最終Registry transaction/同deadlineへ接続する処理は後続です。
+
+保持資源はPのメモリ内にあり、P再起動後に復元しません。正常停止・失敗とも自動解放せず、正常解放は後続のRegistry退出確定に接続します。その接続が完了するまではrunごとのhandleがPの寿命中に残ります。実OSでのhandle資源消費・本人受入は未確認です。Ready期待値を自動承認する変更はありません。
