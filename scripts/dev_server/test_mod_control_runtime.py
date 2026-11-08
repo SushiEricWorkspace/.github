@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from unittest.mock import Mock, patch
 
 from . import mod_control_operations as operations
@@ -52,6 +53,16 @@ class ManagedRuntimeTests(unittest.TestCase):
                             error=None, close_ids={}, drain_lock=threading.Lock())
         self.managed.sessions['slot-a'] = self.session
         f.runtime.managed = self.managed
+        owner = self.session['context']['owner']
+        boot = owner['bootId'] if os.name == 'nt' else str(uuid.UUID(owner['bootId']))
+        process = Mock(pid=owner['pid'], group='fixture-owned-M')
+        f.run.update(identity=dict(pid=owner['pid'], startId=owner['startId'], bootId=boot,
+            startMillis=1234, cwd='/fixture/world', executable='/fixture/java', commandHash='a' * 64, owner='fixture-user'),
+            creation=dict(pid=owner['pid'], ownerGroup=process.group, stage='RUNNING'))
+        f.runtime.processes[f.run['runId']] = process
+        f.runtime._remember_game_process(f.run, self.session)
+        f.db.execute('UPDATE runs SET record=? WHERE id=?', (json.dumps(f.run), f.run['runId']))
+        f.db.commit()
 
     def handshake(self):
         f = self.fixture

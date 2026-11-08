@@ -341,7 +341,7 @@ class ManagedRuntime:
     def save_evidence(self, connection, instance, session, deadline):
         """認証済保存原文と同stop予約をtx内で再照合し、hash参照と元予約本文を返す。
 
-        元M/Cの実終了・Data候補・Readyを証明しない。原文と予約は失敗時も保持する。
+        元Mの生成snapshotを再照合するが、M/C実終了・Data候補・Readyは証明しない。原文と予約を保持する。
         """
         deadline = min(deadline, session["stop_deadline"])
         row, gate, writers = self.snapshot(connection, instance, session)
@@ -383,6 +383,16 @@ class ManagedRuntime:
         require(pending.get("runId") == session["run"] and pending.get("controlOperationId") == stop["operationId"]
                 and ref is not None and ref["instance"] == instance and ref["lease"] == row["lease"] and ref["epoch"] == row["epoch"],
                 "STALE_OPERATION", "元stop意図と参照予約が一致しません")
+        record = connection.execute("SELECT record FROM runs WHERE id=? AND instance=? AND generation=?",
+                                    (row["run_id"], instance, row["generation"])).fetchone()
+        require(record is not None, "PROCESS_UNVERIFIED", "保存元Mのrun正本がありません")
+        run = json.loads(record[0])
+        _, snapshot = self.runtime._game_process(run)
+        require(all(run[k] == row[v] for k,v in
+                    (("runId","run_id"),("instanceId","id"),("generationId","generation"),("artifactId","artifact")))
+                and snapshot["owner"] == session["context"]["owner"]
+                and snapshot["descriptorSha256"] == gate["descriptor_hash"],
+                "PROCESS_MISMATCH", "保存原文と保持元Mの生成bindingが一致しません")
         require(time.monotonic() < deadline, "STOP_TIMEOUT", "保存原文の最終照合中に期限を超過しました")
         return {"operationId":message["operationId"], "requestBodySha256":wire.sha256(request[4:]),
                 "responseBodySha256":wire.sha256(reply[4:]), "descriptorSha256":wire.sha256(session["raw"])}, pending

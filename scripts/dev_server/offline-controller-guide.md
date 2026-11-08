@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）、第18スライス先行部分（保存原文と保持元Mの結束）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -220,3 +220,12 @@ P内部の単発接続部品は第15スライス節を参照してください�
 `RuntimeControl._game_process(run)`は保持した元handleと生成snapshotのcopyを返す内部取得です。PIDからの再attach・別processの採用・native本人再照会を行いません。この取得だけで停止・保存・全writer・候補・Registry退出・Ready/CLOSEDを証明しません。原要求hash参照/候補原本を再照合して観測Cへ供給し、C退出を最終Registry transaction/同deadlineへ接続する処理は後続です。
 
 保持資源はPのメモリ内にあり、P再起動後に復元しません。正常停止・失敗とも自動解放せず、正常解放は後続のRegistry退出確定に接続します。その接続が完了するまではrunごとのhandleがPの寿命中に残ります。実OSでのhandle資源消費・本人受入は未確認です。Ready期待値を自動承認する変更はありません。
+
+
+## 保存原文と保持元Mの結束（第18スライス先行部分）
+
+`ManagedRuntime.save_evidence`は、認証済Requested/COMPLETION・元stop予約・閉門/全writerの原文照合に続き、同じRegistry transactionで元run記録を読みます。run/instance/generation/artifactと、保持した元Mの生成identity/creation/handleを照合し、生成時のData ownerとdescriptor hashを保存原文へ結束します。Data ownerの原表記を維持し、native identityのUUID表現へ書き換えません。
+
+初回の保存原文参照の記録前と、公共stop/直接stopの最終transactionで同じ照合を行い、その完了後に元deadlineを検査します。不一致・期限超過では原文・PENDING/参照・保持資源を保全し、追加IPC/生成・自動再送・再attach・killへ進みません。既存stopの返却形式とcontrol slot終端は維持します。
+
+この照合は元Mの実終了、候補/退出証拠、Ready/CLOSEDを表しません。候補原本・全writer・正本予約の観測Cへの供給、C退出証拠の最終Registry確定、明示Readyの次open供給と元handle正常解放は後続です。実OS/native/実root受入は未確認です。

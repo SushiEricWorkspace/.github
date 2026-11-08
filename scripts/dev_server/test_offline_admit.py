@@ -285,8 +285,8 @@ class OfflineAdmitTests(unittest.TestCase):
             try:
                 self.assertTrue(entered.wait(10))
                 loser=pool.submit(self.admit)
-                start=pool.submit(self.runtime.execute,'start',dict(self.token,timeoutSeconds=1),operation_id='start-after-assigned')
                 with self.assertRaises(RegistryError): loser.result(10)
+                start=pool.submit(self.runtime.execute,'start',dict(self.token,timeoutSeconds=1),operation_id='start-after-assigned')
                 with self.assertRaises(RegistryError): start.result(10)
                 self.assertEqual(dict.fromkeys(self.counts,0),self.counts)
                 self.assertEqual(2,len(self.p.adapter.processes))
