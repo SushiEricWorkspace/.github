@@ -280,7 +280,8 @@ class RuntimeControl:
         fields(payload, TOKEN | {"timeoutSeconds"})
         identifier(payload["instanceId"], "instanceId")
         ttl(payload["timeoutSeconds"])
-        wait = self._lock_wait(time.monotonic() + payload["timeoutSeconds"]) if command == "stop" and self.managed is not None else nullcontext()
+        deadline = time.monotonic() + payload["timeoutSeconds"] if command == "stop" else None
+        wait = self._lock_wait(deadline) if command == "stop" and self.managed is not None else nullcontext()
         with wait:
             if not dry_run:
                 self.refresh()
@@ -340,7 +341,7 @@ class RuntimeControl:
                 return {"dryRun": True, "wouldExecute": command, "instanceId": row["id"]}
             session = self.managed.sessions.get(row["id"]) if self.managed is not None else None
             if joining_stop and session is not None and session.get("direct_stop"):
-                return self._join_direct_stop(row, payload, operation_id, fingerprint, session)
+                return self._join_direct_stop(row, payload, operation_id, fingerprint, session, deadline)
             join_direct = False
             with self._transaction(row["id"]) as connection:
                 for table in ("operations", "reference_operations", "writer_operations", "snapshot_operations"):
@@ -382,12 +383,13 @@ class RuntimeControl:
                                        (operation_id, "artifact:" + row["artifact"],
                                          row["id"], row["lease"], row["epoch"]))
             if join_direct:
-                return self._join_direct_stop(row, payload, operation_id, fingerprint, session)
+                return self._join_direct_stop(row, payload, operation_id, fingerprint, session, deadline)
+            committed = False
             try:
                 if command == "start":
                     result = self._start(row, payload, generation, endpoints, operation_id)
                 else:
-                    result = self._stop(row, payload, generation)
+                    result = self._stop(row, payload, generation, deadline)
                 with self._transaction(row["id"]) as connection:
                     current = self.registry._instance(connection, row["id"])
                     self.registry._token(current, payload, allow_expired=command == "stop")
@@ -407,16 +409,31 @@ class RuntimeControl:
                         _change(connection, current, gate["revision"], "OPEN")
                         connection.execute("UPDATE instances SET state='RUNNING',pending=0 WHERE id=?", (row["id"],))
                     else:
+                        if session is not None and "control_operation" in session:
+                            deadline = min(deadline, session["stop_deadline"])
+                            evidence, pending = self.managed.save_evidence(connection, row["id"], session, deadline)
+                            require(evidence == result["managedSave"] == pending.get("managedSave"),
+                                    "STALE_OPERATION", "確定前に元保存原文の記録が変更されました")
+                            require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop結果の最終照合後に期限を超過しました")
                         connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?",
                                            (json.dumps(result), row["id"]))
                     connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (json.dumps(result), operation_id))
                     connection.execute("DELETE FROM reservations WHERE operation=?", (operation_id,))
                     if command == "stop":
                         connection.execute("DELETE FROM reservations WHERE reference=?", ("stop:" + operation_id,))
+                committed = True
                 if command == "stop" and self.managed is not None:
-                    self.managed.release(row["id"], result["runId"])
+                    try:
+                        if "managedSave" in result:
+                            require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop結果記録後に期限を超過しました")
+                    finally:
+                        self.managed.release(row["id"], result["runId"])
+                if command == "stop" and "managedSave" in result:
+                    require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop返却前に期限を超過しました")
                 return result
             except BaseException as error:
+                if committed and command == "stop" and "managedSave" in result:
+                    raise
                 code = error.code if isinstance(error, RegistryError) else "RUNTIME_FAILED"
                 with self._transaction(row["id"]) as connection:
                     current = self.registry._instance(connection, row["id"])
@@ -429,8 +446,12 @@ class RuntimeControl:
                     gate = connection.execute("SELECT * FROM run_admission WHERE run=?", (current["run_id"],)).fetchone()
                     if gate is not None and gate["gate"] != "BLOCKED":
                         _change(connection, current, gate["revision"], "BLOCKED")
+                    failure = {"error": code}
+                    pending = json.loads(operation["response"])
+                    if command == "stop" and "managedSave" in pending:
+                        failure = dict(pending, error=code)
                     connection.execute("UPDATE runtime_operations SET status='RECOVERY_REQUIRED',response=? WHERE id=?",
-                                       (json.dumps({"error": code}), operation_id))
+                                       (json.dumps(failure), operation_id))
                 if isinstance(error, RegistryError):
                     raise
                 raise RegistryError(code, "runtime操作に失敗しました。保全し、自動kill/再送しません") from None
@@ -601,19 +622,26 @@ class RuntimeControl:
         self.processes.pop(run["runId"], None)
         return expected
 
-    def _stop(self, row, payload, generation):
+    def _stop(self, row, payload, generation, deadline=None):
         run, expected = self._load_run(row, with_record=True)
         process = self.processes[row["run_id"]]
         if self.managed is None or process.poll() is None:
             runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
         if self.managed is not None:
             session = self.managed.sessions[row["id"]]
-            deadline = time.monotonic() + payload["timeoutSeconds"]
+            if deadline is None:
+                deadline = time.monotonic() + payload["timeoutSeconds"]
+            deadline = min(deadline, session.get("stop_deadline", deadline))
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop待機前に期限を超過しました")
             self.managed.drain(row["id"], session, deadline)
+            deadline = min(deadline, session.get("stop_deadline", deadline))
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop drain後に期限を超過しました")
             if not session["stop"].is_set():
                 expected = self._rcon_stop(run, generation, process, max(0.001, deadline - time.monotonic()), expected=expected)
-            require(session["done"].wait(max(0, deadline - time.monotonic())),
-                    "CONTROL_UNKNOWN", "MのRequested/COMPLETION/closeが未完了です")
+            completed = session["done"].wait(max(0, deadline - time.monotonic()))
+            deadline = min(deadline, session.get("stop_deadline", deadline))
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop保存待機中に期限を超過しました")
+            require(completed, "CONTROL_UNKNOWN", "MのRequested/COMPLETION/closeが未完了です")
             require(session["error"] is None, "CONTROL_UNKNOWN", "元停止制御が不明です")
             remaining = max(0.001, deadline - time.monotonic())
         else:
@@ -631,13 +659,14 @@ class RuntimeControl:
                   "jvmAndChildrenExited": True, "externalWritersVerified": False, "snapshotClean": False,
                   "proofHash": run["proofHash"]}
         if self.managed is not None and "control_operation" in session:
-            result.update(stopOperationId=session["stop_operation"], controlOperationId=session["control_operation"])
+            result.update(stopOperationId=session["stop_operation"], controlOperationId=session["control_operation"],
+                          managedSave=dict(session["save_evidence"]))
         write_json(Path(run["proofPath"]).parent / "runtime-stop.json", result)
         return result
 
     def _direct_stop(self, instance, session):
         """外部停止も元runへ予約し、保存proofと実exit後にだけ停止確定する。"""
-        deadline = time.monotonic() + 30
+        deadline = session["stop_deadline"] if "control_operation" in session else time.monotonic() + 30
         operation_id = session.get("stop_operation", "direct-stop-" + uuid.uuid4().hex)
         with self._transaction(instance) as connection:
             row = dict(self.registry._instance(connection, instance))
@@ -647,6 +676,7 @@ class RuntimeControl:
                 return
             if connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND command='stop' AND status='PENDING' AND id!=?", (instance, operation_id)).fetchone() and not session.get("direct_stop"):
                 return
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "元stopの期限を超過しました")
             require(row["run_id"] == session["run"] and row["state"] == "STOPPING" and row["pending"],
                     "STALE_RUN", "直接停止した元runではありません")
             if "stop_operation" not in session:
@@ -654,46 +684,68 @@ class RuntimeControl:
                                    (operation_id, digest(session["raw"]), instance))
         generation = self._active_generation(row)
         # RCON再送を避け、受信済みSTOP_BLOCKと同Requestedだけから保存終端を照合する。
-        result = self._stop(row, dict(session["token"], timeoutSeconds=max(0.001, deadline - time.monotonic())), generation)
+        result = self._stop(row, dict(session["token"], timeoutSeconds=max(0.001, deadline - time.monotonic())), generation, deadline)
         with self._transaction(instance) as connection:
             current = self.registry._instance(connection, instance)
             self._binding(current, row)
+            if "control_operation" in session:
+                evidence, pending = self.managed.save_evidence(connection, instance, session, deadline)
+                require(evidence == result["managedSave"] == pending.get("managedSave"),
+                        "STALE_OPERATION", "直接stopの保存原文記録が変更されました")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "直接stopの最終照合後に期限を超過しました")
             connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?", (json.dumps(result), instance))
             connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (json.dumps(result), operation_id))
             connection.execute("DELETE FROM reservations WHERE reference=? AND operation=?",
                                ("stop:" + operation_id, session.get("control_operation")))
-        self.managed.release(instance, session["run"])
+        try:
+            if "managedSave" in result:
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "直接stop結果記録後に期限を超過しました")
+        finally:
+            self.managed.release(instance, session["run"])
+        if "managedSave" in result:
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "直接stop返却前に期限を超過しました")
 
-    def _join_direct_stop(self, row, payload, operation_id, fingerprint, session):
+    def _join_direct_stop(self, row, payload, operation_id, fingerprint, session, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + payload["timeoutSeconds"]
+        deadline = min(deadline, session.get("stop_deadline", deadline))
+        require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流受付前に期限を超過しました")
         parent = session["stop_operation"]
-        with self._transaction(row["id"]) as connection:
-            current = self.registry._instance(connection, row["id"])
-            self.registry._token(current, payload, allow_expired=True)
-            self._binding(current, row)
-            require(current["state"] in {"STOPPING", "LEASED_STOPPED"}, "STALE_RUN", "直接停止の元runではありません")
-            for table in ("operations", "runtime_operations", "reference_operations", "writer_operations", "snapshot_operations"):
-                require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
-                        "OPERATION_CONFLICT", "operationIdが他の操作に使用されています")
-            connection.execute("INSERT INTO runtime_operations VALUES (?,?, 'stop',?,'PENDING',?)",
-                (operation_id, fingerprint, row["id"], json.dumps({"runId": row["run_id"], "stopOperationId": parent})))
-            connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)",
-                (operation_id, "stop:" + parent, row["id"], row["lease"], row["epoch"]))
-        deadline = time.monotonic() + payload["timeoutSeconds"]
-        while True:
+        with self._lock_wait(deadline):
             with self._transaction(row["id"]) as connection:
                 current = self.registry._instance(connection, row["id"])
+                self.registry._token(current, payload, allow_expired=True)
                 self._binding(current, row)
-                saved = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND instance=? AND command='stop'", (parent, row["id"])).fetchone()
-                require(saved is not None, "CONTROL_UNKNOWN", "元停止予約がありません")
-                if saved["status"] == "COMPLETED":
-                    require(current["state"] == "LEASED_STOPPED" and not current["pending"], "CONTROL_UNKNOWN", "元停止が未確定です")
-                    result = json.loads(saved["response"])
-                    connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (saved["response"], operation_id))
-                    connection.execute("DELETE FROM reservations WHERE operation=?", (operation_id,))
-                    return result
-                require(saved["status"] == "PENDING" and current["state"] == "STOPPING", "CONTROL_UNKNOWN", "元停止が不明です")
-            require(time.monotonic() < deadline, "STOP_TIMEOUT", "直接停止の元結果を保全します")
-            time.sleep(0.01)
+                require(current["state"] in {"STOPPING", "LEASED_STOPPED"}, "STALE_RUN", "直接停止の元runではありません")
+                for table in ("operations", "runtime_operations", "reference_operations", "writer_operations", "snapshot_operations"):
+                    require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
+                            "OPERATION_CONFLICT", "operationIdが他の操作に使用されています")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流予約前に期限を超過しました")
+                connection.execute("INSERT INTO runtime_operations VALUES (?,?, 'stop',?,'PENDING',?)",
+                    (operation_id, fingerprint, row["id"], json.dumps({"runId": row["run_id"], "stopOperationId": parent})))
+                connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)",
+                    (operation_id, "stop:" + parent, row["id"], row["lease"], row["epoch"]))
+            while True:
+                result = None
+                with self._transaction(row["id"]) as connection:
+                    current = self.registry._instance(connection, row["id"])
+                    self._binding(current, row)
+                    saved = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND instance=? AND command='stop'", (parent, row["id"])).fetchone()
+                    require(saved is not None, "CONTROL_UNKNOWN", "元停止予約がありません")
+                    if saved["status"] == "COMPLETED":
+                        require(current["state"] == "LEASED_STOPPED" and not current["pending"], "CONTROL_UNKNOWN", "元停止が未確定です")
+                        result = json.loads(saved["response"])
+                        require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流結果の最終照合後に期限を超過しました")
+                        connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (saved["response"], operation_id))
+                        connection.execute("DELETE FROM reservations WHERE operation=?", (operation_id,))
+                    else:
+                        require(saved["status"] == "PENDING" and current["state"] == "STOPPING", "CONTROL_UNKNOWN", "元停止が不明です")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流結果記録後に期限を超過しました")
+                if result is not None:
+                    break
+                time.sleep(0.01)
+        require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流返却前に期限を超過しました")
+        return result
 
     def _running(self, row, *, closing=False, observe_stop=False):
         run = self._load_run(row)
