@@ -397,6 +397,43 @@ class _OfflineOpen:
             worker.acknowledge_startup(worker_record['startupResponseSha256'])
             return prepared
 
+    def _game_ready(self, connection, row, gate, proof, ready, deadline):
+        """確定stopの観測原本と独立明示Readyを照合する。OS観測とData作用は呼出元が担う。"""
+        if 'gameExit' not in proof:
+            return
+        slot, originals, binding = self.runtime._game_exit(row['run_id'], proof['stopOperationId'])
+        stop = connection.execute('SELECT fingerprint FROM runtime_operations WHERE id=?',
+                                  (proof['stopOperationId'],)).fetchone()
+        require(binding == {'instanceId':row['id'], 'runId':row['run_id'],
+                            'stopOperationId':proof['stopOperationId'], 'stopFingerprint':stop['fingerprint'],
+                            'controlOperationId':proof['controlOperationId']}
+                and slot['stop'] == (proof['stopOperationId'], stop['fingerprint'], proof['controlOperationId']),
+                'STALE_OPERATION', 'Ready供給元の終端資源が元stopと一致しません')
+        saved = proof['managedSave']
+        require(digest(originals['descriptor']) == saved['descriptorSha256'] == gate['descriptor_hash']
+                and digest(originals['save_request'][4:]) == saved['requestBodySha256']
+                and digest(originals['completion_response'][4:]) == saved['responseBodySha256'],
+                'STALE_OPERATION', 'Ready供給元の認証済原文が変更されました')
+        observer = slot['observer']
+        observed = json.loads(slot['result'])
+        require(proof['gameExit'] == {'candidate':slot['candidate'], 'observationSha256':digest(slot['result']),
+                    'requestSha256':digest(observer.request), 'responseSha256':digest(observer.game_exit_response),
+                    'observerRecordSha256':digest(slot['observer_snapshot'])}
+                and observer.game_exit_result == slot['result']
+                and canonical(observer.record) == slot['observer_snapshot']
+                and observed == observer.record['gameExit'],
+                'STALE_OPERATION', 'Ready供給元の確定参照と観測原本が一致しません')
+        response = json.loads(observer.game_exit_response)
+        require(observed['status'] == 'GAME_EXIT_OBSERVED' and observed['operationId'] == proof['stopOperationId']
+                and type(observed['exitCode']) is int and observed['exitCode'] == 0
+                and observed['allChildrenExited'] is True
+                and observed['requestSha256'] == proof['gameExit']['requestSha256']
+                and observed['responseSha256'] == proof['gameExit']['responseSha256']
+                and response['candidateStateSha256'] == slot['candidate']['stateSha256']
+                and canonical(ready) == canonical(observed['ready']) == canonical({key:response[key] for key in ready}),
+                'PROOF_MISMATCH', '独立明示Readyが同stopの正常退出応答と一致しません')
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready供給の最終照合後に期限を超過しました')
+
     def open(self, token, *, operation_id, revision, ready, deadline):
         """同leaseの認証run正常停止後だけCを取得する。例外後も予約と元Cを保全する。
 
@@ -417,6 +454,7 @@ class _OfflineOpen:
         with self.registry.resource_use(), self.runtime._lock_wait(deadline):
             with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
                 row, gate, run, proof, writers = self._state(connection, token, reserved=False)
+                self._game_ready(connection, row, gate, proof, ready, deadline)
                 require(type(revision) is int and gate['revision'] == revision,
                         'STALE_OPERATION', '閉門revisionが変更されました')
             generation = self.runtime._active_generation(row)
@@ -439,12 +477,15 @@ class _OfflineOpen:
                 self.runtime._binding(current, row)
                 require(current_gate == gate and current_proof == proof and current_run == run and current_writers == writers,
                         'STALE_OPERATION', '予約前に停止/drain証拠が変更されました')
+                self._game_ready(connection, current, current_gate, current_proof, ready, deadline)
                 for table in ('operations','runtime_operations','reference_operations','writer_operations','snapshot_operations'):
                     require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
                             'OPERATION_CONFLICT', '同じoperationIdを再取得・再作用しません')
                 require(not connection.execute('SELECT 1 FROM reservations WHERE instance=?', (row['id'],)).fetchone()
                         and not connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND status!='COMPLETED'",
                                                    (row['id'],)).fetchone(), 'WRITER_PENDING', '旧予約と未完了操作を保全します')
+                if 'gameExit' in proof:
+                    require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready取得予約前に期限を超過しました')
                 _change(connection, current, revision, 'BLOCKED')
                 connection.execute("INSERT INTO runtime_operations VALUES (?,?,'offline-open',?,'PENDING',?)",
                                    (operation_id,fingerprint,row['id'],json.dumps({'binding':expected})))
@@ -457,8 +498,11 @@ class _OfflineOpen:
             def verify():
                 with self.runtime._transaction(row['id'], read_only=True) as connection:
                     previous = self._reserved(connection,token,operation_id,fingerprint,expected)
+                    self._game_ready(connection, row, gate, proof, ready, deadline)
                 require(self.runtime.process_adapter.identity(previous['identity']['pid']) is None,
                         'PROCESS_MISMATCH', '旧MのPIDが存在します。結果不明を保全します')
+                if 'gameExit' in proof:
+                    require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready取得のPID照会後に期限を超過しました')
 
             diagnostics = self.runtime._paths(row['id']) / 'diagnostics' / ('offline-' + operation_id)
             controller = OfflineProcess(bundle,diagnostics,native=self.runtime.managed.transport.native,
@@ -472,6 +516,11 @@ class _OfflineOpen:
             verify()
             with self.runtime._transaction(row['id']) as connection:
                 self._reserved(connection,token,operation_id,fingerprint,expected)
-                saved = {'binding':expected,'startupResponseSha256':digest(canonical(response))}
-                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (json.dumps(saved),operation_id))
+                self._game_ready(connection, row, gate, proof, ready, deadline)
+                saved = json.dumps({'binding':expected,'startupResponseSha256':digest(canonical(response))})
+                if 'gameExit' in proof:
+                    require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready取得結果の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (saved,operation_id))
+            if 'gameExit' in proof:
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready取得結果の記録後に期限を超過しました')
             return response
