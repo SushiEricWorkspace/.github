@@ -24,9 +24,12 @@ class _OfflineOpen:
         self.workers = {}
         self.history = {}
 
-    def _state(self, connection, token, *, reserved):
+    def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
-        self.registry._token(row, token)
+        proof = json.loads(row['runtime_proof']) if row['runtime_proof'] else {}
+        terminal_release = (release_operation_id is not None
+                            and proof.get('gameHandleReleaseOperationId') == release_operation_id)
+        self.registry._token(row, token, allow_expired=terminal_release)
         require(row['state'] == 'LEASED_STOPPED' and row['generation_bound'] and row['generation'] is not None
                 and row['pending'] == int(reserved) and not row['writers'] and not row['children'],
                 'WRITER_PENDING', '停止済み世代とwriter/child/未完了操作の照合が必要です')
@@ -38,7 +41,6 @@ class _OfflineOpen:
                     ('artifactId','artifact'),('runId','run_id'))) and run.get('jvmAndChildrenExited') is True
                 and run.get('runtimeSaveCompleted') is True and type(run.get('exitCode')) is int and run['exitCode'] == 0,
                 'PROOF_REQUIRED', '元runの保存・全child正常終了証拠が必要です')
-        proof = json.loads(row['runtime_proof']) if row['runtime_proof'] else {}
         require(all(proof.get(k) == row[v] for k,v in (('instanceId','id'),('generation','generation'),('runId','run_id')))
                 and proof.get('nonce') == run['nonce'] and proof.get('runtimeStopped') is True
                 and proof.get('modSaveCompleted') is True and proof.get('jvmAndChildrenExited') is True
@@ -452,7 +454,7 @@ class _OfflineOpen:
         fingerprint = digest(canonical({'command':'game-handle-release','token':token,'stopOperationId':stop_operation_id}))
         with self.registry.resource_use(), self.runtime._lock_wait(deadline):
             with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
-                row, gate, run, proof, writers = self._state(connection, token, reserved=False)
+                row, gate, run, proof, writers = self._state(connection, token, reserved=False, release_operation_id=operation_id)
                 require(proof.get('stopOperationId') == stop_operation_id and 'gameExit' in proof,
                         'PROOF_REQUIRED', '同stopのgame退出確定証拠が必要です')
                 slot = self._game_observation(connection, row, gate, proof, deadline)
@@ -467,7 +469,7 @@ class _OfflineOpen:
                         'gameSnapshotSha256':digest(slot['snapshot']), 'observerRecordSha256':digest(slot['observer_snapshot'])}
 
             def checked(connection, reserved):
-                current, current_gate, current_run, current_proof, current_writers = self._state(connection, token, reserved=reserved)
+                current, current_gate, current_run, current_proof, current_writers = self._state(connection, token, reserved=reserved, release_operation_id=operation_id)
                 self.runtime._binding(current, row)
                 require(current_gate == gate and current_run == run and current_proof == proof and current_writers == writers
                         and self._game_observation(connection, current, current_gate, current_proof, deadline) is slot,

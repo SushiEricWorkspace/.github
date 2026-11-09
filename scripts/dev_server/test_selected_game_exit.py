@@ -198,8 +198,10 @@ class SelectedGameExitTests(unittest.TestCase):
                 self.assertEqual(after,self.effects())
             self.assertIs(self.runtime._transaction.__func__,runtime_control.RuntimeControl._transaction)
             self.assertEqual(1,len(self.f.adapter.created));self.assertEqual(0,self.f.rcon_calls)
-            self.assertFalse(self.case.m.closed)
-            if self.case.peer.adapter.processes:self.case.c.process.close.assert_not_called()
+            released = mode in ('ok', 'waiting', 'concurrent', 'manual') or (mode.startswith('input_') and mode != 'input_candidate')
+            self.assertEqual(released, self.case.m.closed)
+            if self.case.peer.adapter.processes:
+                self.assertEqual(int(released), self.case.c.process.close.call_count)
 
     def test_selected_stop_waits_then_observes_once_and_blocks_start(self):self.run_case('waiting',overlap=True)
     def test_concurrent_supply_rejects_second_before_io(self):self.run_case('concurrent')
