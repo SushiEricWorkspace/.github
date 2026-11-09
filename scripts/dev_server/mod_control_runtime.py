@@ -17,7 +17,7 @@ from .build_inputs import canonical, digest, regular_bytes
 from .local_ipc import MAX_MESSAGE, decode, plain_path, require_private
 from .mod_control_startup import _Startup, _admission, _change
 from .mod_control_transport import ModControlTransport, _WindowsNative
-from .registry import RegistryError, fields, require
+from .registry import RegistryError, fields, identifier, require
 from .runtime_bundle import _read_managed_profile, _expand_managed_launch, verify_bundle, require_data_generation
 
 
@@ -262,6 +262,8 @@ class ManagedRuntime:
             session["stop_request"] = request
             session["stop"].set()
             deadline = time.monotonic() + 30
+            if "game_exit_input" in session:
+                deadline = min(deadline, session["game_exit_input"]["deadline"])
             session["stop_deadline"] = deadline
             with self.runtime._lock_wait(deadline):
                 self.reserve_stop(instance, session)
@@ -378,6 +380,10 @@ class ManagedRuntime:
                 and parent["status"] == "PENDING" and parent["fingerprint"] == session["stop_fingerprint"],
                 "STALE_OPERATION", "元stopの正本予約がありません")
         pending = json.loads(parent["response"])
+        selected = session.get("game_exit_input")
+        if selected is not None and "raw" in selected:
+            require(pending.get("gameExitInputSha256") == digest(selected["raw"]),
+                    "STALE_OPERATION", "元stopへ記録した候補入力参照が一致しません")
         ref = connection.execute("SELECT * FROM reservations WHERE operation=? AND reference=?",
                                  (session["control_operation"], "stop:" + session["stop_operation"])).fetchone()
         require(pending.get("runId") == session["run"] and pending.get("controlOperationId") == stop["operationId"]
@@ -396,6 +402,127 @@ class ManagedRuntime:
         require(time.monotonic() < deadline, "STOP_TIMEOUT", "保存原文の最終照合中に期限を超過しました")
         return {"operationId":message["operationId"], "requestBodySha256":wire.sha256(request[4:]),
                 "responseBodySha256":wire.sha256(reply[4:]), "descriptorSha256":wire.sha256(session["raw"])}, pending
+
+    def select_game_exit(self, token, *, run_id, operation_id, descriptor_sha256, deadline):
+        """信頼済みP入力専用。停止予約前に、元run/stop/descriptorの候補受付を一度選ぶ。
+
+        公開RPCやMod wireからは呼ばない。選択したstopは保存原文確定後、同期限内の
+        supply_game_exitを待つ。候補の公開供給元・Ready承認・handle解放は含めない。
+        """
+        identifier(operation_id, "operationId")
+        wire._hash(descriptor_sha256)
+        instance = token["instanceId"]
+        with self.runtime._lock_wait(deadline), self.runtime._transaction(instance, read_only=True) as connection:
+            with self.lock:
+                session = self.sessions[instance]
+                require("game_exit_input" not in session and "game_exit" not in session
+                        and not session["stop"].is_set() and not session["done"].is_set(),
+                        "CONTROL_PENDING", "候補受付は元runの停止前に一度だけ選択します")
+                row = self.registry._instance(connection, instance)
+                self.registry._token(row, token)
+                gate = _admission(connection, row)
+                require(row["state"] == "RUNNING" and not row["pending"] and gate["gate"] == "OPEN"
+                        and row["run_id"] == session["run"] == run_id
+                        and gate["descriptor_hash"] == wire.sha256(session["raw"]) == descriptor_sha256,
+                        "STALE_RUN", "候補受付の元run/descriptorが一致しません")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補受付の選択期限を超過しました")
+                binding = {"instanceId": instance, "runId": run_id, "stopOperationId": operation_id,
+                           "descriptorSha256": descriptor_sha256}
+                session["game_exit_input"] = {"binding": canonical(binding), "deadline": deadline,
+                                             "event": threading.Event(), "submitted": False, "error": None}
+        return deepcopy(binding)
+
+    def supply_game_exit(self, token, *, run_id, operation_id, descriptor_sha256, candidate, deadline):
+        """保存原文確定後、認証した同stopへ独立明示候補を一度供給する。
+
+        認証/元予約の拒否は受付を消費しない。確保後の候補失敗は原本と予約を保全して終端する。
+        受理原文に実効期限を固定し、通知後の確定状態を読んだ停止側だけがCを生成する。
+        """
+        token = deepcopy(token)
+        instance = token["instanceId"]
+        binding = {"instanceId": instance, "runId": run_id, "stopOperationId": operation_id,
+                   "descriptorSha256": descriptor_sha256}
+        with self.runtime._lock_wait(deadline), self.runtime._transaction(instance, read_only=True) as connection:
+            row = self.registry._instance(connection, instance)
+            self.registry._token(row, token, allow_expired=True)
+            with self.lock:
+                session = self.sessions[instance]
+                selected = session["game_exit_input"]
+                deadline = min(deadline, selected["deadline"], session.get("stop_deadline", deadline))
+                require(canonical(binding) == selected["binding"], "STALE_OPERATION", "候補入力の元run/stop/descriptorが一致しません")
+                require(session["done"].is_set() and session["error"] is None,
+                        "CONTROL_UNKNOWN", "候補は保存原文確定後にだけ供給します")
+                require(not selected["submitted"], "CONTROL_PENDING", "候補入力を再供給しません")
+                evidence, pending = self.save_evidence(connection, instance, session, deadline)
+                require(session["stop_operation"] == operation_id and session["run"] == run_id
+                        and wire.sha256(session["raw"]) == descriptor_sha256
+                        and evidence == session["save_evidence"] == pending.get("managedSave")
+                        and "gameExitInputSha256" not in pending,
+                        "STALE_OPERATION", "候補入力の正本予約/保存原文が変更されました")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補受付の確保前に期限を超過しました")
+                selected["submitted"] = True
+                selected["accepted"] = False
+        try:
+            candidate = deepcopy(candidate)
+            self.game_exit_inputs(instance, session, candidate, deadline)
+            raw = canonical(dict(binding, candidate=candidate, deadline=deadline))
+            result = {"inputSha256": digest(raw)}
+            with self.runtime._lock_wait(deadline), self.runtime._transaction(instance) as connection:
+                row = self.registry._instance(connection, instance)
+                self.registry._token(row, token, allow_expired=True)
+                evidence, pending = self.save_evidence(connection, instance, session, deadline)
+                require(session["stop_operation"] == operation_id and session["run"] == run_id
+                        and wire.sha256(session["raw"]) == descriptor_sha256
+                        and evidence == session["save_evidence"] == pending.get("managedSave")
+                        and "gameExitInputSha256" not in pending,
+                        "STALE_OPERATION", "候補入力の正本予約/保存原文が変更されました")
+                with self.lock:
+                    require(self.sessions.get(instance) is session and session.get("game_exit_input") is selected,
+                            "STALE_OPERATION", "元候補受付が変更されました")
+                    require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補入力の記録前に期限を超過しました")
+                    selected["raw"] = raw
+                    connection.execute("UPDATE runtime_operations SET response=? WHERE id=?",
+                                       (json.dumps(dict(pending, gameExitInputSha256=result["inputSha256"])), operation_id))
+            with self.lock:
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補入力の記録後に期限を超過しました")
+                selected["event"].set()
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補入力返却前に期限を超過しました")
+                selected["accepted"] = True
+                return result
+        except BaseException as error:
+            with self.lock:
+                selected["error"] = error
+                selected["accepted"] = False
+                if not selected["event"].is_set():
+                    selected["event"].set()
+            raise
+
+    def observe_selected_game_exit(self, instance, session, deadline):
+        """選択済みstopだけ候補を待ち、確定状態と供給期限を再読込してCを一度開始する。"""
+        selected = session.get("game_exit_input")
+        if selected is None:
+            return
+        deadline = min(deadline, session["stop_deadline"], selected["deadline"])
+        binding = {"instanceId": instance, "runId": session["run"], "stopOperationId": session["stop_operation"],
+                   "descriptorSha256": wire.sha256(session["raw"])}
+        require(canonical(binding) == selected["binding"], "STALE_OPERATION", "候補を選択した元stopではありません")
+        completed = selected["event"].wait(max(0, deadline - time.monotonic()))
+        with self.lock:
+            require(self.sessions.get(instance) is session and session.get("game_exit_input") is selected,
+                    "STALE_OPERATION", "元候補受付が変更されました")
+            if "raw" in selected:
+                value = json.loads(selected["raw"])
+                deadline = min(deadline, value["deadline"])
+                session["stop_deadline"] = min(session["stop_deadline"], deadline)
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補入力の待機中に期限を超過しました")
+            require(completed and selected["submitted"], "CONTROL_UNKNOWN", "選択した候補入力が未確定です")
+            if selected["error"] is not None:
+                raise selected["error"]
+            require(selected.get("accepted") is True and "raw" in selected,
+                    "CONTROL_UNKNOWN", "選択した候補入力が未確定です")
+            require(canonical(dict(binding, candidate=value["candidate"], deadline=value["deadline"])) == selected["raw"],
+                    "STALE_OPERATION", "受理した候補入力が変更されました")
+        self.observe_game_exit(instance, session, value["candidate"], deadline)
 
     def game_exit_inputs(self, instance, session, candidate, deadline):
         """明示候補の不変原本を同stopの保存原文へ結束し、C向け欄と原bytesを返す。
@@ -474,7 +601,23 @@ class ManagedRuntime:
         with self.lock:
             require(self.sessions.get(instance) is session and "game_exit" not in session,
                     "CONTROL_PENDING", "保持した同sessionでgame退出を一度だけ観測します")
+            selected = session.get("game_exit_input")
+            if selected is not None:
+                require(selected["event"].is_set() and selected["submitted"] and selected["error"] is None
+                        and selected.get("accepted") is True and "raw" in selected,
+                        "CONTROL_UNKNOWN", "選択した候補入力の確定前にCを起動しません")
+                value = json.loads(selected["raw"])
+                binding = {"instanceId": instance, "runId": session["run"], "stopOperationId": session["stop_operation"],
+                           "descriptorSha256": wire.sha256(session["raw"])}
+                require(selected["binding"] == canonical(binding)
+                        and selected["raw"] == canonical(dict(binding, candidate=candidate, deadline=value["deadline"])),
+                        "STALE_OPERATION", "観測に使う明示候補入力が変更されました")
+                deadline = min(deadline, value["deadline"])
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "供給期限後にCを起動しません")
+                session["stop_deadline"] = min(session["stop_deadline"], deadline)
             slot = {"candidate": deepcopy(candidate)}
+            if selected is not None:
+                slot["input"] = selected["raw"]
             session["game_exit"] = slot
         with self.runtime._lock_wait(deadline):
             inputs = self.game_exit_inputs(instance, session, candidate, deadline)
@@ -550,6 +693,18 @@ class ManagedRuntime:
         frame = json.loads(slot["frame"])
         request = json.loads(observer.request)
         candidate = slot["candidate"]
+        selected = session.get("game_exit_input")
+        if selected is not None or "input" in slot:
+            require(selected is not None and selected["error"] is None and selected["submitted"]
+                    and selected.get("accepted") is True and selected.get("raw") == slot.get("input"),
+                    "STALE_OPERATION", "観測に使った明示候補入力が変更されました")
+            value = json.loads(slot["input"])
+            binding = {"instanceId": instance, "runId": session["run"], "stopOperationId": session["stop_operation"],
+                       "descriptorSha256": wire.sha256(session["raw"])}
+            require(selected["binding"] == canonical(binding)
+                    and slot["input"] == canonical(dict(binding, candidate=candidate, deadline=value["deadline"])),
+                    "STALE_OPERATION", "観測に使った明示候補入力が変更されました")
+            deadline = min(deadline, value["deadline"])
         require(observer.game_exit_result == slot["result"] and observer.record["gameExit"] == result
                 and canonical(observer.game_exit_frame) == slot["frame"]
                 and all(frame[k] == v for k,v in slot["inputs"][0].items())
