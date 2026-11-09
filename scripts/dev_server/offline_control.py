@@ -397,8 +397,8 @@ class _OfflineOpen:
             worker.acknowledge_startup(worker_record['startupResponseSha256'])
             return prepared
 
-    def _game_ready(self, connection, row, gate, proof, ready, deadline):
-        """確定stopの観測原本と独立明示Readyを照合する。OS観測とData作用は呼出元が担う。"""
+    def _game_observation(self, connection, row, gate, proof, deadline):
+        """確定stopと保持した観測原本を照合する。Readyの承認とOS再観測は行わない。"""
         if 'gameExit' not in proof:
             return
         slot, originals, binding = self.runtime._game_exit(row['run_id'], proof['stopOperationId'])
@@ -430,9 +430,122 @@ class _OfflineOpen:
                 and observed['requestSha256'] == proof['gameExit']['requestSha256']
                 and observed['responseSha256'] == proof['gameExit']['responseSha256']
                 and response['candidateStateSha256'] == slot['candidate']['stateSha256']
-                and canonical(ready) == canonical(observed['ready']) == canonical({key:response[key] for key in ready}),
+                and canonical(observed['ready']) == canonical({key:response[key] for key in ('worldUuid','runUuid','stateSha256','stateRevision')}),
                 'PROOF_MISMATCH', '独立明示Readyが同stopの正常退出応答と一致しません')
         require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready供給の最終照合後に期限を超過しました')
+        return slot
+
+    def _game_ready(self, connection, row, gate, proof, ready, deadline):
+        """確定stopの観測原本と独立明示Readyを照合する。OS観測とData作用は呼出元が担う。"""
+        slot = self._game_observation(connection, row, gate, proof, deadline)
+        if slot is not None:
+            require(canonical(ready) == canonical(json.loads(slot['result'])['ready']),
+                    'PROOF_MISMATCH', '独立明示Readyが同stopの正常退出応答と一致しません')
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready供給の最終照合後に期限を超過しました')
+
+    def release_game_handles(self, token, *, operation_id, stop_operation_id, deadline):
+        """確定stopの元M/観測Cを一度だけ解放する。部分失敗も元objectとPENDING予約を保全する。"""
+        fields(token, TOKEN)
+        identifier(operation_id, 'operationId')
+        identifier(stop_operation_id, 'stopOperationId')
+        token = deepcopy(token)
+        fingerprint = digest(canonical({'command':'game-handle-release','token':token,'stopOperationId':stop_operation_id}))
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                row, gate, run, proof, writers = self._state(connection, token, reserved=False)
+                require(proof.get('stopOperationId') == stop_operation_id and 'gameExit' in proof,
+                        'PROOF_REQUIRED', '同stopのgame退出確定証拠が必要です')
+                slot = self._game_observation(connection, row, gate, proof, deadline)
+            process, snapshot = self.runtime._game_process(run)
+            observer = slot['observer_process']
+            pipe = slot['observer'].pipe
+            require(row['id'] not in self.controllers and 'handle_release' not in slot,
+                    'PROCESS_MISMATCH', '元M/Cの保持本人または解放枠が一致しません')
+            expected = {'runId':row['run_id'],'stopOperationId':stop_operation_id,'revision':gate['revision'],
+                        'stopProofSha256':digest(canonical(proof)), 'runRecordSha256':digest(canonical(run)),
+                        'descriptorSha256':gate['descriptor_hash'],'writers':writers,
+                        'gameSnapshotSha256':digest(slot['snapshot']), 'observerRecordSha256':digest(slot['observer_snapshot'])}
+
+            def checked(connection, reserved):
+                current, current_gate, current_run, current_proof, current_writers = self._state(connection, token, reserved=reserved)
+                self.runtime._binding(current, row)
+                require(current_gate == gate and current_run == run and current_proof == proof and current_writers == writers
+                        and self._game_observation(connection, current, current_gate, current_proof, deadline) is slot,
+                        'STALE_OPERATION', 'handle解放中に元停止証拠が変更されました')
+                held, born = self.runtime._game_process(current_run)
+                observed = json.loads(slot['result'])
+                controller = slot['observer']
+                request = json.loads(controller.request)
+                require(held is process is slot['process'] and canonical(born) == slot['snapshot'] == canonical(snapshot)
+                        and snapshot['owner'] == observed['gameOwner'] and process.group == observed['gameGroup']
+                        and controller.process is observer is slot['observer_process'] and observer is not process
+                        and controller.pipe is pipe
+                        and controller.identity == controller.record['identity']
+                        and controller.data_identity == controller.record['controlIdentity'] == observed['observer'] == request['owner']
+                        and observer.pid == controller.identity['pid'] == controller.data_identity['pid'] == controller.record['creation']['pid']
+                        and observer.group == controller.record['creation']['ownerGroup'] == observed['observerGroup']
+                        and observer.group != process.group,
+                        'PROCESS_MISMATCH', 'handle解放中に元M/Cの保持資源が変更されました')
+                if not reserved:
+                    require('handle_release' not in slot and row['id'] not in self.controllers,
+                            'WRITER_PENDING', '元M/Cの単発解放は開始済みです')
+                if reserved:
+                    require(slot.get('handle_release') is progress, 'STALE_OPERATION', '元handle解放の進捗保持先が変更されました')
+                    operation = connection.execute('SELECT * FROM runtime_operations WHERE id=?', (operation_id,)).fetchone()
+                    refs = connection.execute('SELECT * FROM reservations WHERE instance=?', (row['id'],)).fetchall()
+                    require(operation is not None and operation['instance'] == row['id']
+                            and operation['command'] == 'game-handle-release' and operation['fingerprint'] == fingerprint
+                            and operation['status'] == 'PENDING' and json.loads(operation['response']) == {'binding':expected}
+                            and len(refs) == 1 and refs[0]['operation'] == operation_id
+                            and refs[0]['reference'] == 'artifact:' + row['artifact']
+                            and refs[0]['lease'] == row['lease'] and refs[0]['epoch'] == row['epoch'],
+                            'STALE_OPERATION', '元handle解放予約が変更されました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'handle解放の最終照合後に期限を超過しました')
+
+            with self.runtime._transaction(row['id']) as connection:
+                checked(connection, False)
+                for table in ('operations','runtime_operations','reference_operations','writer_operations','snapshot_operations'):
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT', 'handle解放を再実行しません')
+                require(not connection.execute('SELECT 1 FROM reservations WHERE instance=?', (row['id'],)).fetchone()
+                        and not connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND status!='COMPLETED'", (row['id'],)).fetchone(),
+                        'WRITER_PENDING', '未完了操作の資源を保全します')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'handle解放予約前に期限を超過しました')
+                connection.execute("INSERT INTO runtime_operations VALUES (?,?,'game-handle-release',?,'PENDING',?)",
+                                   (operation_id,fingerprint,row['id'],json.dumps({'binding':expected})))
+                connection.execute('INSERT INTO reservations VALUES (?,?,?,?,?)',
+                                   (operation_id,'artifact:'+row['artifact'],row['id'],row['lease'],row['epoch']))
+                connection.execute('UPDATE instances SET pending=1 WHERE id=?', (row['id'],))
+            progress = {'operationId':operation_id,'fingerprint':fingerprint,'m':'NOT_STARTED','c':'NOT_STARTED'}
+            slot['handle_release'] = progress
+            def verify_pipe():
+                with self.runtime._transaction(row['id'], read_only=True) as connection:
+                    checked(connection, True)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '親側pipe解放直前に期限を超過しました')
+
+            for role, owned in (('m',process),('c',observer)):
+                with self.runtime._transaction(row['id'], read_only=True) as connection:
+                    checked(connection, True)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '元handle解放直前に期限を超過しました')
+                progress[role] = 'UNKNOWN'
+                owned.close()
+                if role == 'c':
+                    pipe.close_after_exit(verify=verify_pipe)
+                progress[role] = 'RELEASED'
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '元handle解放後に期限を超過しました')
+            result = {'instanceId':row['id'],'runId':row['run_id'],'stopOperationId':stop_operation_id,
+                      'handlesReleased':True,'binding':expected}
+            with self.runtime._transaction(row['id']) as connection:
+                checked(connection, True)
+                saved = json.dumps(result)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'handle解放結果更新前に期限を超過しました')
+                connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (saved,operation_id))
+                connection.execute('UPDATE instances SET pending=0 WHERE id=?', (row['id'],))
+                connection.execute('DELETE FROM reservations WHERE operation=?', (operation_id,))
+            progress['completed'] = True
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'handle解放結果記録後に期限を超過しました')
+            return result
+
 
     def open(self, token, *, operation_id, revision, ready, deadline):
         """同leaseの認証run正常停止後だけCを取得する。例外後も予約と元Cを保全する。

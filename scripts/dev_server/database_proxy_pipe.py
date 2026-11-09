@@ -105,10 +105,12 @@ class ProxyPipe:
         self.incoming.clear()
         self.expected = None
 
-    def close_after_exit(self):
+    def close_after_exit(self, verify=None):
         self.close_child_ends()
         for name in ('input', 'output'):
             value = getattr(self, name)
             if value is not None:
+                if verify is not None:
+                    verify()
                 os.close(value)
                 setattr(self, name, None)
