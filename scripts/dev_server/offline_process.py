@@ -364,7 +364,10 @@ class OfflineProcess:
             verify()
         with (self.diagnostics / 'stderr.log').open('xb') as log:
             make_private(self.diagnostics / 'stderr.log')
-            self.process.start(arguments, self.bundle, log, 'offline-' + role + '-' + uuid.uuid4().hex, created,
+            name = 'offline-' + role + '-' + uuid.uuid4().hex
+            if command == 'open':
+                verify()
+            self.process.start(arguments, self.bundle, log, name, created,
                                input_fd=self.pipe.child_input, output_fd=self.pipe.child_output)
         self.pipe.close_child_ends()
         self.record['creation']['stage'] = self.process.stage
