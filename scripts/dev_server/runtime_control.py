@@ -45,6 +45,7 @@ class RuntimeControl:
         self.process_adapter = process_adapter
         self.processes = {}
         self.game_processes = {}
+        self.game_exits = {}
         self.managed = None
         self._control = None
         self._offline = None
@@ -415,6 +416,9 @@ class RuntimeControl:
                             evidence, pending = self.managed.save_evidence(connection, row["id"], session, deadline)
                             require(evidence == result["managedSave"] == pending.get("managedSave"),
                                     "STALE_OPERATION", "確定前に元保存原文の記録が変更されました")
+                            if "game_exit" in session:
+                                require(self.managed.game_exit_evidence(row["id"], session, deadline) == result.get("gameExit"),
+                                        "STALE_OPERATION", "確定前にgame退出証拠が変更されました")
                             require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop結果の最終照合後に期限を超過しました")
                         connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?",
                                            (json.dumps(result), row["id"]))
@@ -632,6 +636,30 @@ class RuntimeControl:
                     "PROCESS_MISMATCH", "元Mの生成handleまたはsnapshotが変更されました")
             return process, snapshot
 
+    def _remember_game_exit(self, instance, session):
+        """active slotを外す前に、元run/stopのCと固定原文を終端保持へ移す。"""
+        key = (session["run"], session["stop_operation"])
+        originals = {"descriptor": session["raw"],
+                     "startup_request": self.managed.startup.sessions[instance]["request"],
+                     "stop_request": session["stop_request"], "save_request": session["save_request"],
+                     "completion_response": session["completion_response"]}
+        binding = canonical({"instanceId": instance, "runId": key[0], "stopOperationId": key[1],
+                             "stopFingerprint": session["stop_fingerprint"], "controlOperationId": session["control_operation"]})
+        with self._control_lock:
+            require(key not in self.game_exits, "STALE_OPERATION", "元game退出の終端資源を差し替えません")
+            self.game_exits[key] = (session["game_exit"], originals, binding)
+
+    def _game_exit(self, run_id, stop_operation):
+        """Pが保持した元Cのslotと、原文/bindingのcopyを返す。再観測/再attach/解放はしない。"""
+        with self._control_lock:
+            held = self.game_exits.get((run_id, stop_operation))
+            require(held is not None, "PROCESS_UNVERIFIED", "元run/stopの観測Cを保持していません")
+            slot, originals, raw = held
+            binding = json.loads(raw)
+            require(binding["runId"] == run_id and binding["stopOperationId"] == stop_operation,
+                    "PROCESS_MISMATCH", "終端資源の元run/stopが一致しません")
+            return slot, dict(originals), binding
+
     def _wait_exit(self, run, process, timeout, *, expected, verify=None):
         with self._control_lock:
             retained = run["runId"] in self.game_processes
@@ -685,6 +713,9 @@ class RuntimeControl:
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop保存待機中に期限を超過しました")
             require(completed, "CONTROL_UNKNOWN", "MのRequested/COMPLETION/closeが未完了です")
             require(session["error"] is None, "CONTROL_UNKNOWN", "元停止制御が不明です")
+            if "game_exit" in session:
+                self.managed.game_exit_inputs(row["id"], session, session["game_exit"]["candidate"], deadline)
+                self.managed.game_exit_evidence(row["id"], session, deadline)
             remaining = max(0.001, deadline - time.monotonic())
         else:
             expected = self._rcon_stop(run, generation, process, payload["timeoutSeconds"], expected=expected)
@@ -703,6 +734,9 @@ class RuntimeControl:
         if self.managed is not None and "control_operation" in session:
             result.update(stopOperationId=session["stop_operation"], controlOperationId=session["control_operation"],
                           managedSave=dict(session["save_evidence"]))
+            if "game_exit" in session:
+                self.managed.game_exit_inputs(row["id"], session, session["game_exit"]["candidate"], deadline)
+                result["gameExit"] = self.managed.game_exit_evidence(row["id"], session, deadline)
         write_json(Path(run["proofPath"]).parent / "runtime-stop.json", result)
         return result
 
@@ -734,6 +768,9 @@ class RuntimeControl:
                 evidence, pending = self.managed.save_evidence(connection, instance, session, deadline)
                 require(evidence == result["managedSave"] == pending.get("managedSave"),
                         "STALE_OPERATION", "直接stopの保存原文記録が変更されました")
+                if "game_exit" in session:
+                    require(self.managed.game_exit_evidence(instance, session, deadline) == result.get("gameExit"),
+                            "STALE_OPERATION", "直接stopのgame退出証拠が変更されました")
                 require(time.monotonic() < deadline, "STOP_TIMEOUT", "直接stopの最終照合後に期限を超過しました")
             connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?", (json.dumps(result), instance))
             connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (json.dumps(result), operation_id))

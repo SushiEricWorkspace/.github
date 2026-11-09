@@ -520,15 +520,71 @@ class ManagedRuntime:
             verify()
             require(observer.game_exit_result == canonical(result), "STALE_OPERATION", "観測Cの局所原本が一致しません")
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出接続の最終照合後に期限を超過しました")
+            slot.update(observer_process=observer.process, observer_snapshot=canonical(observer.record), frame=canonical(frame))
             slot["result"] = canonical(result)
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出局所結果の保持後に期限を超過しました")
             return deepcopy(result)
+
+    def game_exit_evidence(self, instance, session, deadline):
+        """元M/Cの保持証拠を停止結果のhash参照へ束縛する。
+
+        最終確定時は同txのsave_evidenceで正本/原文も照合する。
+        OS/file/IPC作用は行わない。Ready承認・CLOSED・handle解放は含めない。
+        """
+        deadline = min(deadline, session["stop_deadline"])
+        with self.lock:
+            require(self.sessions.get(instance) is session, "STALE_OPERATION", "元game退出sessionがありません")
+            slot = session["game_exit"]
+        require("result" in slot and session["done"].is_set() and session["error"] is None,
+                "CONTROL_UNKNOWN", "開始済みgame退出観測が未確定です")
+        require(tuple(session[k] for k in ("stop_operation", "stop_fingerprint", "control_operation")) == slot["stop"],
+                "STALE_OPERATION", "game退出の元stopが変更されました")
+        snapshot = json.loads(slot["snapshot"])
+        process, current = self.runtime._game_process(snapshot["run"])
+        require(process is slot["process"] and canonical(current) == slot["snapshot"],
+                "PROCESS_MISMATCH", "game退出の元Mが変更されました")
+        observer = slot["observer"]
+        require(observer.process is slot["observer_process"] and canonical(observer.record) == slot["observer_snapshot"],
+                "PROCESS_MISMATCH", "観測Cの保持object/recordが変更されました")
+        result = json.loads(slot["result"])
+        frame = json.loads(slot["frame"])
+        request = json.loads(observer.request)
+        candidate = slot["candidate"]
+        require(observer.game_exit_result == slot["result"] and observer.record["gameExit"] == result
+                and canonical(observer.game_exit_frame) == slot["frame"]
+                and all(frame[k] == v for k,v in slot["inputs"][0].items())
+                and all(request[k] == v for k,v in frame.items())
+                and frame["operationId"] == session["stop_operation"] == result["operationId"]
+                and frame["expectedStateSha256"] == candidate["stateSha256"]
+                and frame["expectedRevision"] == candidate["stateRevision"]
+                and digest(slot["inputs"][1]) == candidate["stateSha256"]
+                and digest(slot["inputs"][2]) == frame["saveProofSha256"]
+                and all(frame[k] == candidate[k] for k in ("worldUuid", "runUuid"))
+                and result["requestSha256"] == digest(observer.request)
+                and result["responseSha256"] == digest(observer.game_exit_response),
+                "STALE_OPERATION", "同候補の観測C要求/応答/結果が一致しません")
+        require(result["status"] == "GAME_EXIT_OBSERVED" and type(result["exitCode"]) is int
+                and result["exitCode"] == 0 and result["allChildrenExited"] is True
+                and result["gameOwner"] == frame["gameOwner"] == snapshot["owner"]
+                and result["gameGroup"] == process.group
+                and observer.record["identity"] == observer.identity
+                and observer.record["controlIdentity"] == observer.data_identity == result["observer"] == request["owner"]
+                and observer.process.pid == observer.identity["pid"] == observer.data_identity["pid"] == observer.record["creation"]["pid"]
+                and observer.process.group == observer.record["creation"]["ownerGroup"] == result["observerGroup"]
+                and observer.process.group != process.group,
+                "PROCESS_MISMATCH", "元M/観測Cの正常終了bindingが一致しません")
+        require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出証拠の最終照合後に期限を超過しました")
+        return {"candidate": deepcopy(candidate), "observationSha256": digest(slot["result"]),
+                "requestSha256": result["requestSha256"], "responseSha256": result["responseSha256"],
+                "observerRecordSha256": digest(slot["observer_snapshot"])}
 
     def release(self, instance, run_id):
         with self.lock:
             session = self.sessions[instance]
             require(session["run"] == run_id and session["done"].is_set() and session["error"] is None,
                     "CONTROL_UNKNOWN", "未終端control slotを解放しません")
+            if "game_exit" in session:
+                self.runtime._remember_game_exit(instance, session)
             self.sessions.pop(instance)
             self.startup.sessions.pop(instance)
 
