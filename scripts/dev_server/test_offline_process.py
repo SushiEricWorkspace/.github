@@ -96,12 +96,21 @@ class Pipe:
     def __init__(self):
         self.child_input = 101 + len(self.current.pipes) * 2
         self.child_output = self.child_input + 1
+        self.input, self.output = self.child_input + 1000, self.child_output + 1000
         self.sent = []
         self.effects = 0
         self.current.pipes.append(self)
 
     def close_child_ends(self):
         self.child_input = self.child_output = None
+
+    def close_after_exit(self, verify=None):
+        self.close_child_ends()
+        for name in ('input', 'output'):
+            if getattr(self, name) is not None:
+                if verify is not None:
+                    verify()
+                setattr(self, name, None)
 
     def send(self, request, deadline, verify):
         verify()

@@ -60,6 +60,18 @@ class RuntimeControl:
                 self._offline = _OfflineOpen(self)
         return self._offline.open(token, operation_id=operation_id, revision=revision, ready=ready, deadline=deadline)
 
+    def _release_game_handles(self, token, *, operation_id, stop_operation_id, deadline):
+        """P内部専用。確定stopの元M/観測Cを一度だけ解放し、失敗時は進捗と予約を保持する。
+
+        公共stopからは自動実行しない。Ready承認・writer CLOSED・失敗後の再試行は行わない。
+        """
+        from .offline_control import _OfflineOpen
+        with self._control_lock:
+            if self._offline is None:
+                self._offline = _OfflineOpen(self)
+        return self._offline.release_game_handles(token, operation_id=operation_id,
+                                                 stop_operation_id=stop_operation_id, deadline=deadline)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")

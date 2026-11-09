@@ -213,7 +213,7 @@ if os.name == "nt":
 
         def close(self):
             _winapi.CloseHandle(self.handle)
-            kernel.CloseHandle(self.job)
+            _check(kernel.CloseHandle(self.job))
 
 else:
     class BsdInfo(ctypes.Structure):
