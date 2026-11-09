@@ -258,8 +258,10 @@ class StopTests(unittest.TestCase):
                 self.assertEqual([],self.source.query('SELECT * FROM reservations'))
                 self.assertNotIn(self.instance,self.managed.sessions)
             self.assertIs(self.runtime._transaction.__func__,runtime_control.RuntimeControl._transaction)
-            self.assertFalse(self.m.closed)
-            if not unfinished:self.c.process.close.assert_not_called()
+            released = not direct and error is None
+            self.assertEqual(released, self.m.closed)
+            if not unfinished:
+                self.assertEqual(int(released), self.c.process.close.call_count)
             self.assertEqual(1,len(self.f.adapter.created));self.assertEqual(0,self.f.rcon_calls)
 
     def test_public_stop_commits_bound_game_exit_and_blocks_start(self):self.stop_case(overlap=True)
@@ -318,7 +320,9 @@ class StopTests(unittest.TestCase):
         self.assertEqual(captured['binding'],self.runtime._game_exit(*captured['key'])[2])
         self.assertNotIn(self.instance,self.managed.sessions)
         self.assertNotIn(self.instance,self.managed.startup.sessions)
-        slot['observer_process'].close.assert_not_called();self.assertFalse(self.m.closed)
+        released = not direct and not timeout
+        self.assertEqual(int(released), slot['observer_process'].close.call_count)
+        self.assertEqual(released, self.m.closed)
         for key in ((captured['key'][0],'other-stop'),('other-run',captured['key'][1])):
             with self.assertRaises(RegistryError):self.runtime._game_exit(*key)
 

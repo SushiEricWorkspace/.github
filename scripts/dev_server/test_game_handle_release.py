@@ -406,16 +406,17 @@ class SelectedReleaseIntegrationTests(unittest.TestCase):
         case=selected.SelectedGameExitTests();case.setUp();self.addCleanup(case.doCleanups)
         case.run_case()
         base=ready.GameReadyTests();self.addCleanup(base.doCleanups);base.configure(case.case)
-        helper=HandleReleaseTests();helper.configure(base);self.addCleanup(helper.doCleanups)
         raw=case.session['game_exit_input']['raw']
-        helper.release()
-        self.assertEqual(raw,helper.runtime._game_exit(case.session['run'],'public-stop')[1]['game_exit_input'])
+        held, originals, _ = case.runtime._game_exit(case.session['run'], 'public-stop')
+        self.assertTrue(held['handle_release']['completed'])
+        self.assertEqual(raw, originals['game_exit_input'])
         case.case.clock=json.loads(raw)['deadline']+1
         result=base.open()
         self.assertEqual('OPEN',result['status'])
         self.assertEqual('OfflineIdle',case.case.data_phase)
-        self.assertEqual(['m','c'],helper.order)
-        self.assertIs(helper.runtime._transaction.__func__,runtime_control.RuntimeControl._transaction)
+        self.assertTrue(case.case.m.closed)
+        held['observer_process'].close.assert_called_once()
+        self.assertIs(case.runtime._transaction.__func__,runtime_control.RuntimeControl._transaction)
 
 
 class ReleaseRaceTests(unittest.TestCase):

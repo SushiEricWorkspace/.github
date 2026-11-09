@@ -54,7 +54,7 @@ class GameReadyTests(unittest.TestCase):
         case = stops.StopTests()
         case.setUp()
         self.addCleanup(case.doCleanups)
-        case.stop_case()
+        case.stop_case(direct=True)
         GameReadyTests.configure(self, case)
 
     def configure(self, case):
