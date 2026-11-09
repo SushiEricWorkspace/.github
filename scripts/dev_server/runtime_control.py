@@ -643,6 +643,8 @@ class RuntimeControl:
                      "startup_request": self.managed.startup.sessions[instance]["request"],
                      "stop_request": session["stop_request"], "save_request": session["save_request"],
                      "completion_response": session["completion_response"]}
+        if "game_exit_input" in session:
+            originals["game_exit_input"] = session["game_exit_input"]["raw"]
         binding = canonical({"instanceId": instance, "runId": key[0], "stopOperationId": key[1],
                              "stopFingerprint": session["stop_fingerprint"], "controlOperationId": session["control_operation"]})
         with self._control_lock:
@@ -702,6 +704,8 @@ class RuntimeControl:
             if deadline is None:
                 deadline = time.monotonic() + payload["timeoutSeconds"]
             deadline = min(deadline, session.get("stop_deadline", deadline))
+            if "game_exit_input" in session:
+                deadline = min(deadline, session["game_exit_input"]["deadline"])
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop待機前に期限を超過しました")
             self.managed.drain(row["id"], session, deadline)
             deadline = min(deadline, session.get("stop_deadline", deadline))
@@ -713,6 +717,9 @@ class RuntimeControl:
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop保存待機中に期限を超過しました")
             require(completed, "CONTROL_UNKNOWN", "MのRequested/COMPLETION/closeが未完了です")
             require(session["error"] is None, "CONTROL_UNKNOWN", "元停止制御が不明です")
+            if "game_exit_input" in session:
+                self.managed.observe_selected_game_exit(row["id"], session, deadline)
+                deadline = min(deadline, session["stop_deadline"])
             if "game_exit" in session:
                 self.managed.game_exit_inputs(row["id"], session, session["game_exit"]["candidate"], deadline)
                 self.managed.game_exit_evidence(row["id"], session, deadline)
