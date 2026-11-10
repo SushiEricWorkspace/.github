@@ -63,7 +63,7 @@ class RuntimeControl:
     def _release_game_handles(self, token, *, operation_id, stop_operation_id, deadline):
         """P内部専用。確定stopの元M/観測Cを一度だけ解放し、失敗時は進捗と予約を保持する。
 
-        公共の自己予約stopは確定後に同deadlineで呼ぶ。部分失敗の進捗と予約を保持する。
+        公共/直接stopは確定後に同deadlineで呼ぶ。部分失敗の進捗と予約を保持する。
         """
         from .offline_control import _OfflineOpen
         with self._control_lock:
@@ -710,7 +710,7 @@ class RuntimeControl:
         return expected
 
     def _stop_handle_release(self, token, result, deadline, *, replay=False):
-        """公共stopの成功応答を同stopの解放正本へ結束する。再提示は結果照合だけを行う。"""
+        """公共/直接stopの成功応答を同stopの解放正本へ結束する。再提示は結果照合だけを行う。"""
         operation_id = result.get("gameHandleReleaseOperationId")
         if operation_id is None:
             return
@@ -729,7 +729,7 @@ class RuntimeControl:
             progress = slot.get("handle_release", {})
             operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (operation_id,)).fetchone()
             require(binding["instanceId"] == row["id"] and progress.get("operationId") == operation_id
-                    and progress.get("m") == progress.get("c") == "RELEASED" and progress.get("completed") is True
+                    and progress.get("m") == progress.get("c") == "RELEASED"
                     and operation is not None and operation["instance"] == row["id"]
                     and operation["command"] == "game-handle-release" and operation["status"] == "COMPLETED"
                     and operation["fingerprint"] == progress.get("fingerprint"),
@@ -792,8 +792,7 @@ class RuntimeControl:
             if "game_exit" in session:
                 self.managed.game_exit_inputs(row["id"], session, session["game_exit"]["candidate"], deadline)
                 result["gameExit"] = self.managed.game_exit_evidence(row["id"], session, deadline)
-                if not session["direct_stop"]:
-                    result["gameHandleReleaseOperationId"] = "game-release-" + uuid.uuid4().hex
+                result["gameHandleReleaseOperationId"] = "game-release-" + uuid.uuid4().hex
         write_json(Path(run["proofPath"]).parent / "runtime-stop.json", result)
         return result
 
@@ -818,6 +817,7 @@ class RuntimeControl:
         generation = self._active_generation(row)
         # RCON再送を避け、受信済みSTOP_BLOCKと同Requestedだけから保存終端を照合する。
         result = self._stop(row, dict(session["token"], timeoutSeconds=max(0.001, deadline - time.monotonic())), generation, deadline)
+        deadline = min(deadline, session.get("stop_deadline", deadline))
         with self._transaction(instance) as connection:
             current = self.registry._instance(connection, instance)
             self._binding(current, row)
@@ -855,6 +855,7 @@ class RuntimeControl:
         finally:
             self.managed.release(instance, session["run"])
         if "managedSave" in result:
+            self._stop_handle_release(session["token"], result, deadline)
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "直接stop返却前に期限を超過しました")
 
     def _join_direct_stop(self, row, payload, operation_id, fingerprint, session, deadline=None):
@@ -881,7 +882,8 @@ class RuntimeControl:
                 completed = saved["status"] == "COMPLETED"
                 if completed:
                     result = json.loads(saved["response"])
-                    require(current["state"] == "LEASED_STOPPED" and not current["pending"]
+                    require(current["state"] == "LEASED_STOPPED"
+                            and (not current["pending"] or result.get("gameHandleReleaseOperationId") is not None)
                             and result.get("runId") == session["run"] and result.get("stopOperationId") == parent
                             and current["runtime_proof"] is not None and json.loads(current["runtime_proof"]) == result,
                             "CONTROL_UNKNOWN", "元停止の確定証拠が一致しません")
@@ -907,13 +909,26 @@ class RuntimeControl:
                             and waiter["command"] == "stop" and waiter["fingerprint"] == fingerprint,
                             "STALE_OPERATION", "元停止または合流要求が変更されました")
                     if saved["status"] == "COMPLETED":
-                        require(current["state"] == "LEASED_STOPPED" and not current["pending"], "CONTROL_UNKNOWN", "元停止が未確定です")
+                        require(current["state"] == "LEASED_STOPPED", "CONTROL_UNKNOWN", "元停止が未確定です")
                         result = json.loads(saved["response"])
                         require(result.get("runId") == session["run"] and result.get("stopOperationId") == parent
                                 and current["runtime_proof"] is not None and json.loads(current["runtime_proof"]) == result and waiter["status"] == "COMPLETED"
                                 and waiter["response"] == saved["response"]
                                 and not connection.execute("SELECT 1 FROM reservations WHERE operation=?", (operation_id,)).fetchone(),
                                 "STALE_OPERATION", "元stopと合流の確定結果が一致しません")
+                        release_id = result.get("gameHandleReleaseOperationId")
+                        if release_id is not None:
+                            released = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (release_id,)).fetchone()
+                            require(released is None or (released["instance"] == row["id"]
+                                    and released["command"] == "game-handle-release" and released["status"] in {"PENDING", "COMPLETED"}),
+                                    "CONTROL_UNKNOWN", "元stopのhandle解放操作が一致しません")
+                            if released is None or released["status"] == "PENDING":
+                                require(session["error"] is None, "RECOVERY_REQUIRED", "元stopのhandle解放が不明です")
+                                result = None
+                            else:
+                                require(not current["pending"], "CONTROL_UNKNOWN", "handle解放結果が未確定です")
+                        else:
+                            require(not current["pending"], "CONTROL_UNKNOWN", "元停止が未確定です")
                         require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流結果の最終照合後に期限を超過しました")
                     else:
                         require(saved["status"] == "PENDING" and current["state"] == "STOPPING" and current["pending"]
@@ -923,6 +938,7 @@ class RuntimeControl:
                 if result is not None:
                     break
                 time.sleep(0.01)
+        self._stop_handle_release(payload, result, deadline, replay=True)
         require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流返却前に期限を超過しました")
         return result
 

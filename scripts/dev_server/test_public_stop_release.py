@@ -323,7 +323,7 @@ class PublicStopReleaseTests(unittest.TestCase):
 
     def test_replay_requires_release_progress_and_result(self):
         self.run_stop()
-        self.retained()['handle_release'].pop('completed')
+        self.retained()['handle_release'].pop('c')
         self.no_retry()
 
     def test_session_release_deadline_prevents_dedicated_call(self):

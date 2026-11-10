@@ -145,8 +145,10 @@ class StopTests(unittest.TestCase):
 
     def observe(self):return self.managed.observe_game_exit(self.instance,self.session,self.candidate,self.deadline)
 
-    def stop_case(self, *, direct=False, change=None, timeout=False, unfinished=False, overlap=False, loss=False, after=False, committed_timeout=False):
+    def stop_case(self, *, direct=False, change=None, timeout=False, unfinished=False, overlap=False, loss=False, after=False, committed_timeout=False, auto_release=True):
         self.session=self.base.start()
+        if not auto_release:
+            self.enterContext(patch.object(self.runtime, '_stop_handle_release'))
         reserved,proceed=threading.Event(),threading.Event()
         original=self.runtime._direct_stop if direct else self.runtime._stop
         before_final,release_final=threading.Event(),threading.Event()
@@ -225,7 +227,7 @@ class StopTests(unittest.TestCase):
                 self.assertIsInstance(error,RegistryError);self.assertEqual('STOP_TIMEOUT',error.code)
                 self.assertEqual('COMPLETED',parent['status'])
                 self.assertEqual(target.digest(self.session['game_exit']['result']),json.loads(parent['response'])['gameExit']['observationSha256'])
-                self.assertEqual('RECOVERY_REQUIRED' if direct else 'LEASED_STOPPED',self.f.state()['state']);self.assertEqual(0,self.f.state()['pending'])
+                self.assertEqual('LEASED_STOPPED',self.f.state()['state']);self.assertEqual(0,self.f.state()['pending'])
                 self.assertNotIn(self.instance,self.managed.sessions)
                 self.assertEqual([],self.source.query('SELECT * FROM reservations'))
             elif change or timeout or unfinished or loss or after:
@@ -258,7 +260,7 @@ class StopTests(unittest.TestCase):
                 self.assertEqual([],self.source.query('SELECT * FROM reservations'))
                 self.assertNotIn(self.instance,self.managed.sessions)
             self.assertIs(self.runtime._transaction.__func__,runtime_control.RuntimeControl._transaction)
-            released = not direct and error is None
+            released = auto_release and error is None
             self.assertEqual(released, self.m.closed)
             if not unfinished:
                 self.assertEqual(int(released), self.c.process.close.call_count)
@@ -320,7 +322,7 @@ class StopTests(unittest.TestCase):
         self.assertEqual(captured['binding'],self.runtime._game_exit(*captured['key'])[2])
         self.assertNotIn(self.instance,self.managed.sessions)
         self.assertNotIn(self.instance,self.managed.startup.sessions)
-        released = not direct and not timeout
+        released = not timeout
         self.assertEqual(int(released), slot['observer_process'].close.call_count)
         self.assertEqual(released, self.m.closed)
         for key in ((captured['key'][0],'other-stop'),('other-run',captured['key'][1])):
