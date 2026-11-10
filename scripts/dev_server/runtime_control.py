@@ -829,7 +829,23 @@ class RuntimeControl:
                     require(self.managed.game_exit_evidence(instance, session, deadline) == result.get("gameExit"),
                             "STALE_OPERATION", "直接stopのgame退出証拠が変更されました")
                 require(time.monotonic() < deadline, "STOP_TIMEOUT", "直接stopの最終照合後に期限を超過しました")
+            waiters = connection.execute("""SELECT r.*,o.instance AS operation_instance,o.command,o.status,o.response
+                FROM reservations r LEFT JOIN runtime_operations o ON o.id=r.operation
+                WHERE r.instance=? AND r.reference=? AND r.operation!=?""",
+                (instance, "stop:" + operation_id, session.get("control_operation"))).fetchall()
+            for waiter in waiters:
+                require(waiter["lease"] == row["lease"] and waiter["epoch"] == row["epoch"]
+                        and waiter["operation_instance"] == instance and waiter["command"] == "stop"
+                        and waiter["status"] == "PENDING" and json.loads(waiter["response"]) == {
+                            "runId": session["run"], "stopOperationId": operation_id},
+                        "STALE_OPERATION", "合流予約と元stopのbindingが一致しません")
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流予約の最終照合後に期限を超過しました")
             connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?", (json.dumps(result), instance))
+            for waiter in waiters:
+                connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?",
+                                   (json.dumps(result), waiter["operation"]))
+                connection.execute("DELETE FROM reservations WHERE operation=? AND reference=?",
+                                   (waiter["operation"], "stop:" + operation_id))
             connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (json.dumps(result), operation_id))
             connection.execute("DELETE FROM reservations WHERE reference=? AND operation=?",
                                ("stop:" + operation_id, session.get("control_operation")))
@@ -842,11 +858,13 @@ class RuntimeControl:
             require(time.monotonic() < deadline, "STOP_TIMEOUT", "直接stop返却前に期限を超過しました")
 
     def _join_direct_stop(self, row, payload, operation_id, fingerprint, session, deadline=None):
+        """元stopの確定で待機予約を終端し、同じ結果だけを期限内に返す。"""
         if deadline is None:
             deadline = time.monotonic() + payload["timeoutSeconds"]
         deadline = min(deadline, session.get("stop_deadline", deadline))
         require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流受付前に期限を超過しました")
         parent = session["stop_operation"]
+        pending = {"runId": row["run_id"], "stopOperationId": parent}
         with self._lock_wait(deadline):
             with self._transaction(row["id"]) as connection:
                 current = self.registry._instance(connection, row["id"])
@@ -856,26 +874,51 @@ class RuntimeControl:
                 for table in ("operations", "runtime_operations", "reference_operations", "writer_operations", "snapshot_operations"):
                     require(not connection.execute(f"SELECT 1 FROM {table} WHERE id=?", (operation_id,)).fetchone(),
                             "OPERATION_CONFLICT", "operationIdが他の操作に使用されています")
+                saved = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND instance=? AND command='stop'",
+                                           (parent, row["id"])).fetchone()
+                require(saved is not None and saved["status"] in {"PENDING", "COMPLETED"},
+                        "CONTROL_UNKNOWN", "元停止予約がありません")
+                completed = saved["status"] == "COMPLETED"
+                if completed:
+                    result = json.loads(saved["response"])
+                    require(current["state"] == "LEASED_STOPPED" and not current["pending"]
+                            and result.get("runId") == session["run"] and result.get("stopOperationId") == parent
+                            and current["runtime_proof"] is not None and json.loads(current["runtime_proof"]) == result,
+                            "CONTROL_UNKNOWN", "元停止の確定証拠が一致しません")
+                else:
+                    require(current["state"] == "STOPPING" and current["pending"],
+                            "CONTROL_UNKNOWN", "元停止が未確定です")
                 require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流予約前に期限を超過しました")
-                connection.execute("INSERT INTO runtime_operations VALUES (?,?, 'stop',?,'PENDING',?)",
-                    (operation_id, fingerprint, row["id"], json.dumps({"runId": row["run_id"], "stopOperationId": parent})))
-                connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)",
-                    (operation_id, "stop:" + parent, row["id"], row["lease"], row["epoch"]))
+                connection.execute("INSERT INTO runtime_operations VALUES (?,?, 'stop',?,?,?)",
+                    (operation_id, fingerprint, row["id"], "COMPLETED" if completed else "PENDING",
+                     saved["response"] if completed else json.dumps(pending)))
+                if not completed:
+                    connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)",
+                        (operation_id, "stop:" + parent, row["id"], row["lease"], row["epoch"]))
             while True:
                 result = None
-                with self._transaction(row["id"]) as connection:
+                with self._transaction(row["id"], read_only=True) as connection:
                     current = self.registry._instance(connection, row["id"])
+                    self.registry._token(current, payload, allow_expired=True)
                     self._binding(current, row)
                     saved = connection.execute("SELECT * FROM runtime_operations WHERE id=? AND instance=? AND command='stop'", (parent, row["id"])).fetchone()
-                    require(saved is not None, "CONTROL_UNKNOWN", "元停止予約がありません")
+                    waiter = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (operation_id,)).fetchone()
+                    require(saved is not None and waiter is not None and waiter["instance"] == row["id"]
+                            and waiter["command"] == "stop" and waiter["fingerprint"] == fingerprint,
+                            "STALE_OPERATION", "元停止または合流要求が変更されました")
                     if saved["status"] == "COMPLETED":
                         require(current["state"] == "LEASED_STOPPED" and not current["pending"], "CONTROL_UNKNOWN", "元停止が未確定です")
                         result = json.loads(saved["response"])
+                        require(result.get("runId") == session["run"] and result.get("stopOperationId") == parent
+                                and current["runtime_proof"] is not None and json.loads(current["runtime_proof"]) == result and waiter["status"] == "COMPLETED"
+                                and waiter["response"] == saved["response"]
+                                and not connection.execute("SELECT 1 FROM reservations WHERE operation=?", (operation_id,)).fetchone(),
+                                "STALE_OPERATION", "元stopと合流の確定結果が一致しません")
                         require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流結果の最終照合後に期限を超過しました")
-                        connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (saved["response"], operation_id))
-                        connection.execute("DELETE FROM reservations WHERE operation=?", (operation_id,))
                     else:
-                        require(saved["status"] == "PENDING" and current["state"] == "STOPPING", "CONTROL_UNKNOWN", "元停止が不明です")
+                        require(saved["status"] == "PENDING" and current["state"] == "STOPPING" and current["pending"]
+                                and waiter["status"] == "PENDING" and json.loads(waiter["response"]) == pending,
+                                "CONTROL_UNKNOWN", "元停止または合流が不明です")
                 require(time.monotonic() < deadline, "STOP_TIMEOUT", "合流結果記録後に期限を超過しました")
                 if result is not None:
                     break

@@ -345,8 +345,12 @@ class ManagedRuntimeTests(unittest.TestCase):
 
         def finished(_):
             with f.transaction() as connection:
-                connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0")
-                connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (json.dumps(expected), parent))
+                connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?",
+                                   (json.dumps(expected), f.token['instanceId']))
+                connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id IN (?,?)",
+                                   (json.dumps(expected), parent, 'public-stop'))
+                connection.execute("DELETE FROM reservations WHERE reference=? AND instance=?",
+                                   ('stop:' + parent, f.token['instanceId']))
 
         with patch('dev_server.runtime_control.time.sleep', side_effect=finished):
             result = f.runtime._join_direct_stop(dict(f.row()), dict(f.token, timeoutSeconds=2), 'public-stop', 'a' * 64, self.session)

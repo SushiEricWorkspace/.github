@@ -636,6 +636,7 @@ class SaveEvidenceRegistryTests(unittest.TestCase):
         original_join = self.runtime._join_direct_stop
         original_instance = self.f.registry._instance
         original_wait = self.runtime._lock_wait
+        original_transaction = self.f.registry.transaction
         limit = 30.0 if source_deadline else 15.0
 
         def stop(*args):
@@ -655,8 +656,6 @@ class SaveEvidenceRegistryTests(unittest.TestCase):
                 clock[0] = limit + 1
             if not parent_done.is_set(): return
             if phase == 'verification' and sql.startswith('SELECT * FROM runtime_operations WHERE id=') and "command='stop'" in sql:
-                clock[0] = limit + 1
-            if phase == 'commit' and sql.startswith("UPDATE runtime_operations SET status='COMPLETED'") and 'public-join' in sql:
                 clock[0] = limit + 1
 
         def instance(connection, key):
@@ -684,6 +683,14 @@ class SaveEvidenceRegistryTests(unittest.TestCase):
             finally:
                 depths.value = depth - 1
 
+        @contextmanager
+        def transaction(*args, **kwargs):
+            with original_transaction(*args, **kwargs) as connection:
+                yield connection
+            if phase == 'commit' and kwargs.get('read_only') and parent_done.is_set() \
+                    and threading.get_ident() == public_thread[0]:
+                clock[0] = limit + 1
+
         timeout = 40 if source_deadline else 10
         payload = dict(self.f.token, timeoutSeconds=timeout)
         with patch.object(target.time, 'monotonic', side_effect=lambda: clock[0]), \
@@ -691,7 +698,8 @@ class SaveEvidenceRegistryTests(unittest.TestCase):
                 patch.object(self.runtime, '_stop', side_effect=stop), \
                 patch.object(self.runtime, '_join_direct_stop', side_effect=join), \
                 patch.object(self.f.registry, '_instance', side_effect=instance), \
-                patch.object(self.runtime, '_lock_wait', side_effect=lock_wait):
+                patch.object(self.runtime, '_lock_wait', side_effect=lock_wait), \
+                patch.object(self.f.registry, 'transaction', side_effect=transaction):
             self.base.stop_ready.set(); self.base.save_ready.set()
             try:
                 self.assertTrue(paused.wait(5))
@@ -715,20 +723,15 @@ class SaveEvidenceRegistryTests(unittest.TestCase):
         self.assertEqual('LEASED_STOPPED', self.f.state()['state'])
         self.assertEqual(0, self.f.state()['pending'])
         joined = self.query('SELECT * FROM runtime_operations WHERE id=?', ('public-join',))
-        recorded = phase in ('normal', 'commit', 'return')
         if phase in ('entry', 'admission'):
             self.assertEqual([], joined)
             self.assertEqual([], self.query('SELECT * FROM reservations'))
         else:
-            self.assertEqual('COMPLETED' if recorded else 'PENDING', joined[0]['status'])
+            self.assertEqual('COMPLETED', joined[0]['status'])
             references = self.query('SELECT * FROM reservations WHERE operation=?', ('public-join',))
-            self.assertEqual(0 if recorded else 1, len(references))
+            self.assertEqual(0, len(references))
             before = self.query('SELECT * FROM runtime_operations ORDER BY id')
-            if recorded:
-                self.assertTrue(self.f.command('stop', payload, 'public-join')['replayed'])
-            else:
-                with self.assertRaises(RegistryError) as replay: self.f.command('stop', payload, 'public-join')
-                self.assertEqual('RECOVERY_REQUIRED', replay.exception.code)
+            self.assertTrue(self.f.command('stop', payload, 'public-join')['replayed'])
             self.assertEqual(before, self.query('SELECT * FROM runtime_operations ORDER BY id'))
         self.assertEqual(1, len(self.f.adapter.created))
         self.assertEqual(0, self.f.rcon_calls)
@@ -745,13 +748,13 @@ class SaveEvidenceRegistryTests(unittest.TestCase):
     def test_join_expired_before_admission_has_no_reservation(self):
         self.join_boundary('entry')
 
-    def test_join_reservation_crosses_deadline_keeps_pending_reference(self):
+    def test_join_reservation_crosses_deadline_keeps_parent_result_without_normal_return(self):
         self.join_boundary('reservation')
 
-    def test_join_final_verification_crosses_deadline_without_success_record(self):
+    def test_join_final_verification_crosses_deadline_without_normal_return(self):
         self.join_boundary('verification')
 
-    def test_join_commit_crosses_deadline_keeps_record_without_return(self):
+    def test_join_read_commit_crosses_deadline_keeps_parent_record_without_return(self):
         self.join_boundary('commit')
 
     def test_join_return_crosses_deadline_without_normal_return(self):
