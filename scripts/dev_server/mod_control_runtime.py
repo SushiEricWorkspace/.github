@@ -331,6 +331,15 @@ class ManagedRuntime:
                 with self.runtime._lock_wait(time.monotonic() + 30), self.runtime._transaction(instance) as connection:
                     row = self.registry._instance(connection, instance)
                     require(row["run_id"] == session["run"], "STALE_RUN", "別runを不明へ変更しません")
+                    stopped = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (session.get("stop_operation"),)).fetchone()
+                    if (stopped is not None and stopped["instance"] == instance and stopped["command"] == "stop"
+                            and stopped["status"] == "COMPLETED" and stopped["fingerprint"] == session["stop_fingerprint"]
+                            and row["state"] == "LEASED_STOPPED" and row["runtime_proof"] is not None
+                            and json.loads(row["runtime_proof"]) == json.loads(stopped["response"])):
+                        result = json.loads(stopped["response"])
+                        if (result.get("runId") == session["run"] and result.get("stopOperationId") == session["stop_operation"]
+                                and result.get("controlOperationId") == session["control_operation"]):
+                            return
                     if request is not None and operations.readback(connection, instance, request) is not None:
                         operations.unknown(connection, instance, request)
                     gate = _admission(connection, row)

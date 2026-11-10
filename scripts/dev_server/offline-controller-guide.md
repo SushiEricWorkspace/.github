@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）、第18スライス先行部分（保存原文と保持元Mの結束）、第19スライス先行部分（不変候補原本の入力結束）、第20スライス先行部分（同stopから観測Cへの単発接続）、第21スライス先行部分（観測済みgame退出証拠とstop確定の結束）、第22スライス先行部分（P内部の同stop専用候補入力と観測開始）、第23スライス先行部分（確定game退出と独立Readyから次C取得）、第24スライス先行部分（確定stopに束縛した元M/C単発handle解放）、第25スライス先行部分（公共stopの自己予約確定から正常解放）、第26スライス先行部分（直接stopと公共合流の待機予約終端）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）、第18スライス先行部分（保存原文と保持元Mの結束）、第19スライス先行部分（不変候補原本の入力結束）、第20スライス先行部分（同stopから観測Cへの単発接続）、第21スライス先行部分（観測済みgame退出証拠とstop確定の結束）、第22スライス先行部分（P内部の同stop専用候補入力と観測開始）、第23スライス先行部分（確定game退出と独立Readyから次C取得）、第24スライス先行部分（確定stopに束縛した元M/C単発handle解放）、第25スライス先行部分（公共stopの自己予約確定から正常解放）、第26スライス先行部分（直接stopと公共合流の待機予約終端）、第27スライス（直接stopの正常解放と合流応答）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -215,11 +215,11 @@ P内部の単発接続部品は第15スライス節を参照してください�
 
 ## 認証済Mの生成handle保持（第17スライス先行部分）
 
-認証済handshake後、Pは元MのOwnedProcessと生成時のrun/instance/generation/artifact/nonce/native identity/creation、Data owner、descriptor hashを固定します。macOSのboot照合は生成identityと同じUUID表現へ正規化し、Data ownerと生成snapshotの原値は保持します。停止時は同じ保持objectと生成snapshotを照合し、既存の終了観測・Registry停止記録を続けます。認証済Mは停止後もhandleをcloseせず、稼働process mapからだけ退避します。通常control slotの終端と次startは維持し、元Mと次Mをrun別に保持します。従来の非認証通信fixture境界とGameTestのcloseは変更しません。
+認証済handshake後、Pは元MのOwnedProcessと生成時のrun/instance/generation/artifact/nonce/native identity/creation、Data owner、descriptor hashを固定します。macOSのboot照合は生成identityと同じUUID表現へ正規化し、Data ownerと生成snapshotの原値は保持します。停止時は同じ保持objectと生成snapshotを照合し、既存の終了観測・Registry停止記録を続けます。第17スライスの保持段階では稼働process mapからだけ退避し、正常handle解放は第24/25/27節の確定退出経路で行います。通常control slotの終端と次startは維持し、元Mと次Mをrun別に保持します。従来の非認証通信fixture境界とGameTestのcloseは変更しません。
 
-`RuntimeControl._game_process(run)`は保持した元handleと生成snapshotのcopyを返す内部取得です。PIDからの再attach・別processの採用・native本人再照会を行いません。この取得だけで停止・保存・全writer・候補・Registry退出・Ready/CLOSEDを証明しません。原要求hash参照/候補原本から観測Cへの単発供給は第20節、観測済みslotを停止結果・最終Registry transaction/同deadlineへ結束する処理は第21節を参照してください。既存stopからの自動観測開始・独立明示Ready供給・元handle正常解放は後続です。
+`RuntimeControl._game_process(run)`は保持した元handleと生成snapshotのcopyを返す内部取得です。PIDからの再attach・別processの採用・native本人再照会を行いません。この取得だけで停止・保存・全writer・候補・Registry退出・Ready/CLOSEDを証明しません。原要求hash参照/候補原本から観測Cへの単発供給は第20節、観測済みslotを停止結果・最終Registry transaction/同deadlineへ結束する処理は第21節を参照してください。既存stopからの内部明示候補による観測開始は第22節、独立明示Ready供給は第23節、元handle正常解放は第24/25/27節を参照してください。
 
-保持資源はPのメモリ内にあり、P再起動後に復元しません。正常停止・失敗とも自動解放せず、正常解放は後続のRegistry退出確定に接続します。その接続が完了するまではrunごとのhandleがPの寿命中に残ります。実OSでのhandle資源消費・本人受入は未確認です。Ready期待値を自動承認する変更はありません。
+保持資源はPのメモリ内にあり、P再起動後に復元しません。正常解放の対象外・失敗/不明の資源は保全し、対象game退出の確定後にだけ第24/25/27節の単発解放へ進みます。解放済みobjectと固定snapshotも元run/stopの終端保持先へ残します。実OSでのhandle資源消費・本人受入は未確認です。Ready期待値を自動承認する変更はありません。
 
 
 ## 保存原文と保持元Mの結束（第18スライス先行部分）
@@ -228,7 +228,7 @@ P内部の単発接続部品は第15スライス節を参照してください�
 
 初回の保存原文参照の記録前と、公共stop/直接stopの最終transactionで同じ照合を行い、その完了後に元deadlineを検査します。不一致・期限超過では原文・PENDING/参照・保持資源を保全し、追加IPC/生成・自動再送・再attach・killへ進みません。既存stopの返却形式とcontrol slot終端は維持します。
 
-この照合は元Mの実終了、候補/退出証拠、Ready/CLOSEDを表しません。候補原本・全writer・正本予約を供給するP内部の観測Cへの単発接続は[第20節「同stopから観測Cへの単発接続」](#同stopから観測cへの単発接続第20スライス先行部分)で実装済みです。観測済みslotを停止結果・最終Registry確定へ結束する処理は第21節を参照してください。既存stopからの内部明示候補による観測開始は第22節を参照してください。明示Readyの次open供給は第23節を参照してください。元handle正常解放は後続です。実OS/native/実root受入は未確認です。
+この照合は元Mの実終了、候補/退出証拠、Ready/CLOSEDを表しません。候補原本・全writer・正本予約を供給するP内部の観測Cへの単発接続は[第20節「同stopから観測Cへの単発接続」](#同stopから観測cへの単発接続第20スライス先行部分)で実装済みです。観測済みslotを停止結果・最終Registry確定へ結束する処理は第21節を参照してください。既存stopからの内部明示候補による観測開始は第22節を参照してください。明示Readyの次open供給は第23節を参照してください。元M/Cの正常handle解放は第24節、公共/直接stopの自動接続は第25/27節を参照してください。実OS/native/実root受入は未確認です。
 
 ## 不変game候補原本の入力結束（第19スライス先行部分）
 
@@ -238,7 +238,7 @@ P内部の`ManagedRuntime.game_exit_inputs(instance, session, candidate, deadlin
 
 戻り値は観測C向けの管理/candidate欄、候補原bytes、saveproof原bytesのtupleです。operationId/requestHash、P/C本人、private session/nonceは含めず、後続の正本予約と起動時に補います。原本I/O後に元保存原文/正本予約/保持Mを再照合し、最終境界で同deadlineを検査します。不一致・原本欠落/変更・期限超過は例外で保全し、別候補/currentへのfallback、DB更新、IPC、生成、終了観測、kill、handle解放を行いません。
 
-この読取り入口を用いるP内部の観測Cへの単発接続は[第20節「同stopから観測Cへの単発接続」](#同stopから観測cへの単発接続第20スライス先行部分)で実装済みです。観測済みslotを停止結果・最終Registry確定へ結束する処理は第21節を参照してください。既存stopからの内部明示候補による観測開始は第22節を参照してください。独立明示Readyの次open供給は第23節を参照してください。元handle正常解放は後続です。戻り値をReadyやCLOSEDへ自動昇格しません。実OS/native本人受入・実root/Mod/実bundleビルドは未確認です。
+この読取り入口を用いるP内部の観測Cへの単発接続は[第20節「同stopから観測Cへの単発接続」](#同stopから観測cへの単発接続第20スライス先行部分)で実装済みです。観測済みslotを停止結果・最終Registry確定へ結束する処理は第21節を参照してください。既存stopからの内部明示候補による観測開始は第22節を参照してください。独立明示Readyの次open供給は第23節を参照してください。元M/Cの正常handle解放は第24節、公共/直接stopの自動接続は第25/27節を参照してください。戻り値をReadyやCLOSEDへ自動昇格しません。実OS/native本人受入・実root/Mod/実bundleビルドは未確認です。
 
 ## 同stopから観測Cへの単発接続（第20スライス先行部分）
 
@@ -248,7 +248,7 @@ callbackは元session/slot、stop識別、同原本/要求欄、保持M object/�
 
 同deadlineをcallbackとC完了後、局所結果保持の前後まで検査します。失敗後もslot/原文/元M/観測Cを残し、別候補への変更・再生成・再送・再観測・kill・rollbackをしません。局所結果保持後に期限を跨いだ場合は証拠を保持しますが、成功として返しません。
 
-返却`GAME_EXIT_OBSERVED`とslotのresultは局所観測です。観測済みslotを既存公共/直接stopの結果と最終Registry transactionへ結束する処理は第21節を参照してください。既存stopからの内部明示候補による観測開始は第22節を参照してください。独立明示Readyの次open供給は第23節を参照してください。元M/Cの正常handle解放は後続です。呼出元Pが元stop予約とsessionを保持する前提で、解除/差替はcallbackで拒否します。Ready/CLOSEDへ自動昇格しません。実OS/native本人/実Job/group/実IPC結合と保持資源量は未確認です。
+返却`GAME_EXIT_OBSERVED`とslotのresultは局所観測です。観測済みslotを既存公共/直接stopの結果と最終Registry transactionへ結束する処理は第21節を参照してください。既存stopからの内部明示候補による観測開始は第22節を参照してください。独立明示Readyの次open供給は第23節を参照してください。元M/Cの正常handle解放は第24節、公共/直接stopの自動接続は第25/27節を参照してください。呼出元Pが元stop予約とsessionを保持する前提で、解除/差替はcallbackで拒否します。Ready/CLOSEDへ自動昇格しません。実OS/native本人/実Job/group/実IPC結合と保持資源量は未確認です。
 
 
 ## 観測済みgame退出証拠とstop確定の結束（第21スライス先行部分）
@@ -257,9 +257,9 @@ callbackは元session/slot、stop識別、同原本/要求欄、保持M object/�
 
 最終transactionでは既存`save_evidence`による元stop/認証済原文・閉門/drain/全writer照合の後、同じgame退出証拠を再照合します。ここではOS照会・file読取り・追加IPCを行いません。同deadlineを最終照合後・結果更新前と、確定後/返却前にも検査します。結果JSONの任意欄`gameExit`は明示候補4欄と要求/応答/観測/観測C recordのSHA-256だけです。要求本文・本人の原UUID・局所Ready本文を監督DBへ追加せず、Ready/CLOSEDへ自動昇格しません。テーブル変更はありません。
 
-確定前の不一致・期限超過では元予約/原文/slot/M/Cを保持し、追加Data作用・再観測・再送・killを行いません。確定後timeoutではCOMPLETEDのgameExit証拠を保持し、既存のsession解放を実施します。直接stopの受信handlerは従来どおりRECOVERY_REQUIREDを保全し、公共stopの確定済み結果を巻き戻す処理は加えません。active sessionの解放前に、観測Cのslot（元OwnedProcess・固定原本/生成snapshotを含む）とdescriptor/startup/stop/Requested/COMPLETION原文をRuntimeControl.game_exitsへ元run/stopをkeyにして移します。既存M保持と同じRuntimeControl/lockを使い、_game_exitで同じC objectを取得できます。active mapは残さず、次startのcontrol slotを塞ぎません。元M/C handleの正常解放の内部入口は第24節を参照してください。公共stopの自己予約経路への自動接続は第25節、直接stopと合流は後続です。
+確定前の不一致・期限超過では元予約/原文/slot/M/Cを保持し、追加Data作用・再観測・再送・killを行いません。確定後timeoutではCOMPLETEDのgameExit証拠を保持し、既存のsession解放を実施します。直接stopの確定後失敗で同run/元stopの停止proofを保全する扱いは第27節を参照してください。active sessionの解放前に、観測Cのslot（元OwnedProcess・固定原本/生成snapshotを含む）とdescriptor/startup/stop/Requested/COMPLETION原文をRuntimeControl.game_exitsへ元run/stopをkeyにして移します。既存M保持と同じRuntimeControl/lockを使い、_game_exitで同じC objectを取得できます。active mapは残さず、次startのcontrol slotを塞ぎません。元M/C handleの正常解放の内部入口は第24節を参照してください。公共stopの自己予約経路への自動接続は第25節、直接stopと合流応答の解放正本への結束は第27節を参照してください。
 
-P内部の明示候補供給と観測開始の順序付けは第22節を参照してください。独立明示Readyの次open供給は第23節を参照してください。公共stopの自動解放は第25節を参照してください。公開供給元と直接stop/合流の自動解放は後続です。呼出元Pは観測からstop結果確定まで元session/予約を保持します。確定後は終端保持mapが観測Cと固定原文/生成snapshotを所有し、呼出元のsession参照に依存しません。実OS/native・Job/group・private IPC結合と保持資源量は未確認です。
+P内部の明示候補供給と観測開始の順序付けは第22節を参照してください。独立明示Readyの次open供給は第23節を参照してください。公共stopの自動解放は第25節を参照してください。直接stop/合流の自動解放と応答接続は第27節を参照してください。公開供給元は後続です。呼出元Pは観測からstop結果確定まで元session/予約を保持します。確定後は終端保持mapが観測Cと固定原文/生成snapshotを所有し、呼出元のsession参照に依存しません。実OS/native・Job/group・private IPC結合と保持資源量は未確認です。
 
 ## 第22スライス先行部分: P内部の同stop専用候補入力
 
@@ -271,7 +271,7 @@ P内部の明示候補供給と観測開始の順序付けは第22節を参照�
 
 候補受付を選択したstopだけ保存原文確定後に同deadline内で入力を待つ。元run/stop/descriptorと正本参照を再照合して観測Cを一度開始し、第21スライスの最終transactionへ進める。受付確保後の候補欠落・期限超過・不一致は原本/予約/M/Cを保持して非正常終了し、既存proofへfallback・再供給・自動再観測をしない。認証前の拒否は受付を消費しないので、正規入力を引き続き一度だけ受けられる。通知と成功確定をcontrol lock内で行い、停止側は通知後に確定状態と供給期限を再読込する。短い供給期限をC観測/callback/最終transactionまで引き継ぎ、通知後timeoutの入力からCを開始しない。予定stopと異なる直接停止への選択流用も拒否する。候補待機/原本照合/観測/結果確定は元stopと選択入力の短い方の期限に従う。
 
-観測に使った入力原文もactive解放前に元run/stopの終端保持先へ移管する。局所結果をReady/CLOSEDへ自動昇格しない。独立明示Readyの次open供給は第23節を参照してください。元M/Cの正常handle解放の内部入口は第24節を参照してください。公共stopの自動解放は第25節、直接stop/合流は後続。実OS/native受入は未実施。
+観測に使った入力原文もactive解放前に元run/stopの終端保持先へ移管する。局所結果をReady/CLOSEDへ自動昇格しない。独立明示Readyの次open供給は第23節を参照してください。元M/Cの正常handle解放の内部入口は第24節を参照してください。公共stopの自動解放は第25節、直接stop/合流の自動解放と応答接続は第27節を参照してください。実OS/native受入は未実施。
 
 
 ## 確定game退出と独立Readyから次C取得（第23スライス先行部分）
@@ -280,13 +280,13 @@ P内部の明示候補供給と観測開始の順序付けは第22節を参照�
 
 元stopにgameExitが記録された取得では、確定済みCOMPLETED stop・保存proof・閉門/全writer台帳に加え、Pが保持した元run/stopの終端binding、認証済保存原文、C要求/応答/生成record/resultのhash参照を照合します。独立Readyと観測応答の4欄を型も含めて一致させ、C本人が既存Data APIで実Readyを再照合してOfflineIdleへ進みます。初回、予約と同transaction、起動中、結果更新前に原本を照合し、予約直前・結果更新直前・記録後返却前まで次openのdeadlineを適用します。 固定bundle command生成・P本人照会・journal・stderr設定を終えた後、OwnedProcess.start直前にも元verifyを呼び、準備中の期限超過をOS生成前に拒否します。
 
-拒否時は元stop・原本・保持M/Cを保全します。次C生成後の失敗では次openのPENDING予約と同Cを保持し、追加作用と同open再入口を拒否します。明示値を供給する呼出元の内部契約に限定し、Manager/CLI公開受付は後続で扱います。元M/Cの正常handle解放の内部入口は第24節を参照してください。公共stopの自動解放は第25節を参照してください。直接stop/合流への自動接続、C本人closeとRegistry CLOSED、Ready/CLOSED start gateは後続です。実OS/native受入は未確認です。
+拒否時は元stop・原本・保持M/Cを保全します。次C生成後の失敗では次openのPENDING予約と同Cを保持し、追加作用と同open再入口を拒否します。明示値を供給する呼出元の内部契約に限定し、Manager/CLI公開受付は後続で扱います。元M/Cの正常handle解放の内部入口は第24節を参照してください。公共stopの自動解放は第25節を参照してください。直接stop/合流の自動解放と応答接続は第27節を参照してください。C本人closeとRegistry CLOSED、Ready/CLOSED start gateは後続です。実OS/native受入は未確認です。
 
 選択→公共stop→候補供給→観測C→stop最終確定→active解放→独立明示Ready→次C OPENは、同じ実Registry transactionの結合fixtureで検査します。元供給期限を過ぎた次openでも独立した新期限内なら取得し、game_exit_inputの原文を元run/stopの終端保持へ残します。
 
 ## 確定stopの元M/Cを単発解放（第24スライス先行部分）
 
-信頼済みP呼出元は、game退出観測を含むstopのRegistry確定とactive session解放後、次OPEN前に `runtime._release_game_handles(token, operation_id=新規解放操作, stop_operation_id=元stop, deadline=解放操作の固定期限)` を一度呼びます。公共stopの自己予約経路からの自動接続は第25節で実装しています。直接stop/合流への自動接続は後続です。
+信頼済みP呼出元は、game退出観測を含むstopのRegistry確定とactive session解放後、次OPEN前に `runtime._release_game_handles(token, operation_id=新規解放操作, stop_operation_id=元stop, deadline=解放操作の固定期限)` を一度呼びます。公共stopの自己予約経路からの自動接続は第25節で実装しています。直接stop/合流への自動接続は第27節を参照してください。
 
 元COMPLETED stopとrun/世代/lease、受付BLOCKED・全writer終了、Pが保持する元M/C objectと生成snapshot、認証済原文・観測要求/応答/結果を既存検査で再照合します。同じinstanceのtransactionでPENDING操作とartifact予約を作り、同transactionでも単発枠を再確認します。M→観測Cの順で既存OwnedProcess.closeを一度ずつ呼び、観測Cの親側pipe input/outputも既存close_after_exitで解放します。close直前、close後、最終transactionの結果更新前、記録後返却前まで同deadlineを検査します。
 
@@ -300,7 +300,7 @@ M/CのOwnedProcessと観測Cの親側pipe両fdを解放した成功時だけ、g
 
 解放前の期限切れではOS作用を開始しない。部分解放失敗では第24節のUNKNOWN/PENDING・成功したfdのNone・残存元handleを保持する。解放完了後の期限切れでも正常応答を返さず、元stopと解放の確定済み結果を保持する。再提示は同run/leaseと固定stop結果・解放operation・RELEASED進捗を照合する。未開始/PENDING/不明は拒否し、正規recoverへ残す。
 
-今回の自動接続は公共stopの自己予約経路に限定する。直接stopと公共stop合流の待機予約終端は第26節、直接stopからの自動解放開始は後続で扱う。独立明示Readyは次OPEN呼出元が供給し、M/Cの解放結果をReadyやwriter CLOSEDへ自動昇格しない。実OS/native受入と公開候補供給元は後続。
+第25節の自動接続は公共stopの自己予約経路に限定する。直接stopと公共stop合流の待機予約終端は第26節、直接stopからの自動解放開始と解放結果への合流応答の結束は第27節で扱う。独立明示Readyは次OPEN呼出元が供給し、M/Cの解放結果をReadyやwriter CLOSEDへ自動昇格しない。実OS/native受入と公開候補供給元は後続。
 
 第25節の公共stopは同leaseの期限切れでも完了・再提示を受け付ける。元stopのproofに固定されたgameHandleReleaseOperationIdと同じ解放操作に限り、解放予約・各close・最終結果の照合へ期限切れ許容を引き継ぐ。leaseId/epoch/世代/run・確定proof・単発枠・元M/C・正本予約の照合とmonotonic deadlineを適用する。解放済み結果の再提示は同じstop契約で読み戻し、closeを再実行しない。次offline取得と、元stopへ結束されていない解放は期限内leaseを要求する。
 
@@ -310,4 +310,20 @@ M/CのOwnedProcessと観測Cの親側pipe両fdを解放した成功時だけ、g
 
 受付前照合済みの公共呼出しが親確定後に合流登録へ進んだ場合は、確定proofを照合して同じ結果だけを登録し、新しい待機予約を作らない。待機中と返却前に同じbinding・親と合流の結果・予約終端・固定deadlineを検査する。親の確定後に待機側が期限切れとなった場合も正常応答せず、既知の停止結果を保持し、再提示では元結果だけを照合する。lease期限切れのstop完了・再提示は既存どおり受け付ける。
 
-この節は予約終端と停止結果への結束を独立させた先行部分である。直接stop/合流から元M/Cの自動解放を開始し、解放結果まで待って応答する接続は後続。第25節の公共自己予約stopは変更しない。新しいRPC/wire・Data算法・Ready/CLOSED自動昇格・自動再close/recoverは追加しない。実OS/native受入は未確認。
+この節は予約終端と停止結果への結束を独立させた先行部分である。直接stopから元M/Cの自動解放を開始し、合流が解放結果まで待って応答する接続は第27節を参照する。第25節の公共自己予約stopは変更しない。新しいRPC/wire・Data算法・Ready/CLOSED自動昇格・自動再close/recoverは追加しない。実OS/native受入は未確認。
+
+## 第27スライス 直接stopの正常解放と公共合流応答
+
+game退出の確定証拠がある直接stopも、停止結果へP内部のgameHandleReleaseOperationIdを固定する。親stop・全合流結果と待機予約の終端を同transactionで確定し、元M/Cと原文・snapshotを終端保持へ移した後、第24節の正常解放を同じ期限で一度呼ぶ。候補供給/観測で短縮されたstop_deadlineを最終transaction・解放・返却まで引き継ぐ。game退出を伴わない既存停止は解放IDを作らず従来の契約を維持する。
+
+公共合流は親のCOMPLETEDだけでは正常返却せず、同じ解放operationの確定を待つ。受付前照合済みの遅延合流も、解放PENDING中は待機予約を再生成せず同じ停止結果へ結束する。元run/lease/stop・親proof・要求fingerprintと自分の停止結果を照合し、既存の解放結果照合を読み取りだけで呼んでから、固定min deadline内に返す。合流側がcloseを開始・再実行することはない。
+
+制御threadの確定後timeout・解放失敗はsession.errorへ残す。同run/元stop/fingerprint/control operationと停止proofの確定が一致する場合、既知の停止結果や認証済原文をRECOVERY_REQUIRED/UNKNOWNへ上書きしない。確定前失敗と別runの拒否は維持する。部分失敗では元handle/object・原文・snapshot・UNKNOWN/RELEASED進捗・解放PENDING予約を保持する。解放完了後の期限切れや応答喪失も既知結果を保全する。
+
+再提示は第25節と同じく、同run/stopの確定済み解放正本だけを照合する。解放未開始/PENDING/不明は拒否し、自動再close・再attach・C再生成・kill・rollbackは行わない。期限切れleaseの同stop完了/再提示を維持し、次offline取得のlease条件は緩めない。元M/Cや親pipeを解放したことからReadyやwriter CLOSEDを推測せず、次OPENには独立明示Readyを供給する。
+
+部分失敗/応答不明の正規recover、C本人close/Registry CLOSED、Ready+CLOSED start gate、Manager/CLI公開候補供給元、実OS/native/root/Mod受入は後続である。
+
+第27スライスの解放結果照合は、元M/CのRELEASED進捗と同stopへ束縛したRegistryのCOMPLETED結果を正本にする。DB確定後のメモリ完了公開前でも同じ結果を読み戻し、closeを再実行しない。
+
+現行の直接stopはSTOP_BLOCK受信時に独自のstopOperationIdを生成する。停止前にIDを固定するselect_game_exit/supply_game_exitとは一致しないため、合流受付後に選択済み候補の供給期限でstop_deadlineを短縮する経路は未接続である。選択済み公共stopの供給期限の伝播と、直接stop合流の受付時min期限を区別する。将来この内部入力を直接stopへ接続する際は、合流待機・結果照合・返却にも短縮後期限を伝播して検証する。
