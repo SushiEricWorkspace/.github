@@ -49,94 +49,7 @@ class OfflineRepeatTests(unittest.TestCase):
         self.request['requestId'] = THIRD
         self.request['action']['products'][0]['id'] = 'tab.third'
         self.request['action']['products'][0]['definition']['purchasePrice'] = 789
-        send, receive = processes.Pipe.send, processes.Pipe.receive
-
-        def sending(pipe, frame, deadline, verify):
-            command = frame['command']
-            if command == 'open': return send(pipe,frame,deadline,verify)
-            verify()
-            pipe.sent.append(deepcopy(frame))
-            if self.failure == (command,'partial'): raise TimeoutError('fixture 部分送信')
-            self.before(command)
-            verify()
-            current = self.current
-            op = frame['operationId']
-            assigned_hash,pending_hash,candidate_hash,idle_hash,edit_hash,receipt_hash = ('2','4','5','7','3','6') if op==previous.NEXT else ('9','b','c','d','e','f')
-            base = {k:frame[k] for k in ('operationId','requestHash','sessionId','nonce')}
-            w = self.worker()
-            valid = True
-            if command == 'prepare':
-                valid = current['phase']=='Idle' and (current['hash'],current['revision'],current['run']) == (
-                    frame['expectedStateSha256'],frame['expectedRevision'],frame['runUuid'])
-                self.response = dict(base,status='PREPARED',stateSha256=current['hash'],stateRevision=current['revision'],runUuid=current['run'])
-            elif command == 'assign':
-                self.outer_matched = (current['hash'],current['revision'],current['run']) == (
-                    frame['expectedStateSha256'],frame['expectedRevision'],frame['runUuid'])
-                valid = (self.outer_matched and current['phase']=='Idle' and current['writer']==self.writer
-                         and current['world']==processes.WORLD and current['generation']==json.loads(self.c.request)['generation']
-                         and frame['worker']==w.data_identity and current['run']==self.writer['sessionId'])
-                if valid:
-                    self.effects['assigns'] += 1
-                    self.requests.append(deepcopy(frame['request']))
-                    current.update(phase='Assigned',hash=assigned_hash*64,revision=current['revision']+1,
-                                   previous=frame['expectedStateSha256'],worker=deepcopy(frame['worker']),
-                                   operation=op,editHash=edit_hash*64,resume=None)
-                    self.held = deepcopy(current)
-                self.response = dict(base,status='ASSIGNED',stateSha256=current['hash'],stateRevision=current['revision'],
-                                     runUuid=current['run'],editRequestSha256=edit_hash*64)
-            elif command == 'admit':
-                self.outer_matched = (current['hash'],current['revision'],current['run']) == (
-                    frame['expectedStateSha256'],frame['expectedRevision'],frame['runUuid'])
-                expected = dict(previous=json.loads(w.request)['expectedStateSha256'],writer=self.writer,
-                                worker=w.data_identity,operation=op,editHash=frame['editRequestSha256'],resume=None)
-                valid = self.outer_matched and current['phase']=='Assigned' and all(current[k]==v for k,v in expected.items())
-                if valid:
-                    self.effects['begins'] += 1
-                    current.update(phase='Pending',hash=pending_hash*64,revision=current['revision']+1,run=op,previous=assigned_hash*64)
-                    self.requests.append(deepcopy(json.loads(w.request)['request']))
-                    if self.failure == ('admit','pending'):
-                        w.process.code=1
-                        valid=False
-                    else:
-                        for k in ('dbOpens','edits','dbCloses','finishes'): self.effects[k]+=1
-                        self.requests.append(deepcopy(json.loads(w.request)['request']))
-                        current.update(phase='SavedPendingExit',hash=candidate_hash*64,revision=current['revision']+1,previous=pending_hash*64)
-                        w.process.code=0
-                self.response = dict(base,status='CANDIDATE',stateSha256=current['hash'],stateRevision=current['revision'],
-                    runUuid=op,worldUuid=current['world'],receiptSha256=receipt_hash*64,editRequestSha256=edit_hash*64)
-            elif command == 'complete':
-                self.outer_matched = (current['hash'],current['revision'],current['world'],current['run']) == (
-                    frame['expectedStateSha256'],frame['expectedRevision'],frame['worldUuid'],frame['runUuid'])
-                valid = (self.outer_matched and current['phase']=='SavedPendingExit' and self.held['phase']=='Assigned'
-                         and current['writer']==self.held['writer'] and current['worker']==self.held['worker']
-                         and current['revision']==self.held['revision']+2 and current['run']==op
-                         and frame['receiptSha256']==receipt_hash*64 and frame['editRequestSha256']==self.held['editHash'])
-                if valid:
-                    self.effects['completes'] += 1
-                    current.update(phase='Idle',hash=idle_hash*64,revision=current['revision']+1,run=self.writer['sessionId'],previous=candidate_hash*64)
-                result=dict(version=1,requestId=op,status='SUCCESS',result=dict(
-                    type='io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterResult.Edited',
-                    transactionIds=[8 if op==previous.NEXT else 9]),code=None,message=None,rejectedBeforeEffect=False)
-                self.response = dict(base,status='COMPLETED',stateSha256=current['hash'],stateRevision=current['revision'],
-                    runUuid=current['run'],receiptSha256=receipt_hash*64,candidateStateSha256=frame['expectedStateSha256'],result=result)
-            else: self.fail(command)
-            if not valid:
-                (w if command in ('prepare','admit') else self.c).process.code=1
-                self.response=dict(base,status='REJECTED')
-            self.after(command)
-
-        def receiving(pipe, deadline, verify):
-            frame = pipe.sent[-1]
-            if frame['command']=='open': return receive(pipe,deadline,verify)
-            verify()
-            if self.failure == (frame['command'],'lost'):
-                (self.worker() if frame['command'] in ('prepare','admit') else self.c).process.code=1
-                raise EOFError('fixture 作用後応答喪失')
-            result=json.loads(self.replay) if self.replay is not None else deepcopy(self.response)
-            if self.change: result[self.change[0]]=self.change[1]
-            return result
-        self.enterContext(patch.object(processes.Pipe,'send',sending))
-        self.enterContext(patch.object(processes.Pipe,'receive',receiving))
+        install_edit_pipe(self)
         self.members()
 
     def worker(self): return self.runtime._offline.workers[self.token['instanceId']]
@@ -393,3 +306,95 @@ for key in ('world','generation','phase','writer',*[p+'_'+k for p in ('owner','c
     setattr(OfflineRepeatTests,'test_assign_state_'+key,state_case('assign',key))
 for key in ('previous','writer','resume','worker','operation','editHash'):
     setattr(OfflineRepeatTests,'test_admit_state_'+key,state_case('admit',key))
+
+
+def install_edit_pipe(case):
+    """保存/hash算法を持たない既存の固定編集遷移を接続する。"""
+    send, receive = processes.Pipe.send, processes.Pipe.receive
+
+    def sending(pipe, frame, deadline, verify):
+        command = frame['command']
+        if command == 'open': return send(pipe,frame,deadline,verify)
+        verify()
+        pipe.sent.append(deepcopy(frame))
+        if case.failure == (command,'partial'): raise TimeoutError('fixture 部分送信')
+        case.before(command)
+        verify()
+        current = case.current
+        op = frame['operationId']
+        assigned_hash,pending_hash,candidate_hash,idle_hash,edit_hash,receipt_hash = ('2','4','5','7','3','6') if op==previous.NEXT else ('9','b','c','d','e','f')
+        base = {k:frame[k] for k in ('operationId','requestHash','sessionId','nonce')}
+        w = case.worker()
+        valid = True
+        if command == 'prepare':
+            valid = current['phase']=='Idle' and (current['hash'],current['revision'],current['run']) == (
+                frame['expectedStateSha256'],frame['expectedRevision'],frame['runUuid'])
+            case.response = dict(base,status='PREPARED',stateSha256=current['hash'],stateRevision=current['revision'],runUuid=current['run'])
+        elif command == 'assign':
+            case.outer_matched = (current['hash'],current['revision'],current['run']) == (
+                frame['expectedStateSha256'],frame['expectedRevision'],frame['runUuid'])
+            valid = (case.outer_matched and current['phase']=='Idle' and current['writer']==case.writer
+                     and current['world']==json.loads(case.c.request)['worldUuid'] and current['generation']==json.loads(case.c.request)['generation']
+                     and frame['worker']==w.data_identity and current['run']==case.writer['sessionId'])
+            if valid:
+                case.effects['assigns'] += 1
+                case.requests.append(deepcopy(frame['request']))
+                current.update(phase='Assigned',hash=assigned_hash*64,revision=current['revision']+1,
+                               previous=frame['expectedStateSha256'],worker=deepcopy(frame['worker']),
+                               operation=op,editHash=edit_hash*64,resume=None)
+                case.held = deepcopy(current)
+            case.response = dict(base,status='ASSIGNED',stateSha256=current['hash'],stateRevision=current['revision'],
+                                 runUuid=current['run'],editRequestSha256=edit_hash*64)
+        elif command == 'admit':
+            case.outer_matched = (current['hash'],current['revision'],current['run']) == (
+                frame['expectedStateSha256'],frame['expectedRevision'],frame['runUuid'])
+            expected = dict(previous=json.loads(w.request)['expectedStateSha256'],writer=case.writer,
+                            worker=w.data_identity,operation=op,editHash=frame['editRequestSha256'],resume=None)
+            valid = case.outer_matched and current['phase']=='Assigned' and all(current[k]==v for k,v in expected.items())
+            if valid:
+                case.effects['begins'] += 1
+                current.update(phase='Pending',hash=pending_hash*64,revision=current['revision']+1,run=op,previous=assigned_hash*64)
+                case.requests.append(deepcopy(json.loads(w.request)['request']))
+                if case.failure == ('admit','pending'):
+                    w.process.code=1
+                    valid=False
+                else:
+                    for k in ('dbOpens','edits','dbCloses','finishes'): case.effects[k]+=1
+                    case.requests.append(deepcopy(json.loads(w.request)['request']))
+                    current.update(phase='SavedPendingExit',hash=candidate_hash*64,revision=current['revision']+1,previous=pending_hash*64)
+                    w.process.code=0
+            case.response = dict(base,status='CANDIDATE',stateSha256=current['hash'],stateRevision=current['revision'],
+                runUuid=op,worldUuid=current['world'],receiptSha256=receipt_hash*64,editRequestSha256=edit_hash*64)
+        elif command == 'complete':
+            case.outer_matched = (current['hash'],current['revision'],current['world'],current['run']) == (
+                frame['expectedStateSha256'],frame['expectedRevision'],frame['worldUuid'],frame['runUuid'])
+            valid = (case.outer_matched and current['phase']=='SavedPendingExit' and case.held['phase']=='Assigned'
+                     and current['writer']==case.held['writer'] and current['worker']==case.held['worker']
+                     and current['revision']==case.held['revision']+2 and current['run']==op
+                     and frame['receiptSha256']==receipt_hash*64 and frame['editRequestSha256']==case.held['editHash'])
+            if valid:
+                case.effects['completes'] += 1
+                current.update(phase='Idle',hash=idle_hash*64,revision=current['revision']+1,run=case.writer['sessionId'],previous=candidate_hash*64)
+            result=dict(version=1,requestId=op,status='SUCCESS',result=dict(
+                type='io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterResult.Edited',
+                transactionIds=[8 if op==previous.NEXT else 9]),code=None,message=None,rejectedBeforeEffect=False)
+            case.response = dict(base,status='COMPLETED',stateSha256=current['hash'],stateRevision=current['revision'],
+                runUuid=current['run'],receiptSha256=receipt_hash*64,candidateStateSha256=frame['expectedStateSha256'],result=result)
+        else: case.fail(command)
+        if not valid:
+            (w if command in ('prepare','admit') else case.c).process.code=1
+            case.response=dict(base,status='REJECTED')
+        case.after(command)
+
+    def receiving(pipe, deadline, verify):
+        frame = pipe.sent[-1]
+        if frame['command']=='open': return receive(pipe,deadline,verify)
+        verify()
+        if case.failure == (frame['command'],'lost'):
+            (case.worker() if frame['command'] in ('prepare','admit') else case.c).process.code=1
+            raise EOFError('fixture 作用後応答喪失')
+        result=json.loads(case.replay) if case.replay is not None else deepcopy(case.response)
+        if case.change: result[case.change[0]]=case.change[1]
+        return result
+    case.enterContext(patch.object(processes.Pipe,'send',sending))
+    case.enterContext(patch.object(processes.Pipe,'receive',receiving))

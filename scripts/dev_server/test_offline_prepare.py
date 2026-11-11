@@ -76,10 +76,10 @@ class OfflinePrepareTests(unittest.TestCase):
     def test_original_transaction_and_nonempty_request_reach_prepared_without_edit(self):
         self.assertIs(self.runtime._transaction.__func__, runtime_control.RuntimeControl._transaction)
         original = self.c.acknowledge_startup
-        def acknowledged(value):
+        def acknowledged(value, *, deadline):
             self.assertEqual(self.operation, self.saved()['worker']['operationId'])
             self.assertNotIn('startupResponseSha256', self.saved()['worker'])
-            original(value)
+            original(value, deadline=deadline)
         with patch.object(self.c, 'acknowledge_startup', acknowledged):
             result = self.prepare()
         w = self.runtime._offline.workers[self.token['instanceId']]
@@ -253,12 +253,12 @@ class OfflinePrepareTests(unittest.TestCase):
         committed, release = threading.Event(), threading.Event()
         original = self.c.acknowledge_startup
         entered = []
-        def held(value):
+        def held(value, *, deadline):
             entered.append(value)
             self.assertEqual(1, len(entered), '同じCへ二重ACKが到達しました')
             committed.set()
             self.assertTrue(release.wait(10))
-            original(value)
+            original(value, deadline=deadline)
         with patch.object(self.c, 'acknowledge_startup', held), ThreadPoolExecutor(max_workers=2) as workers:
             winner = workers.submit(self.prepare)
             try:
