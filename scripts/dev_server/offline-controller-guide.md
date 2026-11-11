@@ -351,3 +351,11 @@ close時に固定したP/CのPID/start/host/boot・生成記録・元OwnedProces
 今回期限は本人照合・poll/group観測の前後、原文直列化・ローカル記録後、最終正本の直列化後/更新前、commit後/返却前まで適用します。不明・非zero・期限切れ・不一致・記録失敗は原文・意図・元予約・handle/pipeを保全し、再送・再観測・kill・再attach・C差替を行いません。commit後の期限超過でも既知の結果を巻き戻さず正常返却を拒否します。
 
 成功時もRegistry writer CLOSED、予約終端、handle/pipe解放は行いません。元offline-openはPENDING、pending=1、artifact予約を保持します。終了証拠からCLOSEDと正常解放を接続する段階、独立明示Ready+CLOSED start gate、#54復旧、部分解放失敗/応答不明の正規recover、公開呼出元は後続です。実OS/native本人受入は未確認であり、既存fake/合成fixtureで検証しています。
+
+## 第30スライス先行部分 元Cの正常handle/pipe解放
+
+P呼出元は終了観測の正本記録後、`runtime._offline_release_owner_handles(token, operation_id=元close操作ID, deadline=呼出期限)`を一度呼びます。元closeの要求/対応応答・最新Idle/履歴・全W終了とcomplete ACK、ownerExit正本hashと保持原文、元P/C生成binding・同handle/pipeを照合します。close時の固定期限と呼出期限のminを、解放意図の記録・lock待機・各作用・最終更新/返却まで引き継ぎます。
+
+元offline-openへownerRelease意図を保存し、元CのOwnedProcess.close、親側pipeのclose_after_exitを順に呼びます。元Cの終了を再観測したりPIDを再解決したりしません。各資源は作用直前にUNKNOWN、正常返却後にRELEASEDを保持し、各fdの直前にも正本/bindingと期限を照合します。途中失敗では成功したfdのNone、残存fd、UNKNOWN/RELEASED、要求/終了原本と元objectを保全し、同一/別IDの再close・再送・kill・C再生成へ進みません。
+
+正常解放の原文と正本hashを記録した成功も、元offline-open PENDING/pending=1/artifact予約を保持します。Registry writer CLOSED・予約終端、残るW等の資源解放との統合は後続です。Ready+CLOSED start gate、公開受付、#54復旧、部分解放失敗/応答不明の正規recoverと実OS/native本人受入も今回の範囲外です。

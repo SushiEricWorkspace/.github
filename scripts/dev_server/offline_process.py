@@ -55,6 +55,8 @@ class OfflineProcess:
         self.close_binding = None
         self.owner_exit_started = False
         self.owner_exit_response = None
+        self.owner_release = None
+        self.owner_release_response = None
         self.operation_history = {}
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
