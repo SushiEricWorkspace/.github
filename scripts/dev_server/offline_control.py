@@ -615,6 +615,100 @@ class _OfflineOpen:
             finished()
             return returned
 
+    def _workers_released(self, connection, token, controller, operation_id, deadline):
+        opened, saved = self._owner_released(connection, token, controller, operation_id, deadline)
+        workers, bindings = self._worker_release_bindings(token, controller, opened, saved)
+        require(controller.worker_release_response is not None,
+                'PROOF_REQUIRED', '全Wの正常解放原文が必要です')
+        response = json.loads(controller.worker_release_response)
+        owner_sha256 = digest(controller.owner_release_response)
+        require(controller.worker_release == {binding['operationId']:{'handle':'RELEASED','pipe':'RELEASED'}
+                    for binding in bindings}
+                and all(worker.pipe.input is None and worker.pipe.output is None for worker in workers)
+                and response == dict(status='WORKER_HANDLES_RELEASED', operationId=operation_id,
+                    openOperationId=opened['operationId'], ownerReleaseSha256=owner_sha256,
+                    workers=bindings, handlesReleased=True) and response['handlesReleased'] is True
+                and controller.record.get('workerRelease') == response
+                and saved.get('workerRelease') == dict(operationId=operation_id,
+                    ownerReleaseSha256=owner_sha256, workers=bindings,
+                    responseSha256=digest(controller.worker_release_response)),
+                'PROOF_MISMATCH', '全W解放の原文・正本hash・RELEASED進捗・親pipeが一致しません')
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', '全W解放の照合後に期限を超過しました')
+        return opened, saved, workers
+
+    def record_writer_closed(self, token, *, operation_id, deadline):
+        """同closeの全解放証拠からoffline writer CLOSEDを一度だけ正本へ記録する。
+
+        close時と呼出時の短い期限を局所記録・最終transaction・返却まで適用する。
+        失敗時も元原文・資源object・意図を保全する。元offline-open PENDINGと予約は
+        終端せず、既存Manager writer登録・start受付を変更しない。
+        """
+        fields(token, TOKEN)
+        identifier(operation_id, 'operationId')
+        token = deepcopy(token)
+        controller = self.controllers.get(token['instanceId'])
+        require(controller is not None and controller.close_binding is not None,
+                'WRITER_PENDING', '元Cとclose時固定bindingが必要です')
+        deadline = min(deadline, controller.close_binding['deadline'])
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, saved, workers = self._workers_released(connection, token, controller, operation_id, deadline)
+                require('writerClosed' not in saved and controller.writer_closed_response is None,
+                        'WRITER_PENDING', 'offline writer CLOSEDの単発記録を保全します')
+                closing = dict(operationId=operation_id,
+                    ownerReleaseSha256=digest(controller.owner_release_response),
+                    workerReleaseSha256=digest(controller.worker_release_response))
+                saved['writerClosed'] = closing
+                encoded = json.dumps(saved)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'CLOSED意図の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+
+            def checked(connection):
+                _, current, held = self._workers_released(connection, token, controller, operation_id, deadline)
+                require(current.get('writerClosed') == closing and len(held) == len(workers)
+                        and all(a is b for a,b in zip(held,workers))
+                        and digest(controller.owner_release_response) == closing['ownerReleaseSha256']
+                        and digest(controller.worker_release_response) == closing['workerReleaseSha256'],
+                        'STALE_OPERATION', 'CLOSED意図と元C/全W解放原文・保持先が変更されました')
+                return current
+
+            def verify():
+                controller.verify_owner()
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    checked(connection)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'CLOSED正本の照合後に期限を超過しました')
+
+            result = dict(status='OFFLINE_WRITER_CLOSED', operationId=operation_id,
+                openOperationId=opened['operationId'], writerStatus='CLOSED',
+                ownerReleaseSha256=closing['ownerReleaseSha256'], workerReleaseSha256=closing['workerReleaseSha256'])
+            controller.writer_closed_response = canonical(result)
+            verify()
+            controller.record['writerClosed'] = deepcopy(result)
+            controller._record()
+            verify()
+
+            def finished():
+                require(canonical(result) == controller.writer_closed_response
+                        and controller.record.get('writerClosed') == result,
+                        'PROOF_MISMATCH', 'CLOSED結果の保持原文と局所記録が一致しません')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'CLOSED結果の照合後に期限を超過しました')
+
+            with self.runtime._transaction(token['instanceId']) as connection:
+                current = checked(connection)
+                finished()
+                recorded = dict(closing, state='CLOSED', responseSha256=digest(controller.writer_closed_response))
+                current['writerClosed'] = recorded
+                encoded = json.dumps(current)
+                checked(connection)
+                finished()
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'CLOSED結果の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+            closing = recorded
+            returned = deepcopy(result)
+            verify()
+            finished()
+            return returned
+
     def complete(self, token, *, operation_id, deadline):
         """記録済み元W終了証拠からC本人completeを接続し、応答hashを正本へ記録する。
 
