@@ -440,6 +440,181 @@ class _OfflineOpen:
             finished()
             return returned
 
+    def _owner_released(self, connection, token, controller, operation_id, deadline):
+        opened, saved = self._owner_exited(connection, token, controller, operation_id, deadline)
+        require(controller.owner_release_response is not None,
+                'PROOF_REQUIRED', '元Cの正常解放原文が必要です')
+        response = json.loads(controller.owner_release_response)
+        require(controller.owner_release == {'handle':'RELEASED','pipe':'RELEASED'}
+                and controller.pipe.input is None and controller.pipe.output is None
+                and response == dict(status='OWNER_HANDLES_RELEASED', operationId=operation_id,
+                    openOperationId=opened['operationId'], ownerExitSha256=digest(controller.owner_exit_response),
+                    handlesReleased=True) and response['handlesReleased'] is True
+                and controller.record.get('ownerRelease') == response
+                and saved.get('ownerRelease') == dict(operationId=operation_id,
+                    ownerExitSha256=digest(controller.owner_exit_response),
+                    responseSha256=digest(controller.owner_release_response)),
+                'PROOF_MISMATCH', '元C解放の原文・正本hash・RELEASED進捗が一致しません')
+        return opened, saved
+
+    def _worker_release_bindings(self, token, controller, opened, saved):
+        workers = list(self.history.get(token['instanceId'], []))
+        latest = self.workers.get(token['instanceId'])
+        if latest is not None:
+            workers.append((latest, saved))
+        held, bindings = [], []
+        for worker, record in workers:
+            frame = json.loads(worker.request)
+            operation_id = frame['operationId']
+            archived = controller.operation_history.get(operation_id)
+            assigned = json.loads(archived['assignment_request'] if archived else controller.assignment_request)
+            exited = json.loads(worker.exit_response)
+            prepared = json.loads(worker.response)
+            require(worker.controller is controller and worker.startup_acknowledged and worker.exit_started
+                    and worker.candidate_ready and worker.creation_resources is not None
+                    and worker.creation_resources[0] is worker.process and worker.creation_resources[1] is worker.pipe
+                    and worker.parent == controller.close_binding['parent']
+                    and worker.parent_data == controller.close_binding['parent_data']
+                    and worker.record['identity'] == worker.identity
+                    and worker.record['controlIdentity'] == worker.data_identity
+                    and worker.record['commandHash'] == worker.identity['commandHash']
+                    and worker.identity['owner'] == worker.parent['owner']
+                    and worker.identity['startId'] == worker.data_identity['startId']
+                    and worker.process.pid == worker.identity['pid'] == worker.data_identity['pid'] == worker.record['creation']['pid']
+                    and worker.process.pid != controller.process.pid
+                    and worker.process.group == worker.record['creation']['ownerGroup'] != controller.process.group,
+                    'PROCESS_MISMATCH', '元Wの生成資源・P/C・本人bindingが一致しません')
+            require(record['worker'] == dict(operationId=operation_id, requestSha256=frame['requestHash'],
+                        startupResponseSha256=digest(worker.response))
+                    and record['admission'] == dict(operationId=operation_id,
+                        candidateResponseSha256=digest(worker.candidate_response))
+                    and worker.record.get('candidateResponseSha256') == digest(worker.candidate_response)
+                    and record['workerExit'] == dict(operationId=operation_id, responseSha256=digest(worker.exit_response))
+                    and worker.record.get('workerExit') == exited
+                    and exited == dict(status='WORKER_EXITED', operationId=operation_id,
+                        candidateResponseSha256=digest(worker.candidate_response), worker=worker.data_identity,
+                        ownerGroup=worker.process.group, exitCode=0, allChildrenExited=True)
+                    and type(exited['exitCode']) is int and exited['allChildrenExited'] is True
+                    and all(frame[k] == opened[k] for k in ('leaseId','epoch','generation','drainSha256',
+                                                           'worldRoot','shopDirectory','worldUuid'))
+                    and frame['controller'] == worker.parent_data and frame['owner'] == controller.data_identity
+                    and frame['command'] == 'prepare' and frame['worker'] == worker.data_identity
+                    and frame['sessionId'] == controller.session and frame['nonce'] == controller.nonce
+                    and frame['requestHash'] == digest(canonical({'command':'offline-prepare','request':frame['request']}))
+                    and prepared == dict(status='PREPARED', **{k:frame[k] for k in
+                        ('operationId','requestHash','sessionId','nonce','runUuid')},
+                        stateSha256=frame['expectedStateSha256'], stateRevision=frame['expectedRevision'])
+                    and worker.record.get('startupResponseSha256') == worker.record.get('startupAcknowledgedSha256') == digest(worker.response)
+                    and all(assigned[k] == frame[k] for k in ('operationId','requestHash','sessionId','nonce',
+                        'expectedStateSha256','expectedRevision','runUuid','request'))
+                    and assigned['command'] == 'assign' and assigned['openOperationId'] == opened['operationId']
+                    and assigned['worker'] == worker.data_identity,
+                    'PROOF_MISMATCH', '元W終了原文・候補・割当原文と正本hashが一致しません')
+            require(all(worker is not previous and worker.process is not previous.process
+                        and worker.pipe is not previous.pipe for previous in held)
+                    and worker.process is not controller.process and worker.pipe is not controller.pipe
+                    and all(binding['operationId'] != operation_id for binding in bindings),
+                    'PROCESS_MISMATCH', '全Wの操作と保持資源は独立である必要があります')
+            held.append(worker)
+            bindings.append(dict(operationId=operation_id, requestSha256=digest(worker.request),
+                assignmentSha256=digest(canonical(assigned)), workerExitSha256=digest(worker.exit_response),
+                creationSha256=digest(canonical(worker.record['creation']))))
+        return held, bindings
+
+    def release_worker_handles(self, token, *, operation_id, deadline):
+        """元Cの正常解放後、全Wの確定終了証拠から生成時handle/pipeを一度解放する。
+
+        履歴順に解放し、close時と呼出時の短い期限を各資源・最終記録/返却に適用する。
+        部分失敗はUNKNOWN/RELEASEDと原文・元object・予約を保全して伝播する。
+        成功もRegistry CLOSED・元予約終端やstart許可を意味しない。
+        """
+        fields(token, TOKEN)
+        identifier(operation_id, 'operationId')
+        token = deepcopy(token)
+        controller = self.controllers.get(token['instanceId'])
+        require(controller is not None and controller.close_binding is not None,
+                'WRITER_PENDING', '元Cとclose時固定bindingが必要です')
+        deadline = min(deadline, controller.close_binding['deadline'])
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, saved = self._owner_released(connection, token, controller, operation_id, deadline)
+                require('workerRelease' not in saved and controller.worker_release is None,
+                        'WRITER_PENDING', '全Wの単発解放意図を保全します')
+                workers, bindings = self._worker_release_bindings(token, controller, opened, saved)
+                release_record = dict(operationId=operation_id,
+                    ownerReleaseSha256=digest(controller.owner_release_response), workers=bindings)
+                saved['workerRelease'] = release_record
+                encoded = json.dumps(saved)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放意図の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+            resources = [(worker.process, worker.pipe) for worker in workers]
+            progress = {binding['operationId']:dict(handle='NOT_STARTED', pipe='NOT_STARTED') for binding in bindings}
+            controller.worker_release = progress
+
+            def checked(connection):
+                _, current = self._owner_released(connection, token, controller, operation_id, deadline)
+                current_workers, current_bindings = self._worker_release_bindings(token, controller, opened, current)
+                require(current.get('workerRelease') == release_record and controller.worker_release is progress
+                        and current_bindings == bindings and len(current_workers) == len(workers)
+                        and all(a is b for a,b in zip(current_workers, workers))
+                        and all(worker.process is process and worker.pipe is pipe
+                                for worker,(process,pipe) in zip(workers,resources))
+                        and digest(controller.owner_release_response) == release_record['ownerReleaseSha256'],
+                        'STALE_OPERATION', '全Wの解放意図・原文・保持資源・進捗が変更されました')
+                return current
+
+            def verify():
+                controller.verify_owner()
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    checked(connection)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W資源解放前後に期限を超過しました')
+
+            for binding,(process,pipe) in zip(bindings,resources):
+                state = progress[binding['operationId']]
+                verify()
+                state['handle'] = 'UNKNOWN'
+                process.close()
+                state['handle'] = 'RELEASED'
+                verify()
+                state['pipe'] = 'UNKNOWN'
+                pipe.close_after_exit(verify=verify)
+                require(pipe.input is None and pipe.output is None,
+                        'WRITER_PENDING', '元Wの親側pipe解放が完了していません')
+                state['pipe'] = 'RELEASED'
+                verify()
+            result = dict(status='WORKER_HANDLES_RELEASED', operationId=operation_id,
+                openOperationId=opened['operationId'], ownerReleaseSha256=release_record['ownerReleaseSha256'],
+                workers=deepcopy(bindings), handlesReleased=True)
+            controller.worker_release_response = canonical(result)
+            verify()
+            controller.record['workerRelease'] = deepcopy(result)
+            controller._record()
+            verify()
+
+            def finished():
+                require(all(state == {'handle':'RELEASED','pipe':'RELEASED'} for state in progress.values())
+                        and set(progress) == {binding['operationId'] for binding in bindings}
+                        and canonical(result) == controller.worker_release_response
+                        and controller.record.get('workerRelease') == result,
+                        'PROOF_MISMATCH', '全W解放の原文・記録・進捗が一致しません')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放結果照合後に期限を超過しました')
+
+            with self.runtime._transaction(token['instanceId']) as connection:
+                current = checked(connection)
+                finished()
+                recorded = dict(release_record, responseSha256=digest(controller.worker_release_response))
+                current['workerRelease'] = recorded
+                encoded = json.dumps(current)
+                checked(connection)
+                finished()
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放結果の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+            release_record = recorded
+            returned = deepcopy(result)
+            verify()
+            finished()
+            return returned
+
     def complete(self, token, *, operation_id, deadline):
         """記録済み元W終了証拠からC本人completeを接続し、応答hashを正本へ記録する。
 
