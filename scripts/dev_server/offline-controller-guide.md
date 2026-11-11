@@ -367,3 +367,11 @@ P呼出元は元Cの解放記録後、`runtime._offline_release_worker_handles(t
 元offline-openへworkerRelease意図と元C解放hash・全Wの要求/割当/終了/生成記録hashを保存します。全Wを各作用の前後・各fd直前に再照合し、close時固定期限と呼出期限のminを最終JSON/更新・commit後/返却まで適用します。終了済みC/WのPID/group再観測、再attach・kill・再closeは行いません。部分失敗では各WのUNKNOWN/RELEASED、成功したfdのNone、残存元object・原文・元予約を保全します。後続Wの解放を続行しません。
 
 正常結果WORKER_HANDLES_RELEASEDの原文と正本hashもC/Wと共に保持します。元offline-open PENDING/pending=1/artifact予約は継続します。Registry writer CLOSED・予約終端、Ready+CLOSED start gate、公開受付、#54復旧と正規recoverは後続です。実OS/native本人受入は未確認で、既存fake/合成fixtureと実Registryで検証しています。
+
+## 第32スライス先行部分 offline writer CLOSEDの正本記録
+
+P内部の`runtime._offline_record_writer_closed(token, operation_id=元close操作ID, deadline=呼出期限)`は、元C/全Wの正常解放後に一度呼びます。元close/終了/解放原文、ownerRelease/workerRelease正本hash、全RELEASED進捗・全親pipe解放、元binding・最新Idle/履歴・起動/complete ACKと元予約を再照合します。終了済みPID/groupの再観測・native close・Data API呼出しは行いません。
+
+元offline-open応答のwriterClosedへ単発意図を先行記録し、元CへOFFLINE_WRITER_CLOSEDの原文と局所記録を保持します。最終transactionで対応するstate=CLOSEDと応答hashを記録した場合だけoffline writer CLOSEDが確定します。意図の存在や局所応答だけではCLOSEDと扱いません。既存writer_sessionsはRunning中のManagerのrun/nonce/PID登録であり、このoffline Cのprivate sessionとは混在させません。
+
+close時と呼出時の短い期限を、lock待機・各照合・局所記録・最終JSON/更新・commit後/返却へ適用します。失敗は原文・意図・元object/予約を保全し、再close・再観測・自動recoverしません。commit後の期限超過も既知CLOSED証拠を保持して正常返却を拒否します。今回は元offline-open PENDING/pending=1/artifact予約を維持するため、既存startはCLOSED確定後も拒否します。元予約の終端と終端後照合の分離、独立明示Ready+CLOSEDのstart gate、公開受付、#54/recoverと実OS/native受入は後続です。
