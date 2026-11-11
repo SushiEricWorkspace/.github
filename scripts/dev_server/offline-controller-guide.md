@@ -341,3 +341,13 @@ PはOWNER_CLOSED応答のoperation/hash/session/nonce、同run、revision+1を�
 Cが保持するcallbackは元予約・確定stop/Ready原本・lease/本人bindingの継続照合を担います。openの期限は取得操作に適用し、以後のcloseには今回の期限を用います。取得時の期限経過後も、同じCと最新Idleを照合してcloseできます。closeへ渡す期限は起動応答ACKと最終結果記録まで検査します。
 
 prepareも今回のdeadlineをC/W起動ACKへ渡します。Wを含むOS生成直前、ACKの本人照合後・記録前と記録後、最終結果のJSON直列化後・正本更新前、commit後、ACKから返却する直前に期限を検査します。期限超過時はPREPAREDを返さず、確定済み原文・予約・ACK進捗を保持します。Wが保持するbinding照合も準備期限をsession寿命として捕捉せず、後続操作にはその操作の期限を用います。
+
+## 第29スライス先行部分 C本人close後の実終了観測
+
+記録済みclose応答を持つP呼出元は、`runtime._offline_observe_owner_exit(token, operation_id=元close操作ID, deadline=今回の固定期限)`を一度呼びます。close時に固定した期限と今回の呼出期限の短い方を、観測意図・待機・最終transaction・返却まで使用し、close期限を延長しません。取得時のopen期限はCの寿命へ持ち込みません。元offline-open予約・最新Idleと履歴・全W終了/complete ACK・同close要求/対応応答を再照合し、短いtransactionで`ownerExit`意図を記録します。待機中も同じ意図と正本を照合し、競合する観測・close・prepare・startを拒否します。
+
+close時に固定したP/CのPID/start/host/boot・生成記録・元OwnedProcess/group・pipeと原文を継続照合します。生存中の本人照会と終了が競合した場合は元handleのexit0を要求し、終了済みPIDは再解決しません。元Cのexit0と所有groupの全child不在を観測した場合だけ、局所の`OWNER_EXIT_OBSERVED`原文とそのhash参照を元offline-open正本へ記録します。DataのReady応答だけでは終了と扱いません。
+
+今回期限は本人照合・poll/group観測の前後、原文直列化・ローカル記録後、最終正本の直列化後/更新前、commit後/返却前まで適用します。不明・非zero・期限切れ・不一致・記録失敗は原文・意図・元予約・handle/pipeを保全し、再送・再観測・kill・再attach・C差替を行いません。commit後の期限超過でも既知の結果を巻き戻さず正常返却を拒否します。
+
+成功時もRegistry writer CLOSED、予約終端、handle/pipe解放は行いません。元offline-openはPENDING、pending=1、artifact予約を保持します。終了証拠からCLOSEDと正常解放を接続する段階、独立明示Ready+CLOSED start gate、#54復旧、部分解放失敗/応答不明の正規recover、公開呼出元は後続です。実OS/native本人受入は未確認であり、既存fake/合成fixtureで検証しています。
