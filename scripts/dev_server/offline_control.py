@@ -247,6 +247,36 @@ class _OfflineOpen:
             require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C close結果の記録後に期限を超過しました')
             return response
 
+    def _closed_owner(self, connection, token, controller, operation_id, deadline):
+        require(self.controllers.get(token['instanceId']) is controller,
+                'STALE_OPERATION', '元Cの保持先が変更されました')
+        opened, latest, saved = self._idle(connection, token, controller, operation_id, deadline)
+        closing = saved.get('ownerClose', {})
+        require(controller.close_ready and controller.close_request is not None and controller.close_response is not None
+                and closing.get('operationId') == operation_id
+                and closing.get('idleResponseSha256') == digest(canonical(latest))
+                and closing.get('responseSha256') == digest(controller.close_response)
+                and controller.record.get('ownerCloseRequestSha256') == digest(controller.close_request)
+                and controller.record.get('ownerCloseResponseSha256') == digest(controller.close_response),
+                'STALE_OPERATION', '元closeの記録済み対応応答が必要です')
+        expected_hash = digest(canonical({'command':'offline-close-owner', 'token':token,
+            'openOperationId':opened['operationId'], 'idleResponseSha256':closing['idleResponseSha256'],
+            'operationId':operation_id}))
+        frame = dict(command='close', operationId=operation_id, requestHash=expected_hash,
+                     sessionId=controller.session, nonce=controller.nonce, openOperationId=opened['operationId'],
+                     expectedStateSha256=latest['stateSha256'], expectedRevision=latest['stateRevision'])
+        response = json.loads(controller.close_response)
+        require(closing.get('requestHash') == expected_hash and canonical(frame) == controller.close_request
+                and response.keys() == {'status','operationId','requestHash','sessionId','nonce',
+                                        'stateSha256','stateRevision','runUuid'}
+                and response['status'] == 'OWNER_CLOSED'
+                and all(response[k] == frame[k] for k in ('operationId','requestHash','sessionId','nonce'))
+                and response['runUuid'] == latest['runUuid']
+                and type(response['stateRevision']) is int and response['stateRevision'] == latest['stateRevision'] + 1,
+                'STALE_OPERATION', '元close要求/応答と最新Idleのbindingが一致しません')
+        _hash(response['stateSha256'])
+        return opened, saved, closing
+
     def observe_owner_exit(self, token, *, operation_id, deadline):
         """元closeの対応応答とC/全child正常終了を正本へ記録する。
 
@@ -263,34 +293,7 @@ class _OfflineOpen:
         deadline = min(deadline, controller.close_binding['deadline'])
 
         def closed(connection):
-            require(self.controllers.get(token['instanceId']) is controller,
-                    'STALE_OPERATION', '元Cの保持先が変更されました')
-            opened, latest, saved = self._idle(connection, token, controller, operation_id, deadline)
-            closing = saved.get('ownerClose', {})
-            require(controller.close_ready and controller.close_request is not None and controller.close_response is not None
-                    and closing.get('operationId') == operation_id
-                    and closing.get('idleResponseSha256') == digest(canonical(latest))
-                    and closing.get('responseSha256') == digest(controller.close_response)
-                    and controller.record.get('ownerCloseRequestSha256') == digest(controller.close_request)
-                    and controller.record.get('ownerCloseResponseSha256') == digest(controller.close_response),
-                    'STALE_OPERATION', '元closeの記録済み対応応答が必要です')
-            expected_hash = digest(canonical({'command':'offline-close-owner', 'token':token,
-                'openOperationId':opened['operationId'], 'idleResponseSha256':closing['idleResponseSha256'],
-                'operationId':operation_id}))
-            frame = dict(command='close', operationId=operation_id, requestHash=expected_hash,
-                         sessionId=controller.session, nonce=controller.nonce, openOperationId=opened['operationId'],
-                         expectedStateSha256=latest['stateSha256'], expectedRevision=latest['stateRevision'])
-            response = json.loads(controller.close_response)
-            require(closing.get('requestHash') == expected_hash and canonical(frame) == controller.close_request
-                    and response.keys() == {'status','operationId','requestHash','sessionId','nonce',
-                                            'stateSha256','stateRevision','runUuid'}
-                    and response['status'] == 'OWNER_CLOSED'
-                    and all(response[k] == frame[k] for k in ('operationId','requestHash','sessionId','nonce'))
-                    and response['runUuid'] == latest['runUuid']
-                    and type(response['stateRevision']) is int and response['stateRevision'] == latest['stateRevision'] + 1,
-                    'STALE_OPERATION', '元close要求/応答と最新Idleのbindingが一致しません')
-            _hash(response['stateSha256'])
-            return opened, saved, closing
+            return self._closed_owner(connection, token, controller, operation_id, deadline)
 
         with self.registry.resource_use(), self.runtime._lock_wait(deadline):
             with self.runtime._transaction(token['instanceId']) as connection:
@@ -331,6 +334,111 @@ class _OfflineOpen:
             controller._verify_close_binding(deadline)
             require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C終了結果の記録後に期限を超過しました')
             return response
+
+    def _owner_exited(self, connection, token, controller, operation_id, deadline):
+        opened, saved, closing = self._closed_owner(connection, token, controller, operation_id, deadline)
+        require(controller.owner_exit_started and controller.owner_exit_response is not None,
+                'PROOF_REQUIRED', '元Cの確定した終了原文が必要です')
+        response = json.loads(controller.owner_exit_response)
+        require(saved.get('ownerExit') == dict(operationId=operation_id, closeResponseSha256=closing['responseSha256'],
+                    responseSha256=digest(controller.owner_exit_response))
+                and controller.record.get('ownerExit') == response
+                and response.keys() == {'status','operationId','closeRequestSha256','closeResponseSha256',
+                                        'owner','ownerGroup','exitCode','allChildrenExited'}
+                and response['status'] == 'OWNER_EXIT_OBSERVED' and response['operationId'] == operation_id
+                and response['closeRequestSha256'] == digest(controller.close_request)
+                and response['closeResponseSha256'] == digest(controller.close_response)
+                and response['owner'] == controller.data_identity
+                and response['ownerGroup'] == controller.process.group
+                and type(response['exitCode']) is int and response['exitCode'] == 0
+                and response['allChildrenExited'] is True,
+                'PROOF_MISMATCH', '元C終了原文・生成bindingと正本hashが一致しません')
+        controller._verify_close_binding(deadline)
+        return opened, saved
+
+    def release_owner_handles(self, token, *, operation_id, deadline):
+        """確定した元C/全child終了から同handle/pipeを一度だけ正常解放する。
+
+        close時固定期限と呼出期限のminを使う。各資源の部分失敗はUNKNOWN/RELEASEDと
+        原文・元object・予約を保持して伝播し、再close/再観測しない。正常結果もCLOSEDや
+        予約終端を意味しない。元W等の資源解放は後続で行う。
+        """
+        fields(token, TOKEN)
+        identifier(operation_id, 'operationId')
+        token = deepcopy(token)
+        controller = self.controllers.get(token['instanceId'])
+        require(controller is not None and controller.close_binding is not None,
+                'WRITER_PENDING', '元Cとclose時固定bindingが必要です')
+        deadline = min(deadline, controller.close_binding['deadline'])
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, saved = self._owner_exited(connection, token, controller, operation_id, deadline)
+                require('ownerRelease' not in saved and controller.owner_release is None,
+                        'WRITER_PENDING', '元Cの解放を再実行しません')
+                release_record = dict(operationId=operation_id, ownerExitSha256=digest(controller.owner_exit_response))
+                saved['ownerRelease'] = release_record
+                encoded = json.dumps(saved)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C解放意図の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+            progress = dict(handle='NOT_STARTED', pipe='NOT_STARTED')
+            controller.owner_release = progress
+            process, pipe = controller.process, controller.pipe
+
+            def checked(connection):
+                _, current = self._owner_exited(connection, token, controller, operation_id, deadline)
+                require(current.get('ownerRelease') == release_record and controller.owner_release is progress
+                        and digest(controller.owner_exit_response) == release_record['ownerExitSha256'],
+                        'STALE_OPERATION', '元C解放意図・終了原文・進捗保持先が変更されました')
+                return current
+
+            def verify():
+                controller.verify_owner()
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    checked(connection)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C資源解放直前に期限を超過しました')
+
+            verify()
+            progress['handle'] = 'UNKNOWN'
+            process.close()
+            progress['handle'] = 'RELEASED'
+            verify()
+            progress['pipe'] = 'UNKNOWN'
+            pipe.close_after_exit(verify=verify)
+            require(pipe.input is None and pipe.output is None,
+                    'WRITER_PENDING', '元Cの親側pipe解放が完了していません')
+            progress['pipe'] = 'RELEASED'
+            verify()
+            result = dict(status='OWNER_HANDLES_RELEASED', operationId=operation_id,
+                          openOperationId=opened['operationId'], ownerExitSha256=release_record['ownerExitSha256'],
+                          handlesReleased=True)
+            controller.owner_release_response = canonical(result)
+            verify()
+            controller.record['ownerRelease'] = deepcopy(result)
+            controller._record()
+            verify()
+
+            def finished():
+                require(progress == {'handle':'RELEASED','pipe':'RELEASED'}
+                        and canonical(result) == controller.owner_release_response
+                        and controller.record.get('ownerRelease') == result,
+                        'PROOF_MISMATCH', '元C解放の原文・記録・進捗が一致しません')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C解放結果の照合後に期限を超過しました')
+
+            with self.runtime._transaction(token['instanceId']) as connection:
+                current = checked(connection)
+                finished()
+                recorded = dict(release_record, responseSha256=digest(controller.owner_release_response))
+                current['ownerRelease'] = recorded
+                encoded = json.dumps(current)
+                checked(connection)
+                finished()
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C解放結果の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+            release_record = recorded
+            returned = deepcopy(result)
+            verify()
+            finished()
+            return returned
 
     def complete(self, token, *, operation_id, deadline):
         """記録済み元W終了証拠からC本人completeを接続し、応答hashを正本へ記録する。
