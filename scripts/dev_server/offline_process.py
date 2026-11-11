@@ -34,6 +34,7 @@ class OfflineProcess:
         self.adapter = process_adapter
         self.process = process_adapter.OwnedProcess()
         self.pipe = None
+        self.creation_resources = None
         self.identity = self.parent = self.data_identity = self.parent_data = None
         self.request = self.response = None
         self.record = None
@@ -57,6 +58,8 @@ class OfflineProcess:
         self.owner_exit_response = None
         self.owner_release = None
         self.owner_release_response = None
+        self.worker_release = None
+        self.worker_release_response = None
         self.operation_history = {}
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
@@ -351,6 +354,7 @@ class OfflineProcess:
                        'creation': None, 'identity': None, 'controlIdentity': None}
         self._record()
         self.pipe = ProxyPipe()
+        self.creation_resources = (self.process, self.pipe)
 
         def created():
             self.record['creation'] = {'pid': self.process.pid, 'stage': self.process.stage,

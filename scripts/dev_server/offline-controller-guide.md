@@ -359,3 +359,11 @@ P呼出元は終了観測の正本記録後、`runtime._offline_release_owner_ha
 元offline-openへownerRelease意図を保存し、元CのOwnedProcess.close、親側pipeのclose_after_exitを順に呼びます。元Cの終了を再観測したりPIDを再解決したりしません。各資源は作用直前にUNKNOWN、正常返却後にRELEASEDを保持し、各fdの直前にも正本/bindingと期限を照合します。途中失敗では成功したfdのNone、残存fd、UNKNOWN/RELEASED、要求/終了原本と元objectを保全し、同一/別IDの再close・再送・kill・C再生成へ進みません。
 
 正常解放の原文と正本hashを記録した成功も、元offline-open PENDING/pending=1/artifact予約を保持します。Registry writer CLOSED・予約終端、残るW等の資源解放との統合は後続です。Ready+CLOSED start gate、公開受付、#54復旧、部分解放失敗/応答不明の正規recoverと実OS/native本人受入も今回の範囲外です。
+
+## 第31スライス先行部分 履歴を含む全Wの正常解放
+
+P呼出元は元Cの解放記録後、`runtime._offline_release_worker_handles(token, operation_id=元close操作ID, deadline=呼出期限)`を一度呼びます。ownerReleaseの保持原文・正本hash・RELEASED進捗・親側pipe解放を要求し、元close/終了原文・最新Idle・全履歴のcomplete ACKと予約を再照合します。生成時に保持したprocess/pipe参照、P/Cと各Wの生成本人・独立group、元割当/候補/終了原文と正本hashが一致した場合だけ、履歴順に各Wのhandle、親側pipeを正常解放します。WのないOPEN後closeは空の解放結果を記録します。
+
+元offline-openへworkerRelease意図と元C解放hash・全Wの要求/割当/終了/生成記録hashを保存します。全Wを各作用の前後・各fd直前に再照合し、close時固定期限と呼出期限のminを最終JSON/更新・commit後/返却まで適用します。終了済みC/WのPID/group再観測、再attach・kill・再closeは行いません。部分失敗では各WのUNKNOWN/RELEASED、成功したfdのNone、残存元object・原文・元予約を保全します。後続Wの解放を続行しません。
+
+正常結果WORKER_HANDLES_RELEASEDの原文と正本hashもC/Wと共に保持します。元offline-open PENDING/pending=1/artifact予約は継続します。Registry writer CLOSED・予約終端、Ready+CLOSED start gate、公開受付、#54復旧と正規recoverは後続です。実OS/native本人受入は未確認で、既存fake/合成fixtureと実Registryで検証しています。

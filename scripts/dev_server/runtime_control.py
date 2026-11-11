@@ -87,6 +87,11 @@ class RuntimeControl:
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
         return self._offline.release_owner_handles(token, operation_id=operation_id, deadline=deadline)
 
+    def _offline_release_worker_handles(self, token, *, operation_id, deadline):
+        """同closeのC解放正本から履歴を含む全Wを解放し、元予約は保持する。"""
+        require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
+        return self._offline.release_worker_handles(token, operation_id=operation_id, deadline=deadline)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
