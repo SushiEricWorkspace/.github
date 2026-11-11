@@ -52,6 +52,9 @@ class OfflineProcess:
         self.game_exit_response = self.game_exit_result = None
         self.close_started = self.close_ready = False
         self.close_request = self.close_response = None
+        self.close_binding = None
+        self.owner_exit_started = False
+        self.owner_exit_response = None
         self.operation_history = {}
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
@@ -465,6 +468,9 @@ class OfflineProcess:
         creation = deepcopy(self.record['creation'])
         parent, parent_data = deepcopy(self.parent), deepcopy(self.parent_data)
         group = self.process.group
+        self.close_binding = dict(process=self.process, pipe=self.pipe, identity=identity, data=data,
+                                  creation=creation, parent=parent, parent_data=parent_data,
+                                  group=group, command_hash=self.record['commandHash'], deadline=deadline)
         frame = {'command':'close', 'operationId':operation_id, 'requestHash':request_hash,
                  'sessionId':self.session, 'nonce':self.nonce,
                  'openOperationId':json.loads(self.request)['operationId'],
@@ -505,8 +511,69 @@ class OfflineProcess:
         self.record['ownerCloseResponseSha256'] = digest(self.close_response)
         self._record()
         checked()
+        self.close_binding.update(request=self.close_request, response=self.close_response)
         self.close_ready = True
         return deepcopy(response)
+
+    def _verify_close_binding(self, deadline):
+        binding = self.close_binding
+        request, response = binding['request'], binding['response']
+        runtime_process.require_identity(binding['parent'], self.adapter.identity(os.getpid()))
+        require(process_identity(self.native, self.adapter, os.getpid()) == binding['parent_data']
+                and self.parent == binding['parent'] and self.parent_data == binding['parent_data']
+                and self.process is binding['process'] and self.pipe is binding['pipe']
+                and self.identity == binding['identity'] and self.data_identity == binding['data']
+                and self.record['identity'] == binding['identity']
+                and self.record['controlIdentity'] == binding['data']
+                and self.record['creation'] == binding['creation']
+                and self.record['commandHash'] == binding['command_hash']
+                and self.process.pid == binding['identity']['pid'] == binding['data']['pid'] == binding['creation']['pid']
+                and self.process.group == binding['group'] == binding['creation']['ownerGroup']
+                and self.close_request == request and self.close_response == response
+                and self.record.get('ownerCloseRequestSha256') == digest(request)
+                and self.record.get('ownerCloseResponseSha256') == digest(response),
+                'PROCESS_MISMATCH', 'C終了観測の元P/C/pipe/close生成bindingが一致しません')
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C/全child終了観測の期限を超過しました')
+
+    def observe_owner_exit(self, *, deadline, verify):
+        """close時の元C/全childの正常終了を一度観測し、handle/pipeと原文を保持する。
+
+        verifyは同closeの正本応答と予約を継続照合する。終了済みPIDを再解決せず、
+        不明・非zero・期限超過は再観測/kill/資源解放せず呼出元へ伝える。
+        """
+        require(self.controller is None and self.close_ready and self.close_binding is not None
+                and not self.owner_exit_started,
+                'WRITER_PENDING', '元Cの記録済みcloseだけを一度終了観測します')
+        self.owner_exit_started = True
+        binding = self.close_binding
+        deadline = min(deadline, binding['deadline'])
+        request, response = self.close_request, self.close_response
+
+        def checked():
+            verify()
+            self.verify_owner()
+            self._verify_close_binding(deadline)
+
+        while True:
+            checked()
+            code = self._observe_process(self.process, binding['identity'], binding['data'])
+            checked()
+            members = self.process.members()
+            checked()
+            require(type(members) is list, 'PROCESS_MISMATCH', 'C所有groupの観測が不明です')
+            if type(code) is int and code == 0 and members == []:
+                break
+            time.sleep(0.1)
+        result = dict(status='OWNER_EXIT_OBSERVED', operationId=json.loads(request)['operationId'],
+                      closeRequestSha256=digest(request), closeResponseSha256=digest(response),
+                      owner=deepcopy(binding['data']), ownerGroup=binding['group'],
+                      exitCode=0, allChildrenExited=True)
+        self.owner_exit_response = canonical(result)
+        checked()
+        self.record['ownerExit'] = deepcopy(result)
+        self._record()
+        checked()
+        return deepcopy(result)
 
     def observe_game_exit(self, frame, *, game_process, game_identity, game_group, deadline):
         """元Mと単発観測Cの正常exit/全child不在から同候補のReadyを局所観測する。

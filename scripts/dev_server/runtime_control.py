@@ -77,6 +77,11 @@ class RuntimeControl:
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
         return self._offline.close_owner(token, operation_id=operation_id, deadline=deadline)
 
+    def _offline_observe_owner_exit(self, token, *, operation_id, deadline):
+        """同close操作の元C/全child正常終了だけを記録し、予約と資源を保持する。"""
+        require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
+        return self._offline.observe_owner_exit(token, operation_id=operation_id, deadline=deadline)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")

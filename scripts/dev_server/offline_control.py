@@ -165,6 +165,29 @@ class _OfflineOpen:
                 'STALE_OPERATION', '元W/全child終了証拠と同候補・生成binding・正本が一致しません')
         return opened, saved
 
+    def _idle(self, connection, token, controller, operation_id, deadline):
+        opened, response, saved = self._opened(connection, token, controller, close_operation_id=operation_id)
+        worker = self.workers.get(token['instanceId'])
+        history = self.history.get(token['instanceId'], [])
+        require(saved.get('history', []) == [record for _, record in history],
+                'STALE_OPERATION', '元Cの操作履歴が変更されました')
+        if worker is None:
+            require(not history and not controller.operation_history and 'worker' not in saved,
+                    'WRITER_PENDING', '受理済みWの終端が必要です')
+        else:
+            previous_id = json.loads(worker.request)['operationId']
+            self._exited(connection, token, controller, worker, previous_id, close_operation_id=operation_id)
+            value = digest(controller.completion_response) if controller.completion_response is not None else None
+            require(controller.completion_ready and controller.completion_acknowledged
+                    and saved.get('completion') == {'operationId':previous_id,
+                        'workerExitSha256':digest(worker.exit_response), 'responseSha256':value}
+                    and controller.record.get('completionResponseSha256') == value
+                    and controller.record.get('completionAcknowledgedSha256') == value,
+                    'WRITER_PENDING', '最新Wのcomplete記録/ACKが必要です')
+            response = json.loads(controller.completion_response)
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C closeの最新Idle照合後に期限を超過しました')
+        return opened, response, saved
+
     def close_owner(self, token, *, operation_id, deadline):
         """元Cの最新IdleからData close応答を一度記録し、要求と予約を保持する。"""
         fields(token, TOKEN)
@@ -174,27 +197,7 @@ class _OfflineOpen:
         require(controller is not None, 'WRITER_PENDING', '保持した元Cが必要です')
 
         def idle(connection):
-            opened, response, saved = self._opened(connection, token, controller, close_operation_id=operation_id)
-            worker = self.workers.get(token['instanceId'])
-            history = self.history.get(token['instanceId'], [])
-            require(saved.get('history', []) == [record for _, record in history],
-                    'STALE_OPERATION', '元Cの操作履歴が変更されました')
-            if worker is None:
-                require(not history and not controller.operation_history and 'worker' not in saved,
-                        'WRITER_PENDING', '受理済みWの終端が必要です')
-            else:
-                previous_id = json.loads(worker.request)['operationId']
-                self._exited(connection, token, controller, worker, previous_id, close_operation_id=operation_id)
-                value = digest(controller.completion_response) if controller.completion_response is not None else None
-                require(controller.completion_ready and controller.completion_acknowledged
-                        and saved.get('completion') == {'operationId':previous_id,
-                            'workerExitSha256':digest(worker.exit_response), 'responseSha256':value}
-                        and controller.record.get('completionResponseSha256') == value
-                        and controller.record.get('completionAcknowledgedSha256') == value,
-                        'WRITER_PENDING', '最新Wのcomplete記録/ACKが必要です')
-                response = json.loads(controller.completion_response)
-            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C closeの最新Idle照合後に期限を超過しました')
-            return opened, response, saved
+            return self._idle(connection, token, controller, operation_id, deadline)
 
         with self.registry.resource_use(), self.runtime._lock_wait(deadline):
             with self.runtime._transaction(token['instanceId']) as connection:
@@ -242,6 +245,91 @@ class _OfflineOpen:
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
                                    (json.dumps(current), opened['operationId']))
             require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C close結果の記録後に期限を超過しました')
+            return response
+
+    def observe_owner_exit(self, token, *, operation_id, deadline):
+        """元closeの対応応答とC/全child正常終了を正本へ記録する。
+
+        同close操作IDだけを受け付け、一度開始した観測は再試行しない。失敗時も原文・
+        元予約・handle/pipeを保持する。成功もwriter CLOSEDや予約解放を意味しない。
+        """
+        fields(token, TOKEN)
+        identifier(operation_id, 'operationId')
+        token = deepcopy(token)
+        controller = self.controllers.get(token['instanceId'])
+        require(controller is not None, 'WRITER_PENDING', '保持した元Cが必要です')
+
+        require(controller.close_binding is not None, 'WRITER_PENDING', '元closeの固定期限が必要です')
+        deadline = min(deadline, controller.close_binding['deadline'])
+
+        def closed(connection):
+            require(self.controllers.get(token['instanceId']) is controller,
+                    'STALE_OPERATION', '元Cの保持先が変更されました')
+            opened, latest, saved = self._idle(connection, token, controller, operation_id, deadline)
+            closing = saved.get('ownerClose', {})
+            require(controller.close_ready and controller.close_request is not None and controller.close_response is not None
+                    and closing.get('operationId') == operation_id
+                    and closing.get('idleResponseSha256') == digest(canonical(latest))
+                    and closing.get('responseSha256') == digest(controller.close_response)
+                    and controller.record.get('ownerCloseRequestSha256') == digest(controller.close_request)
+                    and controller.record.get('ownerCloseResponseSha256') == digest(controller.close_response),
+                    'STALE_OPERATION', '元closeの記録済み対応応答が必要です')
+            expected_hash = digest(canonical({'command':'offline-close-owner', 'token':token,
+                'openOperationId':opened['operationId'], 'idleResponseSha256':closing['idleResponseSha256'],
+                'operationId':operation_id}))
+            frame = dict(command='close', operationId=operation_id, requestHash=expected_hash,
+                         sessionId=controller.session, nonce=controller.nonce, openOperationId=opened['operationId'],
+                         expectedStateSha256=latest['stateSha256'], expectedRevision=latest['stateRevision'])
+            response = json.loads(controller.close_response)
+            require(closing.get('requestHash') == expected_hash and canonical(frame) == controller.close_request
+                    and response.keys() == {'status','operationId','requestHash','sessionId','nonce',
+                                            'stateSha256','stateRevision','runUuid'}
+                    and response['status'] == 'OWNER_CLOSED'
+                    and all(response[k] == frame[k] for k in ('operationId','requestHash','sessionId','nonce'))
+                    and response['runUuid'] == latest['runUuid']
+                    and type(response['stateRevision']) is int and response['stateRevision'] == latest['stateRevision'] + 1,
+                    'STALE_OPERATION', '元close要求/応答と最新Idleのbindingが一致しません')
+            _hash(response['stateSha256'])
+            return opened, saved, closing
+
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, saved, closing = closed(connection)
+                require('ownerExit' not in saved, 'WRITER_PENDING', '元Cの終了観測を再実行しません')
+                observation = dict(operationId=operation_id, closeResponseSha256=closing['responseSha256'])
+                saved['ownerExit'] = observation
+                encoded = json.dumps(saved)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C終了観測意図の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+
+            def verify():
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    _, current, current_close = closed(connection)
+                    require(current.get('ownerExit') == observation and current_close == closing,
+                            'STALE_OPERATION', 'C終了観測意図/close応答が変更されました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C終了観測の正本照合後に期限を超過しました')
+
+            verify()
+            response = controller.observe_owner_exit(deadline=deadline, verify=verify)
+            verify()
+            require(canonical(response) == controller.owner_exit_response
+                    and controller.record.get('ownerExit') == response,
+                    'STALE_OPERATION', '元Cの終了観測原文と保持記録が一致しません')
+            with self.runtime._transaction(token['instanceId']) as connection:
+                _, current, current_close = closed(connection)
+                require(current.get('ownerExit') == observation and current_close == closing,
+                        'STALE_OPERATION', 'C終了結果の最終正本照合が一致しません')
+                current['ownerExit'] = dict(observation, responseSha256=digest(controller.owner_exit_response))
+                encoded = json.dumps(current)
+                controller._verify_close_binding(deadline)
+                require(canonical(response) == controller.owner_exit_response
+                        and controller.record.get('ownerExit') == response,
+                        'STALE_OPERATION', '最終更新前に元C終了原文が変更されました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C終了結果の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+            controller.verify_owner()
+            controller._verify_close_binding(deadline)
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C終了結果の記録後に期限を超過しました')
             return response
 
     def complete(self, token, *, operation_id, deadline):
