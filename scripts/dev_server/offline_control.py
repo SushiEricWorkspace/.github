@@ -79,7 +79,7 @@ class _OfflineOpen:
                                        (row['id'], operation_id)).fetchone(), 'WRITER_PENDING', '別の未完了runtime操作があります')
         return run
 
-    def _opened(self, connection, token, controller):
+    def _opened(self, connection, token, controller, close_operation_id=None):
         require(controller.ready, 'WRITER_PENDING', 'OPEN未照合のCを使えません')
         opened = json.loads(controller.request)
         response = json.loads(controller.response)
@@ -91,10 +91,13 @@ class _OfflineOpen:
                 and saved.get('startupResponseSha256') == digest(controller.response),
                 'STALE_OPERATION', '元Cの起動応答と正本記録が一致しません')
         self._reserved(connection, token, opened['operationId'], opened['requestHash'], saved['binding'])
+        require('ownerClose' not in saved or close_operation_id is not None
+                and saved['ownerClose'].get('operationId') == close_operation_id,
+                'WRITER_PENDING', '元Cのclose意図を保全します')
         return opened, response, saved
 
-    def _prepared(self, connection, token, controller, worker, operation_id):
-        opened, response, saved = self._opened(connection, token, controller)
+    def _prepared(self, connection, token, controller, worker, operation_id, close_operation_id=None):
+        opened, response, saved = self._opened(connection, token, controller, close_operation_id)
         history = self.history.get(token['instanceId'], [])
         require(saved.get('history', []) == [record for _, record in history]
                 and set(controller.operation_history) == {record['worker']['operationId'] for _, record in history},
@@ -127,24 +130,24 @@ class _OfflineOpen:
                 'STALE_OPERATION', '元PREPAREDとCのIdle/管理bindingが一致しません')
         return opened, saved
 
-    def _assigned(self, connection, token, controller, worker, operation_id):
-        opened, saved = self._prepared(connection, token, controller, worker, operation_id)
+    def _assigned(self, connection, token, controller, worker, operation_id, close_operation_id=None):
+        opened, saved = self._prepared(connection, token, controller, worker, operation_id, close_operation_id)
         require(controller.assignment_ready and controller.assignment_acknowledged
                 and saved.get('assignment') == {'operationId':operation_id,
                                                'responseSha256':digest(controller.assignment_response)},
                 'STALE_OPERATION', '元Assignedの応答と正本記録が一致しません')
         return opened, saved
 
-    def _candidate(self, connection, token, controller, worker, operation_id):
-        opened, saved = self._assigned(connection, token, controller, worker, operation_id)
+    def _candidate(self, connection, token, controller, worker, operation_id, close_operation_id=None):
+        opened, saved = self._assigned(connection, token, controller, worker, operation_id, close_operation_id)
         require(worker.candidate_ready and saved.get('admission') == {
                     'operationId':operation_id, 'candidateResponseSha256':digest(worker.candidate_response)}
                 and worker.record.get('candidateResponseSha256') == digest(worker.candidate_response),
                 'STALE_OPERATION', '元候補packetのローカル記録と正本が一致しません')
         return opened, saved
 
-    def _exited(self, connection, token, controller, worker, operation_id):
-        opened, saved = self._candidate(connection, token, controller, worker, operation_id)
+    def _exited(self, connection, token, controller, worker, operation_id, close_operation_id=None):
+        opened, saved = self._candidate(connection, token, controller, worker, operation_id, close_operation_id)
         require(worker.exit_started and worker.exit_response is not None,
                 'WRITER_PENDING', '元Wの正常終了証拠が必要です')
         exited = json.loads(worker.exit_response)
@@ -161,6 +164,85 @@ class _OfflineOpen:
                 and worker.process.group != controller.process.group,
                 'STALE_OPERATION', '元W/全child終了証拠と同候補・生成binding・正本が一致しません')
         return opened, saved
+
+    def close_owner(self, token, *, operation_id, deadline):
+        """元Cの最新IdleからData close応答を一度記録し、要求と予約を保持する。"""
+        fields(token, TOKEN)
+        identifier(operation_id, 'operationId')
+        token = deepcopy(token)
+        controller = self.controllers.get(token['instanceId'])
+        require(controller is not None, 'WRITER_PENDING', '保持した元Cが必要です')
+
+        def idle(connection):
+            opened, response, saved = self._opened(connection, token, controller, close_operation_id=operation_id)
+            worker = self.workers.get(token['instanceId'])
+            history = self.history.get(token['instanceId'], [])
+            require(saved.get('history', []) == [record for _, record in history],
+                    'STALE_OPERATION', '元Cの操作履歴が変更されました')
+            if worker is None:
+                require(not history and not controller.operation_history and 'worker' not in saved,
+                        'WRITER_PENDING', '受理済みWの終端が必要です')
+            else:
+                previous_id = json.loads(worker.request)['operationId']
+                self._exited(connection, token, controller, worker, previous_id, close_operation_id=operation_id)
+                value = digest(controller.completion_response) if controller.completion_response is not None else None
+                require(controller.completion_ready and controller.completion_acknowledged
+                        and saved.get('completion') == {'operationId':previous_id,
+                            'workerExitSha256':digest(worker.exit_response), 'responseSha256':value}
+                        and controller.record.get('completionResponseSha256') == value
+                        and controller.record.get('completionAcknowledgedSha256') == value,
+                        'WRITER_PENDING', '最新Wのcomplete記録/ACKが必要です')
+                response = json.loads(controller.completion_response)
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C closeの最新Idle照合後に期限を超過しました')
+            return opened, response, saved
+
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(token['instanceId']) as connection:
+                opened, latest, saved = idle(connection)
+                require('ownerClose' not in saved, 'WRITER_PENDING', '元Cのclose要求を再送しません')
+                used = {opened['operationId'], *controller.operation_history}
+                if token['instanceId'] in self.workers:
+                    used.add(json.loads(self.workers[token['instanceId']].request)['operationId'])
+                require(operation_id not in used, 'OPERATION_CONFLICT', '元C/Wの操作IDをcloseへ再使用しません')
+                for table in ('operations','runtime_operations','reference_operations','writer_operations','snapshot_operations'):
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT', '既存の操作IDをcloseへ再使用しません')
+                closing = {'operationId':operation_id, 'idleResponseSha256':digest(canonical(latest))}
+                closing['requestHash'] = digest(canonical({'command':'offline-close-owner', 'token':token,
+                    'openOperationId':opened['operationId'], 'idleResponseSha256':closing['idleResponseSha256'],
+                    'operationId':operation_id}))
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C close意図の更新前に期限を超過しました')
+                saved['ownerClose'] = closing
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(saved), opened['operationId']))
+
+            def verify():
+                with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    _, current_idle, current = idle(connection)
+                    require(current.get('ownerClose') == closing and canonical(current_idle) == canonical(latest),
+                            'STALE_OPERATION', '元C close意図/最新Idleが変更されました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C closeの正本照合後に期限を超過しました')
+
+            verify()
+            if not controller.startup_acknowledged:
+                controller.acknowledge_startup(saved['startupResponseSha256'], deadline=deadline)
+            response = controller.close_owner(latest, operation_id=operation_id,
+                request_hash=closing['requestHash'], deadline=deadline, verify=verify)
+            verify()
+            require(controller.close_ready and canonical(response) == controller.close_response
+                    and controller.record.get('ownerCloseResponseSha256') == digest(controller.close_response),
+                    'STALE_OPERATION', '元C close応答の保持記録が一致しません')
+            with self.runtime._transaction(token['instanceId']) as connection:
+                _, current_idle, current = idle(connection)
+                require(current.get('ownerClose') == closing and canonical(current_idle) == canonical(latest),
+                        'STALE_OPERATION', 'C close結果の最終正本照合が一致しません')
+                recorded = dict(closing, responseSha256=digest(controller.close_response))
+                current['ownerClose'] = recorded
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C close結果の更新前に期限を超過しました')
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
+                                   (json.dumps(current), opened['operationId']))
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C close結果の記録後に期限を超過しました')
+            return response
 
     def complete(self, token, *, operation_id, deadline):
         """記録済み元W終了証拠からC本人completeを接続し、応答hashを正本へ記録する。
@@ -369,10 +451,9 @@ class _OfflineOpen:
                             'STALE_OPERATION', '元Wの予約又は操作履歴が変更されました')
 
             verify()
-            if previous is not None:
-                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '次W生成前に期限を超過しました')
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W生成前に期限を超過しました')
             if previous is None:
-                controller.acknowledge_startup(saved['startupResponseSha256'])
+                controller.acknowledge_startup(saved['startupResponseSha256'], deadline=deadline)
             worker = OfflineProcess(controller.bundle, controller.diagnostics / ('worker-' + operation_id),
                                     native=controller.native, verify=verify, controller=controller,
                                     process_adapter=self.runtime.process_adapter)
@@ -389,14 +470,16 @@ class _OfflineOpen:
                 require(current.get('worker') == worker_record and current.get('history', []) == history
                         and history == [record for _, record in self.history.get(token['instanceId'], [])],
                         'STALE_OPERATION', '元Wの予約又は操作履歴が変更されました')
-                if previous is not None:
-                    require(time.monotonic() < deadline, 'STOP_TIMEOUT', '次Wの正本照合中に期限を超過しました')
                 completed_record = dict(worker_record, startupResponseSha256=digest(canonical(prepared)))
                 current['worker'] = completed_record
+                recorded_response = json.dumps(current)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W起動結果の更新前に期限を超過しました')
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?',
-                                   (json.dumps(current),opened['operationId']))
+                                   (recorded_response,opened['operationId']))
             worker_record = completed_record
-            worker.acknowledge_startup(worker_record['startupResponseSha256'])
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W起動結果の記録後に期限を超過しました')
+            worker.acknowledge_startup(worker_record['startupResponseSha256'], deadline=deadline)
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W起動ACK後に期限を超過しました')
             return prepared
 
     def _game_observation(self, connection, row, gate, proof, deadline):
@@ -434,7 +517,8 @@ class _OfflineOpen:
                 and response['candidateStateSha256'] == slot['candidate']['stateSha256']
                 and canonical(observed['ready']) == canonical({key:response[key] for key in ('worldUuid','runUuid','stateSha256','stateRevision')}),
                 'PROOF_MISMATCH', '独立明示Readyが同stopの正常退出応答と一致しません')
-        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready供給の最終照合後に期限を超過しました')
+        if deadline is not None:
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready供給の最終照合後に期限を超過しました')
         return slot
 
     def _game_ready(self, connection, row, gate, proof, ready, deadline):
@@ -443,7 +527,8 @@ class _OfflineOpen:
         if slot is not None:
             require(canonical(ready) == canonical(json.loads(slot['result'])['ready']),
                     'PROOF_MISMATCH', '独立明示Readyが同stopの正常退出応答と一致しません')
-            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready供給の最終照合後に期限を超過しました')
+            if deadline is not None:
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready供給の最終照合後に期限を超過しました')
 
     def release_game_handles(self, token, *, operation_id, stop_operation_id, deadline):
         """確定stopの元M/観測Cを一度だけ解放する。部分失敗も元objectとPENDING予約を保全する。"""
@@ -610,18 +695,21 @@ class _OfflineOpen:
                 connection.execute("INSERT INTO audit(at,operation,command) VALUES (?,?,'offline-open')",
                                    (self.registry.clock(),operation_id))
 
-            def verify():
+            def verify_binding():
                 with self.runtime._transaction(row['id'], read_only=True) as connection:
                     previous = self._reserved(connection,token,operation_id,fingerprint,expected)
-                    self._game_ready(connection, row, gate, proof, ready, deadline)
+                    self._game_ready(connection, row, gate, proof, ready, None)
                 require(self.runtime.process_adapter.identity(previous['identity']['pid']) is None,
                         'PROCESS_MISMATCH', '旧MのPIDが存在します。結果不明を保全します')
+
+            def verify():
+                verify_binding()
                 if 'gameExit' in proof:
                     require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready取得のPID照会後に期限を超過しました')
 
             diagnostics = self.runtime._paths(row['id']) / 'diagnostics' / ('offline-' + operation_id)
             controller = OfflineProcess(bundle,diagnostics,native=self.runtime.managed.transport.native,
-                                        verify=verify,process_adapter=self.runtime.process_adapter)
+                                        verify=verify_binding,process_adapter=self.runtime.process_adapter)
             self.controllers[row['id']] = controller
             frame = {'operationId':operation_id,'requestHash':fingerprint,'leaseId':row['lease'],'epoch':row['epoch'],
                      'generation':row['generation'],'drainSha256':digest(canonical(expected)),

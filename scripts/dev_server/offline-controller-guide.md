@@ -1,6 +1,6 @@
 # 停止中controller Cの固定入口
 
-.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）、第18スライス先行部分（保存原文と保持元Mの結束）、第19スライス先行部分（不変候補原本の入力結束）、第20スライス先行部分（同stopから観測Cへの単発接続）、第21スライス先行部分（観測済みgame退出証拠とstop確定の結束）、第22スライス先行部分（P内部の同stop専用候補入力と観測開始）、第23スライス先行部分（確定game退出と独立Readyから次C取得）、第24スライス先行部分（確定stopに束縛した元M/C単発handle解放）、第25スライス先行部分（公共stopの自己予約確定から正常解放）、第26スライス先行部分（直接stopと公共合流の待機予約終端）、第27スライス（直接stopの正常解放と合流応答）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
+.github #64の第1・第2スライス（Cのowner/Assigned）、第3スライス先行部分（Wのprivate入口）、第4スライス先行部分（P内部起動部品）、第5スライス先行部分（Registry正本予約とC取得）、第6スライス先行部分（正本予約からW待機）、第7スライス先行部分（正本PREPAREDからC Assigned）、第8スライス先行部分（Assignedから候補packet）、第9スライス先行部分（W/全child終了観測）、第10スライス先行部分（C本人complete入口）、第11スライス先行部分（P終了証拠からC確定/正本記録）、第12スライス先行部分（記録済みIdleから次W待機）、第13スライス先行部分（同Cの操作別保持と連続編集）、第14スライス先行部分（game候補のData退出入口）、第15スライス先行部分（P内部の単発観測C接続）、第16スライス先行部分（認証済保存原文とstop正本の接続）、第17スライス先行部分（認証済Mの生成handle保持）、第18スライス先行部分（保存原文と保持元Mの結束）、第19スライス先行部分（不変候補原本の入力結束）、第20スライス先行部分（同stopから観測Cへの単発接続）、第21スライス先行部分（観測済みgame退出証拠とstop確定の結束）、第22スライス先行部分（P内部の同stop専用候補入力と観測開始）、第23スライス先行部分（確定game退出と独立Readyから次C取得）、第24スライス先行部分（確定stopに束縛した元M/C単発handle解放）、第25スライス先行部分（公共stopの自己予約確定から正常解放）、第26スライス先行部分（直接stopと公共合流の待機予約終端）、第27スライス（直接stopの正常解放と合流応答）、第28スライス先行部分（最新IdleからC本人closeの要求・応答記録）を扱います。停止中writerの公開受付は有効化していません。現在のwriter-ioはRunning限定です。
 
 ## 責務と固定配布
 
@@ -280,7 +280,7 @@ P内部の明示候補供給と観測開始の順序付けは第22節を参照�
 
 元stopにgameExitが記録された取得では、確定済みCOMPLETED stop・保存proof・閉門/全writer台帳に加え、Pが保持した元run/stopの終端binding、認証済保存原文、C要求/応答/生成record/resultのhash参照を照合します。独立Readyと観測応答の4欄を型も含めて一致させ、C本人が既存Data APIで実Readyを再照合してOfflineIdleへ進みます。初回、予約と同transaction、起動中、結果更新前に原本を照合し、予約直前・結果更新直前・記録後返却前まで次openのdeadlineを適用します。 固定bundle command生成・P本人照会・journal・stderr設定を終えた後、OwnedProcess.start直前にも元verifyを呼び、準備中の期限超過をOS生成前に拒否します。
 
-拒否時は元stop・原本・保持M/Cを保全します。次C生成後の失敗では次openのPENDING予約と同Cを保持し、追加作用と同open再入口を拒否します。明示値を供給する呼出元の内部契約に限定し、Manager/CLI公開受付は後続で扱います。元M/Cの正常handle解放の内部入口は第24節を参照してください。公共stopの自動解放は第25節を参照してください。直接stop/合流の自動解放と応答接続は第27節を参照してください。C本人closeとRegistry CLOSED、Ready/CLOSED start gateは後続です。実OS/native受入は未確認です。
+拒否時は元stop・原本・保持M/Cを保全します。次C生成後の失敗では次openのPENDING予約と同Cを保持し、追加作用と同open再入口を拒否します。明示値を供給する呼出元の内部契約に限定し、Manager/CLI公開受付は後続で扱います。元M/Cの正常handle解放の内部入口は第24節を参照してください。公共stopの自動解放は第25節を参照してください。直接stop/合流の自動解放と応答接続は第27節を参照してください。C本人closeの内部接続は第28節を参照してください。C実終了後のRegistry CLOSEDとReady/CLOSED start gateは後続です。実OS/native受入は未確認です。
 
 選択→公共stop→候補供給→観測C→stop最終確定→active解放→独立明示Ready→次C OPENは、同じ実Registry transactionの結合fixtureで検査します。元供給期限を過ぎた次openでも独立した新期限内なら取得し、game_exit_inputの原文を元run/stopの終端保持へ残します。
 
@@ -322,8 +322,22 @@ game退出の確定証拠がある直接stopも、停止結果へP内部のgameH
 
 再提示は第25節と同じく、同run/stopの確定済み解放正本だけを照合する。解放未開始/PENDING/不明は拒否し、自動再close・再attach・C再生成・kill・rollbackは行わない。期限切れleaseの同stop完了/再提示を維持し、次offline取得のlease条件は緩めない。元M/Cや親pipeを解放したことからReadyやwriter CLOSEDを推測せず、次OPENには独立明示Readyを供給する。
 
-部分失敗/応答不明の正規recover、C本人close/Registry CLOSED、Ready+CLOSED start gate、Manager/CLI公開候補供給元、実OS/native/root/Mod受入は後続である。
+部分失敗/応答不明の正規recover、第28節のclose応答後のC実終了/Registry CLOSED、Ready+CLOSED start gate、Manager/CLI公開候補供給元、実OS/native/root/Mod受入は後続である。
 
 第27スライスの解放結果照合は、元M/CのRELEASED進捗と同stopへ束縛したRegistryのCOMPLETED結果を正本にする。DB確定後のメモリ完了公開前でも同じ結果を読み戻し、closeを再実行しない。
 
 現行の直接stopはSTOP_BLOCK受信時に独自のstopOperationIdを生成する。停止前にIDを固定するselect_game_exit/supply_game_exitとは一致しないため、合流受付後に選択済み候補の供給期限でstop_deadlineを短縮する経路は未接続である。選択済み公共stopの供給期限の伝播と、直接stop合流の受付時min期限を区別する。将来この内部入力を直接stopへ接続する際は、合流待機・結果照合・返却にも短縮後期限を伝播して検証する。
+
+## 第28スライス先行部分 最新IdleからC本人close
+
+P内部の`RuntimeControl._offline_close_owner(token, operation_id=..., deadline=...)`が元Cのcloseを一度開始する。既存offline-open正本予約、管理binding、受付遮断、全writer、操作履歴を再照合し、最後のWの正常終了・complete結果記録とACKから最新Idleを選ぶ。OPEN直後のW未受理sessionでは、記録済みOPEN応答を使う。非空の型付き編集要求は元操作の原文として保持する。
+
+元offline-open操作へ`ownerClose`意図を同transactionで固定し、次のW/編集受付を遮断する。同じclose操作IDの検証が正本の意図と最新Idleを照合しながら、同pipeで既存Java close入口へ期待state hash/revisionを送る。C本人の`WorldOfflineWriterSession.close`がDataのcurrent/OfflineIdle・owner・management/generation・DBclose/sealを検証する。
+
+PはOWNER_CLOSED応答のoperation/hash/session/nonce、同run、revision+1を照合し、元Cに要求・応答bytesと生成記録を保持して正本へ応答hashを記録する。応答直後の正常exitは保持した元handleと生成snapshotで照合する。全体deadlineを応答後・最終正本照合後・結果更新前・記録後まで検査する。拒否や失敗時は元意図・原文・C/W・予約を保持する。
+
+この段階の正常応答後もoffline-openはPENDING、instance.pending=1、artifact予約を保持する。Cの実exit0/全child不在の観測とRegistry writer CLOSED・予約解放は次段階に接続する。close後の返答不明は正規recoverで扱う。Ready期待値は独立明示入力として次openへ供給する。Ready+CLOSED start gate、#54復旧、公開呼出元、実OS/native/root/Mod受入も後続で扱う。
+
+Cが保持するcallbackは元予約・確定stop/Ready原本・lease/本人bindingの継続照合を担います。openの期限は取得操作に適用し、以後のcloseには今回の期限を用います。取得時の期限経過後も、同じCと最新Idleを照合してcloseできます。closeへ渡す期限は起動応答ACKと最終結果記録まで検査します。
+
+prepareも今回のdeadlineをC/W起動ACKへ渡します。Wを含むOS生成直前、ACKの本人照合後・記録前と記録後、最終結果のJSON直列化後・正本更新前、commit後、ACKから返却する直前に期限を検査します。期限超過時はPREPAREDを返さず、確定済み原文・予約・ACK進捗を保持します。Wが保持するbinding照合も準備期限をsession寿命として捕捉せず、後続操作にはその操作の期限を用います。

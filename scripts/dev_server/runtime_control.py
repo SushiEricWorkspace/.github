@@ -72,6 +72,11 @@ class RuntimeControl:
         return self._offline.release_game_handles(token, operation_id=operation_id,
                                                  stop_operation_id=stop_operation_id, deadline=deadline)
 
+    def _offline_close_owner(self, token, *, operation_id, deadline):
+        """最新IdleのC本人close応答を元予約へ記録する。実終了の確定は呼出元が続ける。"""
+        require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
+        return self._offline.close_owner(token, operation_id=operation_id, deadline=deadline)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")

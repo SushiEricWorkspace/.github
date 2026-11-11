@@ -50,6 +50,8 @@ class OfflineProcess:
         self.completion_request = self.completion_response = None
         self.game_exit_started = False
         self.game_exit_response = self.game_exit_result = None
+        self.close_started = self.close_ready = False
+        self.close_request = self.close_response = None
         self.operation_history = {}
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
@@ -301,7 +303,7 @@ class OfflineProcess:
         self.pipe.acknowledged()
         self.assignment_acknowledged = True
 
-    def acknowledge_startup(self, response_sha256):
+    def acknowledge_startup(self, response_sha256, *, deadline=None):
         """呼出元が正本へ記録した起動応答hashを照合し、同pipeのbufferを一度だけ解放する。
 
         失敗時は次frameへ進めず、再送・writer終了扱いもしない。
@@ -309,8 +311,12 @@ class OfflineProcess:
         require(self.ready and not self.startup_acknowledged and digest(self.response) == response_sha256,
                 'STALE_OPERATION', '記録済み起動応答が一致しません')
         self.verify()
+        if deadline is not None:
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '起動応答ACK前に操作期限を超過しました')
         self.record['startupAcknowledgedSha256'] = response_sha256
         self._record()
+        if deadline is not None:
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '起動応答ACKの記録後に操作期限を超過しました')
         self.pipe.acknowledged()
         self.startup_acknowledged = True
 
@@ -365,7 +371,7 @@ class OfflineProcess:
         with (self.diagnostics / 'stderr.log').open('xb') as log:
             make_private(self.diagnostics / 'stderr.log')
             name = 'offline-' + role + '-' + uuid.uuid4().hex
-            if command == 'open':
+            if command in ('open', 'prepare'):
                 verify()
             self.process.start(arguments, self.bundle, log, name, created,
                                input_fd=self.pipe.child_input, output_fd=self.pipe.child_output)
@@ -386,7 +392,11 @@ class OfflineProcess:
     def start(self, frame, deadline):
         """C OPEN又はW PREPAREDを一度照合する。型付き要求本文は変更しない。"""
         require(not self.game_exit_started, 'WRITER_PENDING', '元game退出観測を保全します')
-        request = self._launch(frame, 'open' if self.controller is None else 'prepare', self.verify_owner)
+        def launching():
+            self.verify_owner()
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'helper生成前に操作期限を超過しました')
+
+        request = self._launch(frame, 'open' if self.controller is None else 'prepare', launching)
         self.pipe.send(request, deadline, self.verify)
         response = self.pipe.receive(deadline, self.verify)
         self.response = canonical(response)
@@ -405,9 +415,97 @@ class OfflineProcess:
                 ('stateSha256', 'expectedStateSha256'), ('stateRevision', 'expectedRevision'), ('runUuid', 'runUuid'))),
                 'API_PROTOCOL', 'PREPAREDが元Idleと一致しません')
         self.verify()
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'helper起動応答の照合後に操作期限を超過しました')
         self.record['startupResponseSha256'] = digest(self.response)
         self._record()
         self.ready = True
+        return deepcopy(response)
+
+    def _observe_process(self, process, expected_identity, expected_data):
+        def normal_exit(process):
+            code = process.poll()
+            require(type(code) is int and code == 0,
+                    'WRITER_PENDING', '本人不在の元handleに正常終了証拠がありません')
+            return code
+
+        code = process.poll()
+        require(code is None or type(code) is int and code == 0,
+                'WRITER_PENDING', '元processの非正常終了を保全します')
+        if code is not None:
+            return code
+        actual = self.adapter.identity(process.pid)
+        if actual is None:
+            return normal_exit(process)
+        runtime_process.require_identity(expected_identity, actual)
+        try:
+            observed_data = process_identity(self.native, self.adapter, process.pid)
+        except RegistryError as error:
+            if error.code != 'PROCESS_MISMATCH':
+                raise
+            return normal_exit(process)
+        require(observed_data == expected_data,
+                'PROCESS_MISMATCH', '生存照会の元process本人が一致しません')
+        members = process.members()
+        require(type(members) is list, 'PROCESS_MISMATCH', '所有groupの観測が不明です')
+        if process.pid not in members:
+            return normal_exit(process)
+        return None
+
+    def close_owner(self, latest, *, operation_id, request_hash, deadline, verify):
+        """照合済み最新Idleの元Cへcloseを一度送り、対応するData応答を保持する。"""
+        require(self.controller is None and self.ready and not self.close_started and not self.game_exit_started,
+                'WRITER_PENDING', '保持した元Cのclose入口が必要です')
+        self.close_started = True
+        verify()
+        self.verify()
+        held = self.completion_response if self.completion_ready else self.response
+        require(held is not None and canonical(latest) == held,
+                'STALE_OPERATION', '元Cの最新Idle応答が一致しません')
+        identity, data = deepcopy(self.identity), deepcopy(self.data_identity)
+        creation = deepcopy(self.record['creation'])
+        parent, parent_data = deepcopy(self.parent), deepcopy(self.parent_data)
+        group = self.process.group
+        frame = {'command':'close', 'operationId':operation_id, 'requestHash':request_hash,
+                 'sessionId':self.session, 'nonce':self.nonce,
+                 'openOperationId':json.loads(self.request)['operationId'],
+                 'expectedStateSha256':latest['stateSha256'], 'expectedRevision':latest['stateRevision']}
+
+        def checked():
+            verify()
+            self.verify_owner()
+            runtime_process.require_identity(parent, self.adapter.identity(os.getpid()))
+            actual_parent = process_identity(self.native, self.adapter, os.getpid())
+            self._observe_process(self.process, identity, data)
+            require(self.parent == parent and actual_parent == parent_data and self.parent_data == parent_data
+                    and self.identity == identity and self.data_identity == data
+                    and self.record['identity'] == identity and self.record['controlIdentity'] == data
+                    and self.record['creation'] == creation
+                    and self.process.pid == identity['pid'] == data['pid'] == creation['pid']
+                    and self.process.group == group == creation['ownerGroup'],
+                    'PROCESS_MISMATCH', 'close中の元P/C生成bindingが一致しません')
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C closeの本人照合後に期限を超過しました')
+
+        checked()
+        self.close_request = canonical(frame)
+        self.record['ownerCloseRequestSha256'] = digest(self.close_request)
+        self._record()
+        checked()
+        self.pipe.send(frame, deadline, checked)
+        response = self.pipe.receive(deadline, checked)
+        self.close_response = canonical(response)
+        require(response.keys() == {'status','operationId','requestHash','sessionId','nonce',
+                                    'stateSha256','stateRevision','runUuid'}
+                and response['status'] == 'OWNER_CLOSED'
+                and all(response[k] == frame[k] for k in ('operationId','requestHash','sessionId','nonce'))
+                and response['runUuid'] == latest['runUuid']
+                and type(response['stateRevision']) is int and response['stateRevision'] == latest['stateRevision'] + 1,
+                'API_PROTOCOL', '元C closeの対応Ready応答が一致しません')
+        _hash(response['stateSha256'])
+        checked()
+        self.record['ownerCloseResponseSha256'] = digest(self.close_response)
+        self._record()
+        checked()
+        self.close_ready = True
         return deepcopy(response)
 
     def observe_game_exit(self, frame, *, game_process, game_identity, game_group, deadline):
@@ -445,40 +543,10 @@ class OfflineProcess:
                     'PROCESS_MISMATCH', '元Mの保持handle/groupが一致しません')
             require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'game退出観測の期限を超過しました')
 
-        def normal_exit(process):
-            code = process.poll()
-            require(type(code) is int and code == 0,
-                    'WRITER_PENDING', '本人不在の元handleに正常終了証拠がありません')
-            return code
-
-        def observe_process(process, expected_identity, expected_data):
-            code = process.poll()
-            require(code is None or type(code) is int and code == 0,
-                    'WRITER_PENDING', '元processの非正常終了を保全します')
-            if code is not None:
-                return code
-            actual = self.adapter.identity(process.pid)
-            if actual is None:
-                return normal_exit(process)
-            runtime_process.require_identity(expected_identity, actual)
-            try:
-                observed_data = process_identity(self.native, self.adapter, process.pid)
-            except RegistryError as error:
-                if error.code != 'PROCESS_MISMATCH':
-                    raise
-                return normal_exit(process)
-            require(observed_data == expected_data,
-                    'PROCESS_MISMATCH', '生存照会の元process本人が一致しません')
-            members = process.members()
-            require(type(members) is list, 'PROCESS_MISMATCH', '所有groupの観測が不明です')
-            if process.pid not in members:
-                return normal_exit(process)
-            return None
-
         def exited(process, expected_identity, expected_data):
             while True:
                 checked()
-                code = observe_process(process, expected_identity, expected_data)
+                code = self._observe_process(process, expected_identity, expected_data)
                 members = process.members()
                 checked()
                 if type(code) is int and code == 0 and members == []:
@@ -491,7 +559,7 @@ class OfflineProcess:
 
         def observing():
             checked()
-            observe_process(self.process, identity, request['owner'])
+            self._observe_process(self.process, identity, request['owner'])
             checked()
             require(self.process.pid == identity['pid'] == self.data_identity['pid']
                     and self.identity == identity and self.record['identity'] == identity
