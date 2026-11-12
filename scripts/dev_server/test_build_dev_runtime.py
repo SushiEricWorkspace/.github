@@ -125,7 +125,7 @@ class BuildDevRuntimeTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             build_dev_runtime.recorded_exporter(repos[".github"], source_lock)
 
-    def main_fixture(self, extras=(), failure=None, *, managed=False, stage=None):
+    def main_fixture(self, extras=("SushiEricCombatCore",), failure=None, *, managed=False, stage=None):
         task = self.root / "worktrees/task-41"
         data_model = task / "SushiEricDataModel"
         mod = task / "SushiEricServerMod"
@@ -224,6 +224,8 @@ class BuildDevRuntimeTests(unittest.TestCase):
         else:
             exporter_run.assert_not_called()
         self.assertEqual(mod, export_call.args[0])
+        self.assertIn("-PdataModelReleaseVersion=", export_call.args)
+        self.assertIn("-PcombatCoreReleaseVersion=", export_call.args)
         self.assertIn(f"-PruntimeExporter={exporter.resolve()}", export_call.args)
         self.assertIn("runGameTest", export_call.args)
         self.assertIn("runServer", export_call.args)
@@ -252,6 +254,11 @@ class BuildDevRuntimeTests(unittest.TestCase):
 
     def test_main_passes_recorded_task_exporter_to_gradle(self):
         self.main_fixture()
+
+    def test_unregistered_core_is_rejected_before_publication(self):
+        with self.assertRaisesRegex(ContractError, "SushiEricCombatCoreの登録"):
+            self.main_fixture(extras=(), failure=AssertionError("Gradleへ到達しました"))
+        self.assertFalse((self.root / "worktrees/task-41/maven").exists())
 
     def test_managed_profile_uses_describe_then_official_exporter_without_old_receipt(self):
         self.main_fixture(managed=True)

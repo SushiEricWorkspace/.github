@@ -150,9 +150,11 @@ class TaskMaven:
         for item in record["publications"]:
             validate_relative_path(item["path"])
             path = maven / item["path"]
-            host_module = "io.github.sushiericworkspace:sushieric-datamodel-host-adapter-dev:"
+            host_module = "io.github.sushiericworkspace:" + item["coordinate"].split(":")[1] + ":"
             host_zip = item["coordinate"].startswith(host_module) and path.name == (
-                "sushieric-datamodel-host-adapter-dev-" + item["coordinate"][len(host_module):] + "-runtime.zip")
+                item["coordinate"].split(":")[1] + "-" + item["coordinate"][len(host_module):] + "-runtime.zip")
+            host_zip = host_zip and item["coordinate"].split(":")[1] in (
+                "sushieric-datamodel-host-adapter", "sushieric-datamodel-host-adapter-dev")
             _require((path.suffix in (".jar", ".pom") or host_zip) and digest(regular_bytes(path)) == item["sha256"],
                      "maven: 発行POM/JAR/Host ZIPが一致しません")
             expected.append((item["coordinate"], path.name, item["sha256"]))

@@ -457,16 +457,30 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path, *, managed_pr
     """
     recipe = json.loads(regular_bytes(recipe_path))
     lock = json.loads(regular_bytes(source_lock_path))
-    _require(type(recipe.get("recipeVersion")) is int and recipe["recipeVersion"] == 2
+    _require(type(recipe.get("recipeVersion")) is int and recipe["recipeVersion"] in (2, 3)
              and recipe["development"] is True and "dataModelCoordinate" in recipe
              and "commonCoordinate" not in recipe, "recipe: 未知の起動レシピです")
     _require(recipe["javaVersion"].startswith("21."), "jdk: JDK 21が必要です")
     verify_sources(lock)
+    release = recipe["recipeVersion"] == 3
+    _require((lock["sourceLockVersion"] == 2) == release, "recipe: 入力lockとrecipeの版が一致しません")
+    if release:
+        _require(all(recipe.get(key) == lock[key] for key in
+                     ("librarySelection", "publicationEvidence", "publications")),
+                 "recipe: 正式版の監査入力が一致しません")
+        _require(recipe["dataModelCoordinate"] == lock["librarySelection"]["dataModelCoordinate"],
+                 "recipe: 正式DataModelの選択が一致しません")
+    else:
+        _require(":sushieric-datamodel-mod-dev:" in recipe["dataModelCoordinate"],
+                 "recipe: 正式版には監査済みrecipe v3が必要です")
     data_model = [item for item in recipe["artifacts"] if item["coordinate"] == recipe["dataModelCoordinate"]]
     _require(len(data_model) == 1, "recipe: DataModelの解決済みJARが一意ではありません")
     data_model_jar = Path(data_model[0]["path"])
     dependency_paths = {entry["path"] for entry in recipe.get("dependencyInputs", [])}
-    _require({str(data_model_jar), str(data_model_jar.with_suffix(".pom"))} <= dependency_paths,
+    model_pom = (Path(next(item["path"] for item in lock["publications"] if
+                     item["coordinate"] == recipe["dataModelCoordinate"] and item["extension"] == "pom"))
+                 if release else data_model_jar.with_suffix(".pom"))
+    _require({str(data_model_jar), str(model_pom)} <= dependency_paths,
              "recipe: DataModelのJAR/POMのコンパイル前lockが必要です")
     store = store.absolute()
     _directory(store)
@@ -479,6 +493,17 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path, *, managed_pr
     for entry in recipe["dependencyInputs"]:
         _require(digest(freezer.read(Path(entry["path"]))) == entry["sha256"],
                  "dependency: コンパイル前から依存・ツールが変更されています")
+    if release:
+        locked_inputs = {entry["path"]: entry["sha256"] for entry in recipe["dependencyInputs"]}
+        _require(all(locked_inputs.get(entry["path"]) == entry["sha256"] for entry in
+                     lock["publications"] + lock["publicationEvidence"]), "dependency: 正式入力のcompile前lockが不足しています")
+        for name in ("dataModelCoordinate", "combatCoreCoordinate"):
+            coordinate = lock["librarySelection"][name]
+            jars = [entry for entry in recipe["artifacts"] if entry["coordinate"] == coordinate]
+            published = next(entry for entry in lock["publications"] if
+                             entry["coordinate"] == coordinate and entry["extension"] == "jar")
+            _require(len(jars) == 1 and digest(freezer.read(Path(jars[0]["path"]))) == published["sha256"],
+                     "dependency: 実解決JARと発行hashが一致しません")
     profiles = {name: freezer.profile(name, recipe["profiles"][name]) for name in ("server", "gameTest")}
     freezer.write("launch/profiles.json", canonical({"version": 1, "platform": platform.system(),
                                                    "machine": platform.machine(), "profiles": profiles}))
@@ -499,14 +524,23 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path, *, managed_pr
         dependencies.append({"coordinate": artifact["coordinate"], "file": freezer.copy(path)})
         # 公開したSushiEricDataModelのPOM/JARは双方必須。動的metadataでは代用しない。
         if artifact["coordinate"] == recipe["dataModelCoordinate"]:
-            pom = path.with_suffix(".pom")
+            pom = model_pom
             dependencies.append({"coordinate": artifact["coordinate"], "file": freezer.copy(pom)})
     freezer.write("inputs/dependencies.json", canonical(dependencies))
     publications = []
     for item in lock.get("publications", []):
         path = Path(item["path"])
         _require(digest(freezer.read(path)) == item["sha256"], "publication: 発行直後から変更されています")
-        publications.append({"coordinate": item["coordinate"], "sha256": item["sha256"], "file": freezer.copy(path)})
+        if release:
+            from .release_inputs import portable_publication
+            publication = portable_publication(item)
+            _require(publication["file"] == freezer.copy(path), "publication: 固定先が一致しません")
+            publications.append(publication)
+        else:
+            publications.append({"coordinate": item["coordinate"], "sha256": item["sha256"], "file": freezer.copy(path)})
+    if release:
+        for entry in lock["publicationEvidence"]:
+            freezer.copy(Path(entry["path"]))
     freezer.write("inputs/publications.json", canonical(publications))
     from .database_adapter import freeze_host_adapter
     freeze_host_adapter(freezer, lock, recipe["dataModelCoordinate"], data_model_jar)
@@ -564,6 +598,24 @@ def verify_bundle(root: Path) -> dict:
              "runtime: artifactIdまたはCOMPLETEが一致しません")
     observed = [entry for entry in _files(root) if entry["path"] not in {"runtime.json", "COMPLETE"}]
     _require(observed == manifest["files"], "runtime: ファイル集合・サイズ・hashが一致しません")
+    if manifest["schemaVersion"] == 2 and ":sushieric-datamodel:" in manifest["dataModelCoordinate"]:
+        from .release_inputs import verify_libraries
+        lock = json.loads(regular_bytes(root / "inputs/source-lock.json"))
+        verify_libraries(lock, root)
+        _require(lock["librarySelection"]["dataModelCoordinate"] == manifest["dataModelCoordinate"],
+                 "runtime: 正式版の選択GAVが一致しません")
+        _require(json.loads(regular_bytes(root / "inputs/publications.json")) == lock["publications"],
+                 "runtime: 正式版の発行監査が一致しません")
+        dependencies = json.loads(regular_bytes(root / "inputs/dependencies.json"))
+        for name in ("dataModelCoordinate", "combatCoreCoordinate"):
+            coordinate = lock["librarySelection"][name]
+            jars = [entry for entry in dependencies if entry["coordinate"] == coordinate and entry["file"].endswith(".jar")]
+            publication = next(entry for entry in lock["publications"] if
+                               entry["coordinate"] == coordinate and entry["extension"] == "jar")
+            _require(len(jars) == 1, "runtime: 正式ライブラリJARが一意ではありません")
+            validate_relative_path(jars[0]["file"])
+            _require(digest(regular_bytes(root / jars[0]["file"])) == publication["sha256"],
+                     "runtime: 解決JARと正式発行hashが一致しません")
     from .database_adapter import DESCRIPTOR, verify_host_adapter
     if (root / DESCRIPTOR).exists():
         verify_host_adapter(root)

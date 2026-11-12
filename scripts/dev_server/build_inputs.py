@@ -72,15 +72,24 @@ def capture_sources(repos: dict[str, Path]) -> dict:
 
 def verify_sources(lock: dict) -> None:
     """入力が現在と一致しないlockでは公開しない。再キャプチャして救済しない。"""
-    if lock.get("sourceLockVersion") != 1 or not lock.get("sources"):
+    if lock.get("sourceLockVersion") not in (1, 2) or not lock.get("sources"):
         raise ContractError("source: 未知または空の入力lockです")
     for source in lock["sources"]:
         if capture_source(Path(source["root"]), source["record"]["repo"]) != source:
             raise ContractError(f"source: {source['record']['repo']}がビルド開始時から変更されています")
+    if lock["sourceLockVersion"] == 2:
+        from .release_inputs import verify_libraries
+        verify_libraries(lock, online=True)
 
 
 def portable_lock(lock: dict) -> dict:
     """artifact側にはworktreeへの可変参照を保存しない。"""
-    return {"sourceLockVersion": 1, "sources": [
+    result = {"sourceLockVersion": lock["sourceLockVersion"], "sources": [
         {key: value for key, value in source.items() if key != "root"} for source in lock["sources"]
     ]}
+    if lock["sourceLockVersion"] == 2:
+        from .release_inputs import portable_publication
+        result.update(librarySelection=lock["librarySelection"],
+                      publicationEvidence=[portable_publication(entry) for entry in lock["publicationEvidence"]],
+                      publications=[portable_publication(entry) for entry in lock["publications"]])
+    return result
