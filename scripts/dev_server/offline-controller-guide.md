@@ -375,3 +375,15 @@ P内部の`runtime._offline_record_writer_closed(token, operation_id=元close操
 元offline-open応答のwriterClosedへ単発意図を先行記録し、元CへOFFLINE_WRITER_CLOSEDの原文と局所記録を保持します。最終transactionで対応するstate=CLOSEDと応答hashを記録した場合だけoffline writer CLOSEDが確定します。意図の存在や局所応答だけではCLOSEDと扱いません。既存writer_sessionsはRunning中のManagerのrun/nonce/PID登録であり、このoffline Cのprivate sessionとは混在させません。
 
 close時と呼出時の短い期限を、lock待機・各照合・局所記録・最終JSON/更新・commit後/返却へ適用します。失敗は原文・意図・元object/予約を保全し、再close・再観測・自動recoverしません。commit後の期限超過も既知CLOSED証拠を保持して正常返却を拒否します。今回は元offline-open PENDING/pending=1/artifact予約を維持するため、既存startはCLOSED確定後も拒否します。元予約の終端と終端後照合の分離、独立明示Ready+CLOSEDのstart gate、公開受付、#54/recoverと実OS/native受入は後続です。
+
+## 第33スライス先行部分 元offline-openと予約の終端
+
+P内部の`runtime._offline_finish_close(token, operation_id=元close操作ID, deadline=呼出期限)`は、記録済みwriterClosedのstate/hashと原文、元C/全Wの解放正本・全RELEASED/親pipe閉鎖、元binding・最新Idle/履歴・全ACK・元予約を再照合します。元offline-open応答へtermination意図を先行記録し、OFFLINE_SESSION_COMPLETED原文と局所記録を元Cへ保持します。最終instance transactionで元offline-openだけをCOMPLETED、元artifact予約を削除、instance.pendingを0にします。元stop/Ready/run・解放/CLOSED正本は維持します。
+
+終端時に元Cと履歴を含む全Wをactive枠から退避します。`_offline.retired[(instanceId, openOperationId)]`は元process/pipe/object・要求/対応応答bytes・履歴・生成bindingを保持します。終端後はPENDING前提の元callbackを変更・再実行せず、終端正本・元run/閉門/停止証拠と退避証拠を専用経路で照合します。終了済みC/Wの再観測・再解放・Data呼出しは行いません。
+
+履歴を含む全Wのcontroller参照が元Cと同一objectであることも、終端後の正常返却条件に含めます。snapshot比較・read transaction終了後に期限を再検査し、結果copy後も局所記録の開始直前に検査します。期限到達後は局所記録を開始せず、意図・原文・元objectを保持します。
+
+close時と呼出時の短い期限を意図・局所記録・最終直列化/SQL・transaction内の終端照合・commit後照合・返却まで引き継ぎます。最終SQL後の不一致やcommit失敗ではDBをrollbackし、退避済み元object・意図・局所結果は保持します。この場合active枠は復元せず、元pending/予約が後続取得を遮断します。commit後の期限切れ/不一致でも既知終端を巻き戻さず正常返却を拒否します。通常入口から再終端・再生成・自動recoverしません。
+
+予約解放だけで既存startが通らないよう、同世代のoffline終端正本を事前確認と最終予約transactionの双方で拒否します。新しいRuntimeControlでも永続正本を参照し、旧runのprofile承認を再利用して起動しません。独立明示Ready+CLOSEDを受理する肯定gate、公開呼出元の接続、#54復旧・正規recoverと実OS/native本人受入は後続です。

@@ -23,6 +23,7 @@ class _OfflineOpen:
         self.controllers = {}
         self.workers = {}
         self.history = {}
+        self.retired = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -706,6 +707,157 @@ class _OfflineOpen:
             closing = recorded
             returned = deepcopy(result)
             verify()
+            finished()
+            return returned
+
+    def _writer_closed(self, connection, token, controller, operation_id, deadline):
+        opened, saved, workers = self._workers_released(connection, token, controller, operation_id, deadline)
+        require(controller.writer_closed_response is not None, 'PROOF_REQUIRED', 'writer CLOSED原文が必要です')
+        result = dict(status='OFFLINE_WRITER_CLOSED', operationId=operation_id,
+            openOperationId=opened['operationId'], writerStatus='CLOSED',
+            ownerReleaseSha256=digest(controller.owner_release_response),
+            workerReleaseSha256=digest(controller.worker_release_response))
+        require(json.loads(controller.writer_closed_response) == result and controller.record.get('writerClosed') == result
+                and saved.get('writerClosed') == dict(operationId=operation_id,
+                    ownerReleaseSha256=result['ownerReleaseSha256'], workerReleaseSha256=result['workerReleaseSha256'],
+                    state='CLOSED', responseSha256=digest(controller.writer_closed_response)),
+                'PROOF_MISMATCH', 'writer CLOSEDの原文・局所記録・正本hashが一致しません')
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'writer CLOSED照合後に期限を超過しました')
+        return opened, saved, workers
+
+    @staticmethod
+    def _release_snapshot(controller, workers, history):
+        names = ('parent','parent_data','identity','data_identity','session','nonce','started','ready',
+            'startup_acknowledged','request','response','assignment_started','assignment_ready','assignment_acknowledged',
+            'assignment_request','assignment_response','admission_started','candidate_ready','admission_request',
+            'candidate_response','exit_started','exit_response','completion_started','completion_ready',
+            'completion_acknowledged','completion_request','completion_response','close_started','close_ready',
+            'close_request','close_response','owner_exit_started','owner_exit_response','owner_release',
+            'owner_release_response','worker_release','worker_release_response','writer_closed_response','operation_history')
+        return deepcopy(([(dict((name,getattr(actor,name)) for name in names),
+            {k:v for k,v in actor.record.items() if actor is not controller or k != 'termination'},
+            actor.process.pid, actor.process.group, actor.pipe.input, actor.pipe.output)
+            for actor in (controller,*workers)], [record for _,record in history]))
+
+    def _terminal(self, connection, token, slot, deadline):
+        controller, workers = slot['controller'], slot['workers']
+        require(self.retired.get(slot['key']) is slot and controller.close_binding is slot['closeBinding']
+                and all(worker.controller is controller for worker in workers)
+                and all(actor.process is process and actor.pipe is pipe and actor.creation_resources is resources
+                    for actor,process,pipe,resources in slot['resources'])
+                and self._release_snapshot(controller, workers, slot['history']) == slot['snapshot'],
+                'PROOF_MISMATCH', '退避した元C/全Wの資源object・解放原文・進捗が変更されました')
+        controller._verify_close_binding(deadline)
+        require(controller.termination_response == canonical(slot['result'])
+                and controller.record.get('termination') == slot['result'],
+                'PROOF_MISMATCH', '終端原文と局所記録が一致しません')
+        row, gate, run, proof, writers = self._state(connection, token, reserved=False)
+        self.runtime._binding(row, slot['row'])
+        expected = slot['saved']['binding']
+        require(gate['revision'] == expected['revision'] and gate['descriptor_hash'] == expected['descriptorSha256']
+                and digest(canonical(run)) == expected['runRecordSha256']
+                and digest(canonical(proof)) == expected['stopProofSha256'] and writers == expected['writers'],
+                'STALE_OPERATION', '終端後の元run・閉門・停止証拠が変更されました')
+        opened = slot['opened']
+        operation = connection.execute('SELECT * FROM runtime_operations WHERE id=?', (opened['operationId'],)).fetchone()
+        require(operation is not None and operation['instance'] == row['id'] and operation['command'] == 'offline-open'
+                and operation['fingerprint'] == opened['requestHash'] and operation['status'] == 'COMPLETED'
+                and operation['response'] == slot['encoded']
+                and not connection.execute('SELECT 1 FROM reservations WHERE instance=?', (row['id'],)).fetchone()
+                and not connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND status!='COMPLETED'",
+                                           (row['id'],)).fetchone(),
+                'STALE_OPERATION', '元offline-open終端正本と予約解放が一致しません')
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端正本の照合後に期限を超過しました')
+
+    def finish_close(self, token, *, operation_id, deadline):
+        """CLOSED正本から元offline-openと予約を一度だけ終端し、元object・原文を退避保持する。
+
+        close時と呼出時の短い期限を返却まで適用する。終端後はPENDING前提の元callbackを
+        呼ばず専用照合を行う。失敗時の意図・既知結果・退避先は保持し、自動再試行しない。
+        """
+        fields(token, TOKEN)
+        identifier(operation_id, 'operationId')
+        token = deepcopy(token)
+        instance = token['instanceId']
+        controller = self.controllers.get(instance)
+        require(controller is not None and controller.close_binding is not None,
+                'WRITER_PENDING', '元Cとclose時固定bindingが必要です')
+        deadline = min(deadline, controller.close_binding['deadline'])
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(instance) as connection:
+                opened, saved, workers = self._writer_closed(connection, token, controller, operation_id, deadline)
+                key = instance, opened['operationId']
+                require(key not in self.retired and 'termination' not in saved and controller.termination_response is None,
+                        'WRITER_PENDING', '元終端意図と退避証拠を保全します')
+                row = dict(self.registry._instance(connection, instance))
+                history = self.history.get(instance, [])
+                slot = dict(key=key, controller=controller, workers=tuple(workers), history=history,
+                    latest=self.workers.get(instance), opened=opened, saved=deepcopy(saved), row=row,
+                    closeBinding=controller.close_binding,
+                    resources=[(actor,actor.process,actor.pipe,actor.creation_resources) for actor in (controller,*workers)],
+                    snapshot=self._release_snapshot(controller, workers, history))
+                ending = dict(operationId=operation_id, generationId=row['generation'], runId=row['run_id'],
+                    writerClosedSha256=digest(controller.writer_closed_response))
+                saved['termination'] = ending
+                encoded = json.dumps(saved)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端意図の更新前に期限を超過しました')
+                self.retired[key] = slot
+                connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
+
+            def checked(connection):
+                _, current, held = self._writer_closed(connection, token, controller, operation_id, deadline)
+                require(current.get('termination') == ending and self.retired.get(key) is slot
+                        and self.controllers.get(instance) is controller and self.workers.get(instance) is slot['latest']
+                        and self.history.get(instance, []) == history and len(held) == len(workers)
+                        and all(a is b for a,b in zip(held,workers))
+                        and controller.close_binding is slot['closeBinding']
+                        and all(actor.process is process and actor.pipe is pipe and actor.creation_resources is resources
+                            for actor,process,pipe,resources in slot['resources'])
+                        and self._release_snapshot(controller, workers, history) == slot['snapshot'],
+                        'STALE_OPERATION', '終端意図と元C/全Wの保持証拠が変更されました')
+                return current
+
+            def verify():
+                controller.verify_owner()
+                with self.runtime._transaction(instance, read_only=True) as connection:
+                    checked(connection)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端意図の照合後に期限を超過しました')
+
+            result = dict(status='OFFLINE_SESSION_COMPLETED', operationId=operation_id,
+                openOperationId=opened['operationId'], instanceId=instance,
+                generationId=row['generation'], runId=row['run_id'], writerClosedSha256=ending['writerClosedSha256'])
+            slot['result'] = result
+            controller.termination_response = canonical(result)
+            verify()
+            controller.record['termination'] = deepcopy(result)
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端局所記録の開始前に期限を超過しました')
+            controller._record()
+            verify()
+
+            def finished():
+                require(controller.termination_response == canonical(result) and controller.record.get('termination') == result,
+                        'PROOF_MISMATCH', '終端結果の原文と局所記録が一致しません')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端結果の照合後に期限を超過しました')
+
+            with self.runtime._transaction(instance) as connection:
+                current = checked(connection)
+                finished()
+                current['termination'] = dict(ending, state='COMPLETED', responseSha256=digest(controller.termination_response))
+                encoded = json.dumps(current)
+                checked(connection)
+                finished()
+                slot['encoded'] = encoded
+                connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?",
+                                   (encoded, opened['operationId']))
+                connection.execute('DELETE FROM reservations WHERE operation=?', (opened['operationId'],))
+                connection.execute('UPDATE instances SET pending=0 WHERE id=?', (instance,))
+                self.workers.pop(instance, None)
+                self.history.pop(instance, None)
+                self.controllers.pop(instance)
+                self._terminal(connection, token, slot, deadline)
+            returned = deepcopy(result)
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                self._terminal(connection, token, slot, deadline)
             finished()
             return returned
 
