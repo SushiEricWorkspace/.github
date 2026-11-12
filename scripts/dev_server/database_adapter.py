@@ -17,6 +17,10 @@ HOST_MODULE = "io.github.sushiericworkspace:sushieric-datamodel-host-adapter-dev
 DESCRIPTOR = "adapter/host.json"
 
 
+def host_module(data_model_coordinate):
+    return HOST_MODULE if data_model_coordinate.split(":")[1].endswith("-dev") else HOST_MODULE.removesuffix("-dev")
+
+
 def _require(condition, message):
     if not condition:
         raise ContractError("adapter: " + message)
@@ -81,12 +85,13 @@ def _pom(data, coordinate):
 def freeze_host_adapter(freezer, lock, data_model_coordinate, data_model_jar):
     """同じDataModel発行のZIP/POMと全展開byteを固定する。"""
     version = data_model_coordinate.split(":")[2]
-    coordinate = HOST_MODULE + ":" + version
+    module_coordinate = host_module(data_model_coordinate)
+    coordinate = module_coordinate + ":" + version
     publications = [item for item in lock.get("publications", []) if
-                    item["coordinate"].startswith(HOST_MODULE + ":")]
+                    item["coordinate"].startswith(module_coordinate + ":")]
     _require(len(publications) == 2 and all(item["coordinate"] == coordinate for item in publications),
              "同じDataModel版のHost ZIP/POM発行lockが必要です")
-    module = HOST_MODULE.split(":")[1]
+    module = module_coordinate.split(":")[1]
     expected = {f"{module}-{version}-runtime.zip", f"{module}-{version}.pom"}
     _require({Path(item["path"]).name for item in publications} == expected,
              "Host ZIP/POMの実体が一致しません")
@@ -126,11 +131,21 @@ def verify_host_adapter(root):
              descriptor["mainClass"] == HOST_MAIN, "未知のentrypointです")
     runtime = json.loads(regular_bytes(root / "runtime.json"))
     _require(descriptor["dataModelCoordinate"] == runtime["dataModelCoordinate"], "DataModel座標が異なります")
-    _require(descriptor["coordinate"] == HOST_MODULE + ":" + runtime["dataModelCoordinate"].split(":")[2],
+    _require(descriptor["coordinate"] == host_module(runtime["dataModelCoordinate"]) + ":" + runtime["dataModelCoordinate"].split(":")[2],
              "Host座標が異なります")
     for name in ("archive", "pom", "dataModelJar"):
         _require(type(descriptor[name]) is str, "配布pathが不正です")
         validate_relative_path(descriptor[name])
+    if host_module(runtime["dataModelCoordinate"]) != HOST_MODULE:
+        lock = json.loads(regular_bytes(root / "inputs/source-lock.json"))
+        _require(lock["librarySelection"]["hostAdapterCoordinate"] == descriptor["coordinate"],
+                 "監査済みHost座標と一致しません")
+        for field, extension in (("archive", "zip"), ("pom", "pom")):
+            publications = [item for item in lock["publications"] if
+                            item["coordinate"] == descriptor["coordinate"] and item["extension"] == extension]
+            _require(len(publications) == 1 and descriptor[field] == publications[0]["file"]
+                     and digest(regular_bytes(root / descriptor[field])) == publications[0]["sha256"],
+                     "実使用Hostと監査済みZIP/POMが一致しません")
     _pom(regular_bytes(root / descriptor["pom"]), descriptor["coordinate"])
     entries = _archive(regular_bytes(root / descriptor["archive"]))
     expected = [{"path": "adapter/host/" + name, "kind": "regular", "size": len(data), "sha256": digest(data)}

@@ -89,7 +89,7 @@ def save_prepared(store: Path, build_id: str, state: dict) -> Path:
     files = [(Path(state["sourceLock"]), directory / "source-lock.json", state["sourceLockSha256"]),
              (Path(state["recipe"]), directory / "recipe.json", state["recipeSha256"])]
     files.extend((Path(item["path"]), directory / "publications" / f"{index:04d}-{Path(item['path']).name}",
-                  item["sha256"]) for index, item in enumerate(lock.get("publications", [])))
+                  item["sha256"]) for index, item in enumerate(lock.get("publications", []) + lock.get("publicationEvidence", [])))
     saved = []
     for source, destination, expected_hash in files:
         data = regular_bytes(source)
@@ -131,14 +131,14 @@ def load_prepared(store: Path, build_id: str, task_id: str, owner: str) -> tuple
     if digest(canonical(lock)) != state["sourceLockSha256"]:
         raise ContractError("prepare: source lockのcanonical hashが一致しません")
     verify_sources(lock)
-    for item in lock.get("publications", []):
+    for item in lock.get("publications", []) + lock.get("publicationEvidence", []):
         if digest(regular_bytes(Path(item["path"]))) != item["sha256"]:
             raise ContractError("prepare: 公開物が準備後に変更されています")
     expected_files = [(lock_path, directory / "source-lock.json", state["sourceLockSha256"]),
                       (recipe_path, directory / "recipe.json", state["recipeSha256"])]
     expected_files.extend((Path(item["path"]), directory / "publications" /
                            f"{index:04d}-{Path(item['path']).name}", item["sha256"])
-                          for index, item in enumerate(lock.get("publications", [])))
+                          for index, item in enumerate(lock.get("publications", []) + lock.get("publicationEvidence", [])))
     expected_saved = [{"source": str(source), "path": str(saved), "sha256": expected_hash}
                       for source, saved, expected_hash in expected_files]
     if state.get("savedFiles") != expected_saved:
@@ -193,7 +193,10 @@ def main():
     parser.add_argument("--with-core", action="store_true", help="Coreを検証・発行する。Modへ未接続の依存を追加はしない")
     parser.add_argument("--managed-profile", type=Path, help="通常M用exact Profileの明示候補。承認はsuperviseで別途指定")
     parser.add_argument("--prepared-id", help="freezeするprepareのbuild ID")
+    parser.add_argument("--release-input-lock", type=Path, help="Release原本と取得済み6成果物を含む正式監査入力")
     args = parser.parse_args()
+    if args.release_input_lock is not None and (args.manager or args.with_core or args.stage == "freeze"):
+        raise ContractError("release: 正式版監査入力はprepare/一括実行で指定し、manager/with-coreと併用しません")
     root = args.task_root.absolute()
     _directory(root)
     _directory(args.store.absolute())
@@ -264,6 +267,8 @@ def main():
         names |= plans.keys()
         manager = "SushiEricServerManager" in names
         core = "SushiEricCombatCore" in names
+        if args.release_input_lock is None and not core:
+            raise ContractError("build: 開発runtimeにはSushiEricCombatCoreの登録が必要です。新しいDataModel固定座標を参照するCoreを同じtaskで発行してください")
         repos = {name: root / name for name in names}
         source_lock = capture_sources(repos)
         exporter = recorded_exporter(github, source_lock)
@@ -275,25 +280,37 @@ def main():
         record = records.start(root.name, build_id, args.owner, lock)
         try:
             maven.mkdir(parents=True, exist_ok=False)
-            data_model = repos["SushiEricDataModel"]
-            gradle(data_model, "build", "publishDevelopment", f"-PdataModelDevelopmentRepository={maven}")
-            mod_coordinate = publication(data_model, "mod", "sushieric-datamodel-mod-dev")
-            editor_coordinate = publication(data_model, "editor", "sushieric-datamodel-editor-dev")
-            host_coordinate = publication(data_model, "host", "sushieric-datamodel-host-adapter-dev")
-            publications = []
+            if args.release_input_lock is not None:
+                if manager:
+                    raise ContractError("release: Managerを含むtaskは正式runtimeの対象外です")
+                from dev_server.release_inputs import capture_release_inputs
+                source_lock = capture_release_inputs(source_lock, args.release_input_lock, maven)
+                selected = source_lock["librarySelection"]
+                mod_coordinate = selected["dataModelCoordinate"]
+                publications = source_lock["publications"]
+                mod_args = [f"-PdataModelReleaseVersion={mod_coordinate.split(':')[2]}",
+                            f"-PcombatCoreReleaseVersion={selected['combatCoreCoordinate'].split(':')[2]}"]
+            else:
+                data_model = repos["SushiEricDataModel"]
+                gradle(data_model, "build", "publishDevelopment", "-PdataModelReleaseVersion=",
+                       f"-PdataModelDevelopmentRepository={maven}")
+                mod_coordinate = publication(data_model, "mod", "sushieric-datamodel-mod-dev")
+                editor_coordinate = publication(data_model, "editor", "sushieric-datamodel-editor-dev")
+                host_coordinate = publication(data_model, "host", "sushieric-datamodel-host-adapter-dev")
+                publications = []
 
-            def record_publication(coordinate, repository, suffixes=(".jar", ".pom")):
-                group, module, version = coordinate.split(":")
-                for suffix in suffixes:
-                    path = repository / group.replace(".", "/") / module / version / f"{module}-{version}{suffix}"
-                    publications.append({"coordinate": coordinate, "path": str(path),
-                                         "sha256": digest(regular_bytes(path))})
+                def record_publication(coordinate, repository, suffixes=(".jar", ".pom")):
+                    group, module, version = coordinate.split(":")
+                    for suffix in suffixes:
+                        path = repository / group.replace(".", "/") / module / version / f"{module}-{version}{suffix}"
+                        publications.append({"coordinate": coordinate, "path": str(path),
+                                             "sha256": digest(regular_bytes(path))})
 
-            record_publication(mod_coordinate, maven)
-            record_publication(editor_coordinate, maven)
-            record_publication(host_coordinate, maven, ("-runtime.zip", ".pom"))
-            mod_args = [f"-PdataModelDevelopmentRepository={maven}", f"-PdataModelDevelopmentCoordinate={mod_coordinate}"]
-            if core:
+                record_publication(mod_coordinate, maven)
+                record_publication(editor_coordinate, maven)
+                record_publication(host_coordinate, maven, ("-runtime.zip", ".pom"))
+                mod_args = ["-PdataModelReleaseVersion=", "-PcombatCoreReleaseVersion=",
+                            f"-PdataModelDevelopmentRepository={maven}", f"-PdataModelDevelopmentCoordinate={mod_coordinate}"]
                 core_repo = maven / "core"
                 gradle(repos["SushiEricCombatCore"], "build", "publishDevelopment", *mod_args,
                        f"-PcombatCoreDevelopmentRepository={core_repo}")
@@ -301,9 +318,9 @@ def main():
                 record_publication(core_coordinate, core_repo)
                 mod_args.extend([f"-PcombatCoreDevelopmentRepository={core_repo}",
                                  f"-PcombatCoreDevelopmentCoordinate={core_coordinate}"])
-            if manager:
-                gradle(repos["SushiEricServerManager"], "build", f"-PdataModelDevelopmentRepository={maven}",
-                       f"-PdataModelDevelopmentCoordinate={editor_coordinate}")
+                if manager:
+                    gradle(repos["SushiEricServerManager"], "build", "-PdataModelReleaseVersion=", f"-PdataModelDevelopmentRepository={maven}",
+                           f"-PdataModelDevelopmentCoordinate={editor_coordinate}")
             verify_sources(source_lock)
             registered_task(root, args.owner, names)
             source_lock["publications"] = publications

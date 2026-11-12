@@ -129,8 +129,15 @@ def validate(kind: str, value: dict) -> None:
         version = value["schemaVersion"]
         coordinate = value["commonCoordinate" if version == 1 else "dataModelCoordinate"]
         module = "common" if version == 1 else "datamodel"
-        _require(re.fullmatch(r"io\.github\.sushiericworkspace:sushieric-" + module + r"-mod-dev:0\.1\.0-dev\.[0-9]{17}"
-                             + r"(?:\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})" + ("?" if version == 1 else ""), coordinate) is not None, kind, "提供元の完全なMod開発座標が必要です")
+        development_coordinate = re.fullmatch(r"io\.github\.sushiericworkspace:sushieric-" + module + r"-mod-dev:0\.1\.0-dev\.[0-9]{17}"
+                             + r"(?:\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})" + ("?" if version == 1 else ""), coordinate)
+        release_coordinate = False
+        if version == 2 and coordinate.startswith("io.github.sushiericworkspace:sushieric-datamodel:"):
+            from .release_inputs import SEMVER
+            release_version = coordinate.split(":")[-1]
+            release_coordinate = (re.fullmatch(r"io\.github\.sushiericworkspace:sushieric-datamodel:" + SEMVER, coordinate) is not None
+                                  and "SNAPSHOT" not in release_version.upper() and release_version != "0.2.0")
+        _require(development_coordinate is not None or release_coordinate, kind, "提供元の完全なMod座標が必要です")
         files = {entry["path"] for entry in value["files"]}
         _require(bool(value["launch"]["classpath"]) and all(
             entry in files or any(file.startswith(entry + "/") for file in files)

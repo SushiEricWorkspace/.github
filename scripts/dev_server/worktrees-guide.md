@@ -42,11 +42,37 @@ Issueの変更範囲はそのrepo内だけです。他repoも変更する場合�
 既存SushiEricDataModelソースの読み取りや確定成果物の利用だけなら、SushiEricDataModelの変更Issueは不要です。
 異なるrepoの同番号Issueは別の作業として扱い、依存repoへ元Issue番号の変更branchを作りません。
 新規taskの`--repos`はIssueが属する単一の変更repoです。依存repoは`--dependency`で同じtask配下のdetached HEADとして作り、変更branchを作りません。
-例えばModだけを変更して固定runtimeをビルドする場合、次のcommitプレースホルダーを各repoの確定した完全hashへ置き換えます。
+例えばModだけを変更して開発版の固定runtimeをビルドする場合、DataModel・CombatCore・`.github`を固定commit依存にします。
+次のcommitプレースホルダーを各repoの確定した完全hashへ置き換えます。
 
 ```bash
-python3.12 -B scripts/setup-worktrees.py --task-id mod-123 --issue 123 --owner codex-session-a --repos SushiEricServerMod --dependency "SushiEricDataModel=<SushiEricDataModelの確定commit>" --dependency ".github=<.githubの確定commit>"
+python3.12 -B scripts/setup-worktrees.py --task-id mod-123 --issue 123 --owner codex-session-a --repos SushiEricServerMod --dependency "SushiEricDataModel=<SushiEricDataModelの確定commit>" --dependency "SushiEricCombatCore=<SushiEricCombatCoreの確定commit>" --dependency ".github=<.githubの確定commit>"
 ```
+
+正式版経路（`build-dev-runtime.py --release-input-lock PATH`）では、Coreソースの登録は不要です。
+正式版を同梱したModのIssueなら、次のようにMod・DataModel・`.github`を登録し、別途監査済みCore成果物を入力にします。
+
+```bash
+python3.12 -B scripts/setup-worktrees.py --task-id mod-release-123 --issue 123 --owner codex-session-a --repos SushiEricServerMod --dependency "SushiEricDataModel=<SushiEricDataModelの確定commit>" --dependency ".github=<.githubの確定commit>"
+```
+
+開発版用と正式版用の例は代替手順です。既存branchがある同じrepo・Issueで両方のtaskを作成することはできません。
+
+### Coreなしの既存taskから開発runtimeへ移る場合
+
+同一taskの作成再実行はrepo・固定commitの集合一致を要求するため、`--dependency`を追加するだけでは更新できません。
+旧taskのbranch・未コミット変更・データを保全し、依存として使うコードを確定commitにします。
+別task-idと、変更repoで`feature/issue-<番号>`が未使用の別Issueを用意して新規作成してください。
+例えば`.github`のruntime検証Issueを使う場合は、次のように旧taskで確定したCore前提ModのcommitとDataModel・Coreを依存にします。
+
+```bash
+python3.12 -B scripts/setup-worktrees.py --task-id runtime-456 --issue 456 --owner codex-session-a --repos .github --base ".github=<runtime helperの確定commit>" --dependency "SushiEricServerMod=<Core前提Modの確定commit>" --dependency "SushiEricDataModel=<SushiEricDataModelの確定commit>" --dependency "SushiEricCombatCore=<SushiEricCombatCoreの確定commit>"
+```
+
+旧taskは保持したまま、新taskの`.github/scripts/build-dev-runtime.py`から実行します。
+task-idだけを変えて既存の同一変更branchを再利用する指定は拒否されます。
+
+### 依存worktreeの検証と登録
 
 依存worktreeのHEADとGit登録・detached状態・tracked/未追跡のcleanを作成再実行・引継ぎ・ビルド・削除で照合します。
 依存ソースの編集・commit・pushは行いません。変更が必要なら依存repoの別Issueで確定commitを作ります。

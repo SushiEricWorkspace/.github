@@ -2,7 +2,9 @@
 
 登録済みのタスクworktreeをビルドし、ソースworktreeの寿命とMinecraftの実行環境を分離するときに使います。
 配置・担当の管理は[worktreeガイド](worktrees-guide.md)、データ契約は[README](README.md)を参照してください。
-Python 3.12、JDK 21、対象のSushiEricDataModelとMod、同じタスクの`.github`が必要です。
+Python 3.12、JDK 21と、同じtaskに登録したSushiEricDataModel・Mod・`.github`が必要です。
+開発版経路ではSushiEricCombatCoreのソース登録も必須です。変更対象以外のrepoは確定した完全commit hashで依存登録します。
+正式版経路（`--release-input-lock`）ではCoreソースの登録は不要で、監査済みCore成果物を入力にします。
 `build-dev-runtime.py`は登録済みtaskの`.github/scripts`から実行してください。primaryや別taskのhelperコピーは、ビルド生成物を作る前に拒否します。
 
 ## ビルド
@@ -13,18 +15,47 @@ python3.12 -B scripts/build-dev-runtime.py --task-root /workspace/worktrees/issu
 
 `--store`には運用者が初期設定したartifact領域を指定します。未設定の管理rootや他人のrunをコピー・初期化しません。
 同一taskのGradle実行はOS lockで直列化し、登録ownerの引継ぎとworktree削除もビルド中は拒否します。
-SushiEricDataModelをtask専用Mavenへ発行し、取得した完全座標でModをビルドします。SushiEricDataModel・Mod・`.github`が同じownerのtaskへ登録されていることが必要です。
+開発版経路ではSushiEricDataModelとCombatCoreをtask専用Mavenへ発行し、取得した完全座標でModをビルドします。
+SushiEricDataModel・CombatCore・Mod・`.github`を同じownerのtaskへ登録してください。
 新規taskではIssueが属する単一の変更repoを`--repos`、残るrepoを固定commitの`--dependency`として[worktreeガイド](worktrees-guide.md)の手順で登録します。
-例えばSushiEricDataModelのIssueではMod・`.github`を依存にし、ManagerのIssueではSushiEricDataModel・Mod・`.github`を依存にします。`.github`のIssueではSushiEricDataModel・Modを依存にします。
+開発runtimeでは、DataModelのIssueはCore・Mod・`.github`、CoreのIssueはDataModel・Mod・`.github`を固定commit依存にします。
+ModのIssueはDataModel・Core・`.github`、`.github`のIssueはDataModel・Core・Modを固定commit依存にします。
+ManagerのIssueで開発runtimeを併せて作る場合は、DataModel・Core・Mod・`.github`を固定commit依存にします。
+正式版経路の必要repoはDataModel・Mod・`.github`で、変更対象以外を固定commit依存にします。
 未登録の必要repoは自動追加しません。依存のdetached HEAD・固定commit・cleanとownerを照合し、変更repoのdirty入力は従来どおりhashへ記録します。
 登録全repoを入力集合に含め、exporterもtask `.github`の入力として固定します。
-登録にManagerがあればManagerもビルドし、CombatCoreがあれば検証・発行します。変更repoとして登録した場合も同じです。
+登録にManagerがあればManagerもビルドします。開発版経路では登録したCombatCoreを検証・発行します。変更repoとして登録した場合も同じです。
 `--manager`・`--with-core`で追加検証を要求する場合も、対応するrepoの登録が必要です。
-Coreが登録されていれば、発行した完全座標と同じbuild UUID内のMaven/coreを、
+開発runtimeではCombatCoreの登録も必要です。発行した完全座標と同じbuild UUID内のMaven/coreを、
 Modの`combatCoreDevelopmentCoordinate`と`combatCoreDevelopmentRepository`へ渡します。
-Core未登録時は両propertyを渡しません。Modが実際にCombatCoreへ依存していない状態では、
-helperからModの依存宣言を追加しません。
-通常の開発ビルドは共有開発SushiEricDataModelの動的参照を維持します。正式版を開発bundleへ使用はできません。
+Core未登録時は発行前に拒否します。新たに発行するDataModelの一意な開発座標に合わせ、
+同じtaskのCoreをビルド・発行し、その固定座標をModへ供給します。
+Core非依存の旧Modは開発runtimeの対象外です。
+既存のCoreなしtaskは依存の後付けで更新できないため、[worktreeガイドの作り直し手順](worktrees-guide.md#coreなしの既存taskから開発runtimeへ移る場合)に従って新taskを作成してください。
+開発経路では`dataModelReleaseVersion`・`combatCoreReleaseVersion`を空指定し、正式版の既定値を解除します。
+通常の開発ビルドは共有開発SushiEricDataModelの動的参照を維持します。
+
+### 正式ライブラリを使う場合
+
+`--release-input-lock PATH`へ、`librarySelection`・`publicationEvidence`・`publications`を持つUTF-8 JSONを指定します。
+`librarySelection`は`mode: release`とDataModel・Host・CombatCoreの完全GAVです。
+`publicationEvidence`はDataModel/CoreのRelease添付`input-lock.json`原本2件の`path`と`sha256`、
+`publications`は取得済みJAR/POM/Host runtime ZIP/POM/Core JAR/POMの6件です。
+各成果物は`coordinate`・`path`・`sha256`・`extension`・`classifier`と、
+`origin`の`mode`・`repository`・`sourceRepository`・`sourceCommit`・`evidenceSha256`を指定します。
+パスは絶対パス、ZIPのclassifierは`runtime`、他は空文字です。hashは実bytesから計算します。
+
+captureは既存gh認証でRelease添付原本を取得し、入力とのbyte一致とタグの最終commitを照合します。
+対象は正式版DataModel/Host 0.3.0・CombatCore 0.1.1以降の監査可能な版です。
+DataModel 0.2.0・CombatCore 0.1.0、正式/開発の混在、原本欠落・hash違い・タグ不一致を拒否します。
+検証済み6成果物と原本をtaskのUUID別Maven配下へコピーし、source lock v2をModへ渡します。
+Mod側はPR #630の確定実装を使用し、正式版の選択propertyと`runtimeSourceLock`でdescribe/exportします。
+正式版のhelper実行では`--manager`・`--with-core`を併用しません。
+Managerを登録したtaskは正式版経路の対象外です。Coreソース登録・再発行は不要です。
+
+`prepare --release-input-lock PATH`で保存した入力は`freeze --prepared-id ID`へ引き継ぎます。
+freezeには既存手順どおり独立供給の`--managed-profile`が必要です。
+prepare後の原本・成果物・レシピ変更も拒否します。検証でトークンを表示・保存しないでください。
 
 ## Gradleとの境界
 
@@ -62,8 +93,12 @@ bundleの内部へ実行データを置けませんが、generation/runtimeの�
 
 ## runtimeのversionと切替
 
-新規freezeは`recipeVersion: 2`と`dataModelCoordinate`だけを受け付け、`schemaVersion: 2`を出力します。
-DataModelのMod用JARと隣接POMは双方必須で、コンパイル前の`dependencyInputs`へSHA-256を記録します。
+新規freezeは全開発版の`recipeVersion: 2`/source lock v1、正式版の`recipeVersion: 3`/source lock v2を受け付け、`schemaVersion: 2`を出力します。
+正式版でもFabric/Loomの`development`は`true`です。
+DataModelのMod用JARとPOMは双方必須で、コンパイル前の`dependencyInputs`へSHA-256を記録します。
+正式版は6成果物と原本2件をすべてcompile前に固定し、recipeとsource lockの監査欄を照合します。
+bundle内の`inputs/source-lock.json`と`inputs/publications.json`へ由来を含めて保存し、bundle再検証で照合します。
+原本・成果物のbundle内パスは相対パスです。起動前の検証は固定byteだけで実行します。
 `sources`には`SushiEricDataModel`と`SushiEricServerMod`を含め、旧提供元名やキーを混在させません。
 
 保存済み`schemaVersion: 1`のbundleは、旧`commonCoordinate`・Common入力記録をそのまま検証・起動できます。
