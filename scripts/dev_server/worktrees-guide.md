@@ -19,9 +19,23 @@ python3.12 -B scripts/setup-worktrees.py --task-id issue-123-a --handoff-from co
 `--workspace-root PATH`でworkspaceを明示できます。primaryのbranch・index・作業ファイルは変更しません。
 originをfetchし、repoごとの開発基準commitを記録します。SushiEricDataModel・ServerManager・CombatCoreはdevelop、Mod・.githubはmainです。
 origin/HEADがリリースbranchを指していても、開発基準から起点を変えません。
-変更repoの起点だけを`--base SushiEricServerMod=<commit>`で指定できます。確定した依存ソースは反復可能な`--dependency REPO=COMMIT`で指定します。
+変更repoの起点だけを`--base SushiEricServerMod=<commit>`で指定できます。Issueやマイルストーンが統合branchを指定する場合は、そのbranchの最新確定commitをfetchして記録し、完全commit hashを`--base REPO=<commit>`へ渡します。通常のdevelop/mainへ起点を戻しません。確定した依存ソースは反復可能な`--dependency REPO=COMMIT`で指定します。
 依存には完全commit hashを指定し、branch名・HEAD・短縮hashは使用しません。変更repoとの重複や依存repoの二重指定は拒否します。
 既存のlocal/remote branchやworktreeは取り込んだり上書きしたりせず拒否します。
+
+ManagerのUI統合branchは`codex/manager-ui-workspace`です。次の例ではbranchの最新確定commit、#57の確定commit、SushiEricDataModelの確定commitをそれぞれ完全hashで指定します。
+
+```bash
+python3.12 -B scripts/setup-worktrees.py --task-id manager-244 --issue 244 --owner codex-session-a --repos SushiEricServerManager --base "SushiEricServerManager=<codex/manager-ui-workspaceの確定commit>" --dependency "SushiEricDataModel=<SushiEricDataModelの確定commit>" --dependency ".github=<#57の確定commit>"
+```
+
+依存repoは指定commitからtask用にビルドし、成果物はtask専用Mavenへ発行します。利用側は完全座標とSHA-256を記録して固定し、primaryや他taskの共有Maven出力を参照しません。
+
+`.github`依存worktreeを作業ディレクトリとして、同期対象に担当Manager worktreeの絶対パスだけを指定します。
+
+```bash
+python3.12 -B scripts/sync-agent-rules.py --repo-root "SushiEricServerManager=<Manager worktreeの絶対パス>"
+```
 
 Issueの変更範囲はそのrepo内だけです。他repoも変更する場合は、そちらに別Issueを作り、`owner/repo#番号`で相互参照します。
 例えばModのIssueでSushiEricDataModelのAPI変更も必要になったら、SushiEricDataModel側の別IssueでAPI・完成条件・検証を定め、その確定commitをModの前提にします。
