@@ -1,0 +1,827 @@
+"""通常Mの承認入力、native起動と停止制御のrun所有者。"""
+from copy import deepcopy
+import ctypes
+import json
+import os
+from pathlib import Path
+import stat
+import struct
+import threading
+import time
+import uuid
+
+from . import mod_control_operations as operations
+from . import mod_control_wire as wire
+from . import storage
+from .build_inputs import canonical, digest, regular_bytes
+from .local_ipc import MAX_MESSAGE, decode, plain_path, require_private
+from .mod_control_startup import _Startup, _admission, _change
+from .mod_control_transport import ModControlTransport, _WindowsNative
+from .registry import RegistryError, fields, identifier, require
+from .runtime_bundle import _read_managed_profile, _expand_managed_launch, verify_bundle, require_data_generation
+
+
+def approved_input(path, expected_hash, root, inventory):
+    """privateな同handle/fdから64KiBまで読み、独立承認hashとinventoryへ結束する。"""
+    wire._hash(expected_hash)
+    require(path.is_absolute(), "INVALID_INPUT", "承認入力は絶対pathが必要です")
+    plain_path(path)
+    require_private(path.parent, directory=True)
+    if os.name == "nt":
+        native = _WindowsNative()
+        handles = [native.open_anchor(path.anchor)]
+        try:
+            for name in path.parent.parts[1:]:
+                handle = native.relative(handles[-1], name, directory=True)
+                handles.append(handle)
+                native.metadata(handle, directory=True)
+            native.private(handles[-1])
+            handle = native.relative(handles[-1], path.name)
+            handles.append(handle)
+            native.private(handle)
+            before = native.metadata(handle)
+            require(0 < before[1] <= MAX_MESSAGE, "INVALID_INPUT", "承認入力の長さが上限外です")
+            buffer = ctypes.create_string_buffer(MAX_MESSAGE + 1)
+            count = ctypes.c_uint32()
+            native.check(native.kernel.ReadFile(handle, buffer, len(buffer), ctypes.byref(count), None))
+            raw = buffer.raw[:count.value]
+            require(len(raw) == before[1] and native.metadata(handle) == before,
+                    "INVALID_INPUT", "承認入力の実体・長さが変更されました")
+        finally:
+            for handle in reversed(handles):
+                native.close_handle(handle)
+    else:
+        handles = [os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)]
+        try:
+            for name in path.parent.parts[1:]:
+                handles.append(os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=handles[-1]))
+            parent = os.fstat(handles[-1])
+            require(parent.st_uid == os.getuid() and stat.S_IMODE(parent.st_mode) == 0o700,
+                    "INVALID_INPUT", "承認入力の親はprivateではありません")
+            handles.append(os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=handles[-1]))
+            before = os.fstat(handles[-1])
+            require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_uid == os.getuid()
+                    and stat.S_IMODE(before.st_mode) == 0o600 and 0 < before.st_size <= MAX_MESSAGE,
+                    "INVALID_INPUT", "承認入力はprivateな有限の通常fileが必要です")
+            raw = os.read(handles[-1], MAX_MESSAGE + 1)
+            require(len(raw) == before.st_size and os.fstat(handles[-1]) == before,
+                    "INVALID_INPUT", "承認入力が変更されました")
+        finally:
+            for handle in reversed(handles):
+                os.close(handle)
+    require(0 < len(raw) <= MAX_MESSAGE and wire.sha256(raw) == expected_hash,
+            "INVALID_INPUT", "承認入力の長さ・原hashが一致しません")
+    value = decode(raw)
+    fields(value, {"managementRoot", "instances"})
+    require(value["managementRoot"] == str(root) and type(value["instances"]) is list
+            and len(value["instances"]) <= len(inventory["instances"]), "INVALID_INPUT", "承認対象root/件数が一致しません")
+    allowed = {item["instanceId"] for item in inventory["instances"]}
+    result = {}
+    for item in value["instances"]:
+        fields(item, {"instanceId", "artifactId", "runtimeManifestHash", "expectedEvidence"})
+        require(item["instanceId"] in allowed and item["instanceId"] not in result,
+                "INVALID_INPUT", "承認instanceが不正または重複しています")
+        wire._hash(item["artifactId"])
+        wire._hash(item["runtimeManifestHash"])
+        wire._profile_inventory(item["expectedEvidence"])
+        result[item["instanceId"]] = deepcopy(item)
+    return raw, result
+
+
+def process_identity(native, adapter, pid):
+    """Pがnative観測したPID/startをDataの本人形式へ変換する。M本文を使用しない。"""
+    identity = adapter.identity(pid)
+    require(identity is not None, "PROCESS_MISMATCH", "所有process本人が存在しません")
+    if native.transport == "windows-pipe":
+        host, boot = native.host_boot()
+        start = identity["startId"]
+    else:
+        host, boot = native._host_boot()
+        info = ctypes.create_string_buffer(136)
+        require(native.proc.proc_pidinfo(pid, 3, 0, info, len(info)) == len(info),
+                "PROCESS_MISMATCH", "所有process開始識別を取得できません")
+        start = "{}:{}".format(*struct.unpack_from("QQ", info.raw, 120))
+    value = {"hostHash": host, "bootId": boot, "pid": pid, "startId": start}
+    wire._identity(value)
+    return value
+
+
+def _closed_writers(connection, instance, run):
+    """同runの全writerについて、耐久closeと実proxy/child退出証拠を列挙する。"""
+    values = connection.execute("SELECT * FROM writer_sessions WHERE instance=? AND run=?", (instance, run)).fetchall()
+    writers = []
+    for value in values:
+        require(value["status"] == "CLOSED" and not value["pending"], "WRITER_PENDING", "未終了writerが残っています")
+        require(not connection.execute("SELECT 1 FROM writer_operations WHERE session=? AND status!='COMPLETED'", (value["id"],)).fetchone(),
+                "WRITER_PENDING", "元writer要求が未完了です")
+        closes = connection.execute("SELECT response FROM writer_operations WHERE session=? AND command='writer-close' AND status='COMPLETED'", (value["id"],)).fetchall()
+        require(len(closes) == 1, "PROOF_REQUIRED", "writer終了の耐久記録が一意ではありません")
+        closed = json.loads(closes[0][0])
+        require(closed.get("proxyExited") is True and closed.get("proxyChildrenExited") is True
+                and type(closed.get("proxyIdentity")) is dict, "PROOF_REQUIRED", "proxy/childの実exit証拠がありません")
+        wire._identity(closed["proxyIdentity"])
+        writers.append({"identity": closed["proxyIdentity"], "state": "CLOSED", "children": []})
+    return writers
+
+
+class ManagedRuntime:
+    """inventory各枠に受信threadを一つ保持し、managed-stopとは別に進行する。"""
+    def __init__(self, runtime, approvals, *, transport=None):
+        self.runtime = runtime
+        self.registry = runtime.registry
+        self.approvals = deepcopy(approvals)
+        self.transport = transport or ModControlTransport(
+            [item["instanceId"] for item in self.registry.inventory["instances"]], wire_version=3)
+        self.startup = _Startup(runtime, self.transport, version=3)
+        self.sessions = {}
+        self.lock = threading.Lock()
+
+    def approved(self, row, generation):
+        item = self.approvals.get(row["id"])
+        require(item is not None, "PROFILE_REQUIRED", "通常起動の独立承認入力がありません")
+        manifest = verify_bundle(generation / "runtime")
+        raw = regular_bytes(generation / "runtime/launch/managed-server-candidate.json")
+        require(item["artifactId"] == row["artifact"] == manifest["artifactId"]
+                and item["runtimeManifestHash"] == wire.sha256(regular_bytes(generation / "runtime/runtime.json"))
+                and item["expectedEvidence"]["profileSha256"] == wire.sha256(raw),
+                "PROFILE_MISMATCH", "固定bundleと独立承認が一致しません")
+        _read_managed_profile(raw)
+        return item, raw
+
+    def owns_socket(self, path, info):
+        with self.lock:
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            endpoint = session.get("endpoint")
+            if endpoint is not None and endpoint.listener is not None and path == Path(endpoint.descriptor["endpoint"]["address"]):
+                require_private(path.parent, directory=True)
+                listener = endpoint.listener
+                require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600
+                        and listener.identity == (info.st_dev, info.st_ino), "IPC_UNVERIFIED", "所有control socket実体が変わりました")
+                return True
+        return False
+
+    def prepare(self, row, run, generation):
+        approval, profile_raw = self.approved(row, generation)
+        shop = generation / "config/SushiEricServerMod/shop_data"
+        plain_path(shop)
+        if not shop.exists():
+            storage.mkdir(shop)
+        require(shop.is_dir(), "ROOT_MISMATCH", "shop保存先はディレクトリが必要です")
+        with self.lock:
+            require(row["id"] not in self.sessions, "CONTROL_BUSY", "旧runの制御資源が残っています")
+            session = {"run": run["runId"], "stop": threading.Event(), "done": threading.Event(),
+                       "error": None, "close_ids": {}, "drain_lock": threading.Lock()}
+            self.sessions[row["id"]] = session
+        controller = process_identity(self.transport.native, self.runtime.process_adapter, os.getpid())
+        world = self._world(generation)
+        leaf = self.registry.root / "manager/control" / run["runId"]
+        address = ("\\\\.\\pipe\\sushieric-mod-" + uuid.uuid4().hex if os.name == "nt" else str(leaf / "mod-control.sock"))
+        descriptor = {"version": 1, "purpose": wire.PURPOSE, "descriptorId": uuid.uuid4().hex,
+            "managementRoot": str(self.registry.root), "instanceId": row["id"], "leaseId": row["lease"],
+            "epoch": row["epoch"], "generationId": row["generation"], "runtimeRunId": run["runId"],
+            "startNonce": run["nonce"], "artifactId": row["artifact"], "runtimeManifestHash": run["manifestHash"],
+            "worldRoot": str(world), "shopDirectory": str(shop), "controller": controller,
+            "endpoint": {"transport": self.transport.native.transport, "address": address}}
+        raw = canonical(descriptor)
+        wire.decode_descriptor(raw)
+        context = {key: descriptor[key] for key in ("managementRoot", "instanceId", "leaseId", "epoch", "generationId", "runtimeRunId", "controller")}
+        context["descriptorSha256"] = wire.sha256(raw)
+        session["endpoint"] = self.transport.create(context, raw)
+        launch = {"bundle": str(generation / "runtime"), "run": str(generation), "auxiliary": str(leaf / "auxiliary"),
+                  "privateTmp": str(leaf / "private-tmp"), "controlDescriptor": wire.descriptor_path(descriptor),
+                  "controlDescriptorSha256": wire.sha256(raw), "runtimeManifest": str(generation / "runtime/runtime.json"),
+                  "proofPath": run["proofPath"], "instanceId": row["id"], "generationId": row["generation"], "startNonce": run["nonce"]}
+        session.update(descriptor=descriptor, raw=raw, approval=approval, profile_raw=profile_raw, launch=launch,
+                       observed=_expand_managed_launch(_read_managed_profile(profile_raw), launch))
+        return session
+
+    @staticmethod
+    def _world(generation):
+        from .snapshot_data import properties
+        return generation / properties((generation / "server.properties").read_bytes())["level-name"]
+
+    def handshake(self, token, run, session, deadline):
+        descriptor = session["descriptor"]
+        owner = process_identity(self.transport.native, self.runtime.process_adapter, run["identity"]["pid"])
+        require(owner["startId"] == run["identity"]["startId"],
+                "PROCESS_MISMATCH", "生成時に保持したMの開始識別と一致しません")
+        management = {"leaseId": descriptor["leaseId"], "epoch": descriptor["epoch"],
+                      "generation": descriptor["generationId"], "controller": descriptor["controller"],
+                      "drainSha256": wire.sha256(canonical({"run": run["runId"], "writers": []}))}
+        context = {"descriptorJson": session["raw"].decode("utf-8"), "owner": owner,
+                   "management": management, "expectedEvidence": session["approval"]["expectedEvidence"]}
+        with self.runtime._transaction(token["instanceId"], read_only=True) as connection:
+            revision = _admission(connection, self.registry._instance(connection, token["instanceId"]))["revision"]
+        self.startup.start(token, profile_raw=session["profile_raw"], launch_context=session["launch"],
+            observed=session["observed"], context=context, revision=revision, deadline=deadline,
+            endpoint=session["endpoint"], defer_ready=True)
+        session.update(context=context, token=deepcopy(token))
+        self.runtime._remember_game_process(run, session)
+
+    def ready(self, row, connection):
+        session = self.startup.sessions[row["id"]]
+        require(session.get("acknowledged"), "CONTROL_PENDING", "ACK送信が未確認です")
+        gate = _admission(connection, row)
+        require(gate["gate"] == "CLOSED" and gate["revision"] == session["revision"]
+                and gate["descriptor_hash"] == wire.sha256(session["context"]["descriptorJson"].encode()),
+                "STALE_OPERATION", "readyまでに受付予約が変更されました")
+
+    def listen(self, instance):
+        session = self.sessions[instance]
+        thread = threading.Thread(target=self._serve, args=(instance, session), name="mod-control-" + instance, daemon=True)
+        session["thread"] = thread
+        thread.start()
+
+    def _serve(self, instance, session):
+        channel = self.startup.sessions[instance]["connection"]
+        request = None
+        try:
+            # 受信slotはrunに固定し、共有workerや停止drainのlockを保持しない。
+            def idle():
+                process = self.runtime.processes.get(session["run"])
+                require(process is not None and process.poll() is None,
+                        "CONTROL_UNKNOWN", "停止制御前にMが終了しました")
+            while True:
+                request = channel.receive_frame(time.monotonic() + 30, idle=idle)
+                message = wire.correlate_binding_v3(request, session["context"],
+                    pre_evidence_json=wire.decode_frame_v3(self.startup.sessions[instance]["hello"])["payload"]["profileEvidenceJson"])
+                if message["phase"] != "BOUND":
+                    break
+                require(request == self.startup.sessions[instance]["request"], "STALE_RUN", "元BOUND原文だけを読み戻します")
+                with self.runtime._transaction(instance, read_only=True) as connection:
+                    row = self.registry._instance(connection, instance)
+                    gate = _admission(connection, row)
+                    require(row["run_id"] == session["run"] and gate["descriptor_hash"] == wire.sha256(session["raw"]),
+                            "STALE_RUN", "別runへACKを提示しません")
+                    saved = operations.readback(connection, instance, request)
+                    require(saved is not None and wire.decode_frame_v3(saved)["phase"] == "ACK",
+                            "CONTROL_PENDING", "元ACK原文がありません")
+                require(channel.send_frame(saved, time.monotonic() + 30) == len(saved), "CONTROL_UNKNOWN", "ACK読戻し送信が不明です")
+            require(message["phase"] == "STOP_BLOCK", "INVALID_INPUT", "停止要求が必要です")
+            session["stop_request"] = request
+            session["stop"].set()
+            deadline = time.monotonic() + 30
+            if "game_exit_input" in session:
+                deadline = min(deadline, session["game_exit_input"]["deadline"])
+            session["stop_deadline"] = deadline
+            with self.runtime._lock_wait(deadline):
+                self.reserve_stop(instance, session)
+                with self.runtime._transaction(instance) as connection:
+                    require(operations.reserve(connection, instance, request) is None,
+                            "CONTROL_PENDING", "停止要求の再作用を許可しません")
+                    row = self.registry._instance(connection, instance)
+                    parent = connection.execute("SELECT id,fingerprint FROM runtime_operations WHERE instance=? AND command='stop' AND status='PENDING'", (instance,)).fetchone()
+                    session["direct_stop"] = parent is None
+                    session["stop_operation"] = parent[0] if parent else "direct-stop-" + uuid.uuid4().hex
+                    session["stop_fingerprint"] = parent[1] if parent else digest(session["raw"])
+                    session["control_operation"] = message["operationId"]
+                    pending = {"runId": session["run"], "controlOperationId": message["operationId"]}
+                    if parent is None:
+                        connection.execute("INSERT INTO runtime_operations VALUES (?,?, 'stop',?,'PENDING',?)",
+                            (session["stop_operation"], digest(session["raw"]), instance, json.dumps(pending)))
+                    else:
+                        connection.execute("UPDATE runtime_operations SET response=? WHERE id=?", (json.dumps(pending), parent[0]))
+                    connection.execute("INSERT INTO reservations VALUES (?,?,?,?,?)",
+                        (message["operationId"], "stop:" + session["stop_operation"], instance, row["lease"], row["epoch"]))
+                self.drain(instance, session, deadline)
+                with self.runtime._transaction(instance) as connection:
+                    row, gate, writers = self.snapshot(connection, instance, session)
+                    reply = self.reply(request, "BLOCKED", {"management": session["context"]["management"],
+                                                              "registryRevision": gate["revision"]})
+                    operations.complete(connection, instance, request, reply)
+                require(channel.send_frame(reply, deadline) == len(reply), "CONTROL_UNKNOWN", "BLOCKED送信が不明です")
+            request = channel.receive_frame(deadline)
+            with self.runtime._lock_wait(deadline):
+                message = wire.correlate_binding_v3(request, session["context"])
+                require(message["phase"] == "SAVE_REQUESTED", "INVALID_INPUT", "Requestedが必要です")
+                session["save_request"] = request
+                requested = wire._inner(message["payload"], "requestJson", "requestSha256")
+                bound = wire._status(wire._inner(wire.decode_frame_v3(self.startup.sessions[instance]["request"])["payload"],
+                                               "statusJson", "statusJsonSha256"), "Running")
+                state = wire._status(requested["status"], "ManagedSaveRequested")
+                require(all(wire._same_json(state[key], bound[key]) for key in ("worldUuid", "runUuid", "generation", "paths"))
+                        and state["stateRevision"] > bound["stateRevision"],
+                        "STALE_RUN", "元Runningから進んだRequestedではありません")
+                with self.runtime._transaction(instance) as connection:
+                    row, gate, writers = self.snapshot(connection, instance, session)
+                    require(operations.reserve(connection, instance, request) is None,
+                            "CONTROL_PENDING", "Requestedの再作用を許可しません")
+                    completion = {"request": requested, "snapshotId": uuid.uuid4().hex, "registryRevision": gate["revision"],
+                                  "acceptance": "BLOCKED", "drain": "COMPLETE", "pendingCount": 0, "writers": writers}
+                    reply = self.reply(request, "COMPLETION", {"requestSha256": message["payload"]["requestSha256"], "completion": completion})
+                    operations.complete(connection, instance, request, reply)
+                session["completion_response"] = reply
+                require(channel.send_frame(reply, deadline) == len(reply), "CONTROL_UNKNOWN", "COMPLETION送信が不明です")
+                require(channel.wait_peer_close(deadline) is True, "CONTROL_UNKNOWN", "Mのcontrol closeが未確認です")
+                require(session["endpoint"].close(deadline), "CONTROL_UNKNOWN", "control closeが未確認です")
+                with self.runtime._transaction(instance) as connection:
+                    evidence, pending = self.save_evidence(connection, instance, session, deadline)
+                    require("managedSave" not in pending, "CONTROL_PENDING", "保存原文の再確定を許可しません")
+                    require(time.monotonic() < deadline, "STOP_TIMEOUT", "保存原文の記録前に期限を超過しました")
+                    connection.execute("UPDATE runtime_operations SET response=? WHERE id=?",
+                                       (json.dumps(dict(pending, managedSave=evidence)), session["stop_operation"]))
+                session["save_evidence"] = evidence
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "保存原文の記録後に期限を超過しました")
+                session["done"].set()
+                self.runtime._direct_stop(instance, session)
+        except BaseException as error:
+            session["error"] = error
+            try:
+                with self.runtime._lock_wait(time.monotonic() + 30), self.runtime._transaction(instance) as connection:
+                    row = self.registry._instance(connection, instance)
+                    require(row["run_id"] == session["run"], "STALE_RUN", "別runを不明へ変更しません")
+                    stopped = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (session.get("stop_operation"),)).fetchone()
+                    if (stopped is not None and stopped["instance"] == instance and stopped["command"] == "stop"
+                            and stopped["status"] == "COMPLETED" and stopped["fingerprint"] == session["stop_fingerprint"]
+                            and row["state"] == "LEASED_STOPPED" and row["runtime_proof"] is not None
+                            and json.loads(row["runtime_proof"]) == json.loads(stopped["response"])):
+                        result = json.loads(stopped["response"])
+                        if (result.get("runId") == session["run"] and result.get("stopOperationId") == session["stop_operation"]
+                                and result.get("controlOperationId") == session["control_operation"]):
+                            return
+                    if request is not None and operations.readback(connection, instance, request) is not None:
+                        operations.unknown(connection, instance, request)
+                    gate = _admission(connection, row)
+                    if gate["gate"] != "BLOCKED":
+                        _change(connection, row, gate["revision"], "BLOCKED")
+                    connection.execute("UPDATE instances SET state='RECOVERY_REQUIRED' WHERE id=?", (instance,))
+            except BaseException as preserve_error:
+                session["preservationError"] = preserve_error
+
+    def save_evidence(self, connection, instance, session, deadline):
+        """認証済保存原文と同stop予約をtx内で再照合し、hash参照と元予約本文を返す。
+
+        元Mの生成snapshotを再照合するが、M/C実終了・Data候補・Readyは証明しない。原文と予約を保持する。
+        """
+        deadline = min(deadline, session["stop_deadline"])
+        row, gate, writers = self.snapshot(connection, instance, session)
+        self.registry._token(row, session["token"], allow_expired=True)
+        descriptor = wire.decode_descriptor(session["raw"])
+        require(gate["descriptor_hash"] == wire.sha256(session["raw"])
+                and all(descriptor[k] == row[v] for k,v in
+                        (("instanceId","id"),("leaseId","lease"),("epoch","epoch"),
+                         ("generationId","generation"),("runtimeRunId","run_id"))),
+                "STALE_RUN", "保存原文と元descriptor/正本bindingが一致しません")
+        request = session["save_request"]
+        reply = session["completion_response"]
+        message = wire.correlate_binding_v3(request, session["context"])
+        response = wire.correlate_response_v3(request, reply)
+        require(message["phase"] == "SAVE_REQUESTED" and response["phase"] == "COMPLETION"
+                and operations.readback(connection, instance, request) == reply,
+                "STALE_OPERATION", "認証済Requested/COMPLETION原文が変更されました")
+        requested = wire._inner(message["payload"], "requestJson", "requestSha256")
+        state = wire._status(requested["status"], "ManagedSaveRequested")
+        bound = wire._status(wire._inner(wire.decode_frame_v3(self.startup.sessions[instance]["request"])["payload"],
+                                        "statusJson", "statusJsonSha256"), "Running")
+        completion = response["payload"]["completion"]
+        require(all(wire._same_json(state[k], bound[k]) for k in ("worldUuid","runUuid","generation","paths"))
+                and state["stateRevision"] > bound["stateRevision"]
+                and completion["registryRevision"] == gate["revision"] and completion["writers"] == writers,
+                "STALE_OPERATION", "保存元Runningまたは最新閉門/全writer台帳が変更されました")
+        stop = wire.correlate_binding_v3(session["stop_request"], session["context"])
+        blocked = operations.readback(connection, instance, session["stop_request"])
+        require(stop["phase"] == "STOP_BLOCK" and stop["operationId"] == session["control_operation"]
+                and blocked is not None and wire.decode_frame_v3(blocked)["phase"] == "BLOCKED",
+                "STALE_OPERATION", "元STOP_BLOCK/BLOCKED原文が一致しません")
+        parent = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (session["stop_operation"],)).fetchone()
+        require(parent is not None and parent["instance"] == instance and parent["command"] == "stop"
+                and parent["status"] == "PENDING" and parent["fingerprint"] == session["stop_fingerprint"],
+                "STALE_OPERATION", "元stopの正本予約がありません")
+        pending = json.loads(parent["response"])
+        selected = session.get("game_exit_input")
+        if selected is not None and "raw" in selected:
+            require(pending.get("gameExitInputSha256") == digest(selected["raw"]),
+                    "STALE_OPERATION", "元stopへ記録した候補入力参照が一致しません")
+        ref = connection.execute("SELECT * FROM reservations WHERE operation=? AND reference=?",
+                                 (session["control_operation"], "stop:" + session["stop_operation"])).fetchone()
+        require(pending.get("runId") == session["run"] and pending.get("controlOperationId") == stop["operationId"]
+                and ref is not None and ref["instance"] == instance and ref["lease"] == row["lease"] and ref["epoch"] == row["epoch"],
+                "STALE_OPERATION", "元stop意図と参照予約が一致しません")
+        record = connection.execute("SELECT record FROM runs WHERE id=? AND instance=? AND generation=?",
+                                    (row["run_id"], instance, row["generation"])).fetchone()
+        require(record is not None, "PROCESS_UNVERIFIED", "保存元Mのrun正本がありません")
+        run = json.loads(record[0])
+        _, snapshot = self.runtime._game_process(run)
+        require(all(run[k] == row[v] for k,v in
+                    (("runId","run_id"),("instanceId","id"),("generationId","generation"),("artifactId","artifact")))
+                and snapshot["owner"] == session["context"]["owner"]
+                and snapshot["descriptorSha256"] == gate["descriptor_hash"],
+                "PROCESS_MISMATCH", "保存原文と保持元Mの生成bindingが一致しません")
+        require(time.monotonic() < deadline, "STOP_TIMEOUT", "保存原文の最終照合中に期限を超過しました")
+        return {"operationId":message["operationId"], "requestBodySha256":wire.sha256(request[4:]),
+                "responseBodySha256":wire.sha256(reply[4:]), "descriptorSha256":wire.sha256(session["raw"])}, pending
+
+    def select_game_exit(self, token, *, run_id, operation_id, descriptor_sha256, deadline):
+        """信頼済みP入力専用。停止予約前に、元run/stop/descriptorの候補受付を一度選ぶ。
+
+        公開RPCやMod wireからは呼ばない。選択したstopは保存原文確定後、同期限内の
+        supply_game_exitを待つ。候補の公開供給元・Ready承認・handle解放は含めない。
+        """
+        identifier(operation_id, "operationId")
+        wire._hash(descriptor_sha256)
+        instance = token["instanceId"]
+        with self.runtime._lock_wait(deadline), self.runtime._transaction(instance, read_only=True) as connection:
+            with self.lock:
+                session = self.sessions[instance]
+                require("game_exit_input" not in session and "game_exit" not in session
+                        and not session["stop"].is_set() and not session["done"].is_set(),
+                        "CONTROL_PENDING", "候補受付は元runの停止前に一度だけ選択します")
+                row = self.registry._instance(connection, instance)
+                self.registry._token(row, token)
+                gate = _admission(connection, row)
+                require(row["state"] == "RUNNING" and not row["pending"] and gate["gate"] == "OPEN"
+                        and row["run_id"] == session["run"] == run_id
+                        and gate["descriptor_hash"] == wire.sha256(session["raw"]) == descriptor_sha256,
+                        "STALE_RUN", "候補受付の元run/descriptorが一致しません")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補受付の選択期限を超過しました")
+                binding = {"instanceId": instance, "runId": run_id, "stopOperationId": operation_id,
+                           "descriptorSha256": descriptor_sha256}
+                session["game_exit_input"] = {"binding": canonical(binding), "deadline": deadline,
+                                             "event": threading.Event(), "submitted": False, "error": None}
+        return deepcopy(binding)
+
+    def supply_game_exit(self, token, *, run_id, operation_id, descriptor_sha256, candidate, deadline):
+        """保存原文確定後、認証した同stopへ独立明示候補を一度供給する。
+
+        認証/元予約の拒否は受付を消費しない。確保後の候補失敗は原本と予約を保全して終端する。
+        受理原文に実効期限を固定し、通知後の確定状態を読んだ停止側だけがCを生成する。
+        """
+        token = deepcopy(token)
+        instance = token["instanceId"]
+        binding = {"instanceId": instance, "runId": run_id, "stopOperationId": operation_id,
+                   "descriptorSha256": descriptor_sha256}
+        with self.runtime._lock_wait(deadline), self.runtime._transaction(instance, read_only=True) as connection:
+            row = self.registry._instance(connection, instance)
+            self.registry._token(row, token, allow_expired=True)
+            with self.lock:
+                session = self.sessions[instance]
+                selected = session["game_exit_input"]
+                deadline = min(deadline, selected["deadline"], session.get("stop_deadline", deadline))
+                require(canonical(binding) == selected["binding"], "STALE_OPERATION", "候補入力の元run/stop/descriptorが一致しません")
+                require(session["done"].is_set() and session["error"] is None,
+                        "CONTROL_UNKNOWN", "候補は保存原文確定後にだけ供給します")
+                require(not selected["submitted"], "CONTROL_PENDING", "候補入力を再供給しません")
+                evidence, pending = self.save_evidence(connection, instance, session, deadline)
+                require(session["stop_operation"] == operation_id and session["run"] == run_id
+                        and wire.sha256(session["raw"]) == descriptor_sha256
+                        and evidence == session["save_evidence"] == pending.get("managedSave")
+                        and "gameExitInputSha256" not in pending,
+                        "STALE_OPERATION", "候補入力の正本予約/保存原文が変更されました")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補受付の確保前に期限を超過しました")
+                selected["submitted"] = True
+                selected["accepted"] = False
+        try:
+            candidate = deepcopy(candidate)
+            self.game_exit_inputs(instance, session, candidate, deadline)
+            raw = canonical(dict(binding, candidate=candidate, deadline=deadline))
+            result = {"inputSha256": digest(raw)}
+            with self.runtime._lock_wait(deadline), self.runtime._transaction(instance) as connection:
+                row = self.registry._instance(connection, instance)
+                self.registry._token(row, token, allow_expired=True)
+                evidence, pending = self.save_evidence(connection, instance, session, deadline)
+                require(session["stop_operation"] == operation_id and session["run"] == run_id
+                        and wire.sha256(session["raw"]) == descriptor_sha256
+                        and evidence == session["save_evidence"] == pending.get("managedSave")
+                        and "gameExitInputSha256" not in pending,
+                        "STALE_OPERATION", "候補入力の正本予約/保存原文が変更されました")
+                with self.lock:
+                    require(self.sessions.get(instance) is session and session.get("game_exit_input") is selected,
+                            "STALE_OPERATION", "元候補受付が変更されました")
+                    require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補入力の記録前に期限を超過しました")
+                    selected["raw"] = raw
+                    connection.execute("UPDATE runtime_operations SET response=? WHERE id=?",
+                                       (json.dumps(dict(pending, gameExitInputSha256=result["inputSha256"])), operation_id))
+            with self.lock:
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補入力の記録後に期限を超過しました")
+                selected["event"].set()
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補入力返却前に期限を超過しました")
+                selected["accepted"] = True
+                return result
+        except BaseException as error:
+            with self.lock:
+                selected["error"] = error
+                selected["accepted"] = False
+                if not selected["event"].is_set():
+                    selected["event"].set()
+            raise
+
+    def observe_selected_game_exit(self, instance, session, deadline):
+        """選択済みstopだけ候補を待ち、確定状態と供給期限を再読込してCを一度開始する。"""
+        selected = session.get("game_exit_input")
+        if selected is None:
+            return
+        deadline = min(deadline, session["stop_deadline"], selected["deadline"])
+        binding = {"instanceId": instance, "runId": session["run"], "stopOperationId": session["stop_operation"],
+                   "descriptorSha256": wire.sha256(session["raw"])}
+        require(canonical(binding) == selected["binding"], "STALE_OPERATION", "候補を選択した元stopではありません")
+        completed = selected["event"].wait(max(0, deadline - time.monotonic()))
+        with self.lock:
+            require(self.sessions.get(instance) is session and session.get("game_exit_input") is selected,
+                    "STALE_OPERATION", "元候補受付が変更されました")
+            if "raw" in selected:
+                value = json.loads(selected["raw"])
+                deadline = min(deadline, value["deadline"])
+                session["stop_deadline"] = min(session["stop_deadline"], deadline)
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "候補入力の待機中に期限を超過しました")
+            require(completed and selected["submitted"], "CONTROL_UNKNOWN", "選択した候補入力が未確定です")
+            if selected["error"] is not None:
+                raise selected["error"]
+            require(selected.get("accepted") is True and "raw" in selected,
+                    "CONTROL_UNKNOWN", "選択した候補入力が未確定です")
+            require(canonical(dict(binding, candidate=value["candidate"], deadline=value["deadline"])) == selected["raw"],
+                    "STALE_OPERATION", "受理した候補入力が変更されました")
+        self.observe_game_exit(instance, session, value["candidate"], deadline)
+
+    def game_exit_inputs(self, instance, session, candidate, deadline):
+        """明示候補の不変原本を同stopの保存原文へ結束し、C向け欄と原bytesを返す。
+
+        candidateはworldUuid/runUuid/stateSha256/stateRevisionの固定期待値。元stop予約を
+        事前/最終の短いtxで照合し、原本I/Oはtx外で行う。currentへの追従・C生成・Data退出・Ready承認は行わない。
+        """
+        candidate = deepcopy(candidate)
+        fields(candidate, {"worldUuid", "runUuid", "stateSha256", "stateRevision"})
+        for key in ("worldUuid", "runUuid"):
+            wire._canonical_uuid(candidate[key])
+        wire._hash(candidate["stateSha256"])
+        wire._integer(candidate["stateRevision"])
+        deadline = min(deadline, session["stop_deadline"])
+        with self.runtime._lock_wait(deadline):
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                require(session["done"].is_set() and session["error"] is None,
+                        "CONTROL_UNKNOWN", "認証済保存原文が未終端です")
+                evidence, pending = self.save_evidence(connection, instance, session, deadline)
+                require(evidence == session["save_evidence"] == pending.get("managedSave"),
+                        "STALE_OPERATION", "元stopへ記録した保存原文参照が一致しません")
+                message = wire.decode_frame_v3(session["save_request"])
+                requested = wire._inner(message["payload"], "requestJson", "requestSha256")["status"]
+                previous = wire._status(requested, "ManagedSaveRequested")
+                descriptor = wire.decode_descriptor(session["raw"])
+            directory = Path(descriptor["worldRoot"]) / "sushieric/run-state"
+            path = directory / "states" / (candidate["stateSha256"] + ".json")
+            plain_path(path)
+            state_raw = regular_bytes(path)
+            require(digest(state_raw) == candidate["stateSha256"],
+                    "PROOF_MISMATCH", "明示候補の不変原本hashが一致しません")
+            state = wire._status({"sha256": candidate["stateSha256"], "state": wire._json(state_raw)}, "SavedPendingExit")
+            require(all(state[k] == candidate[k] for k in ("worldUuid", "runUuid", "stateRevision"))
+                    and all(wire._same_json(state[k], previous[k]) for k in ("worldUuid", "runUuid", "generation", "paths"))
+                    and state["stateRevision"] == previous["stateRevision"] + 1
+                    and state["previousStateSha256"] == requested["sha256"]
+                    and all(wire._same_json(state["payload"][k], previous["payload"][k]) for k in ("owner", "management")),
+                    "PROOF_MISMATCH", "元Requestedと同Mの保存候補bindingが一致しません")
+            proof_hash = state["payload"]["saveProofSha256"]
+            wire._hash(proof_hash)
+            path = directory / "saveproofs" / (proof_hash + ".json")
+            plain_path(path)
+            proof_raw = regular_bytes(path)
+            require(digest(proof_raw) == proof_hash, "PROOF_MISMATCH", "saveproof原本hashが一致しません")
+            proof = wire._json(proof_raw)
+            completion = wire.decode_frame_v3(session["completion_response"])["payload"]["completion"]
+            require(proof["sourceStateSha256"] == requested["sha256"]
+                    and all(wire._same_json(proof[k], previous[k]) for k in ("worldUuid", "runUuid", "stateRevision"))
+                    and wire._same_json(proof["owner"], previous["payload"]["owner"])
+                    and wire._same_json(proof["managementCompletion"], completion),
+                    "PROOF_MISMATCH", "saveproofと認証済Requested/COMPLETION原文が一致しません")
+            management = previous["payload"]["management"]
+            frame = {key: deepcopy(management[key]) for key in ("leaseId", "epoch", "generation", "drainSha256")}
+            frame.update(worldRoot=descriptor["worldRoot"], shopDirectory=descriptor["shopDirectory"],
+                         worldUuid=state["worldUuid"], runUuid=state["runUuid"],
+                         expectedStateSha256=candidate["stateSha256"], expectedRevision=state["stateRevision"],
+                         gameOwner=deepcopy(state["payload"]["owner"]), saveProofSha256=proof_hash,
+                         requestedStateSha256=requested["sha256"])
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                current, reserved = self.save_evidence(connection, instance, session, deadline)
+                require(current == evidence == session["save_evidence"] == reserved.get("managedSave")
+                        and reserved == pending and session["done"].is_set() and session["error"] is None,
+                        "STALE_OPERATION", "原本読取り中に元stop/保存原文が変更されました")
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "game候補入力の最終照合後に期限を超過しました")
+            return frame, state_raw, proof_raw
+
+    def observe_game_exit(self, instance, session, candidate, deadline):
+        """保持元Mと同stopの原本を単発Cへ渡す。局所観測を返し、Registry/Readyは確定しない。
+
+        呼出元は元stop予約とsessionを保持する。失敗後もslot/C/原本を残し再入口を拒否する。
+        """
+        from .offline_process import OfflineProcess
+
+        candidate = deepcopy(candidate)
+        deadline = min(deadline, session["stop_deadline"])
+        with self.lock:
+            require(self.sessions.get(instance) is session and "game_exit" not in session,
+                    "CONTROL_PENDING", "保持した同sessionでgame退出を一度だけ観測します")
+            selected = session.get("game_exit_input")
+            if selected is not None:
+                require(selected["event"].is_set() and selected["submitted"] and selected["error"] is None
+                        and selected.get("accepted") is True and "raw" in selected,
+                        "CONTROL_UNKNOWN", "選択した候補入力の確定前にCを起動しません")
+                value = json.loads(selected["raw"])
+                binding = {"instanceId": instance, "runId": session["run"], "stopOperationId": session["stop_operation"],
+                           "descriptorSha256": wire.sha256(session["raw"])}
+                require(selected["binding"] == canonical(binding)
+                        and selected["raw"] == canonical(dict(binding, candidate=candidate, deadline=value["deadline"])),
+                        "STALE_OPERATION", "観測に使う明示候補入力が変更されました")
+                deadline = min(deadline, value["deadline"])
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "供給期限後にCを起動しません")
+                session["stop_deadline"] = min(session["stop_deadline"], deadline)
+            slot = {"candidate": deepcopy(candidate)}
+            if selected is not None:
+                slot["input"] = selected["raw"]
+            session["game_exit"] = slot
+        with self.runtime._lock_wait(deadline):
+            inputs = self.game_exit_inputs(instance, session, candidate, deadline)
+            stop = tuple(session[k] for k in ("stop_operation", "stop_fingerprint", "control_operation"))
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                row = dict(self.registry._instance(connection, instance))
+                run = json.loads(connection.execute("SELECT record FROM runs WHERE id=?", (session["run"],)).fetchone()[0])
+                process, snapshot = self.runtime._game_process(run)
+            fixed = canonical(snapshot)
+            slot.update(inputs=deepcopy(inputs), stop=stop, process=process, snapshot=fixed)
+            generation = self.runtime._active_generation(row)
+            bundle = generation / "runtime"
+            manifest = verify_bundle(bundle)
+            require(manifest["artifactId"] == row["artifact"], "ARTIFACT_MISMATCH", "元runの固定artifactが一致しません")
+            require_data_generation(manifest, row["generation"])
+
+            def verify():
+                with self.lock:
+                    require(self.sessions.get(instance) is session and session.get("game_exit") is slot,
+                            "STALE_OPERATION", "元game退出slotが変更されました")
+                require(tuple(session[k] for k in ("stop_operation", "stop_fingerprint", "control_operation")) == stop,
+                        "STALE_OPERATION", "元stopの操作識別が変更されました")
+                require(self.game_exit_inputs(instance, session, candidate, deadline) == inputs,
+                        "STALE_OPERATION", "固定した候補/保存原文が変更されました")
+                with self.runtime._transaction(instance, read_only=True) as connection:
+                    current = json.loads(connection.execute("SELECT record FROM runs WHERE id=?", (session["run"],)).fetchone()[0])
+                    held, born = self.runtime._game_process(current)
+                require(held is process and canonical(born) == fixed
+                        and slot["process"] is process and slot["snapshot"] == fixed
+                        and slot["inputs"] == inputs and slot["stop"] == stop and slot["candidate"] == candidate,
+                        "PROCESS_MISMATCH", "元Mの保持object/生成snapshotが変更されました")
+                require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出接続の照合期限を超過しました")
+
+            verify()
+            observer = OfflineProcess(bundle, self.runtime._paths(instance) / "diagnostics" / ("game-exit-" + stop[0]),
+                                      native=self.transport.native, verify=verify, process_adapter=self.runtime.process_adapter)
+            slot["observer"] = observer
+            frame = deepcopy(inputs[0])
+            frame.update(operationId=stop[0], requestHash=digest(canonical({"command": "observe-game-exit",
+                         "stopFingerprint": stop[1], "inputs": inputs[0]})))
+            result = observer.observe_game_exit(frame, game_process=process, game_identity=snapshot["run"]["identity"],
+                                               game_group=snapshot["run"]["creation"]["ownerGroup"], deadline=deadline)
+            verify()
+            require(observer.game_exit_result == canonical(result), "STALE_OPERATION", "観測Cの局所原本が一致しません")
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出接続の最終照合後に期限を超過しました")
+            slot.update(observer_process=observer.process, observer_snapshot=canonical(observer.record), frame=canonical(frame))
+            slot["result"] = canonical(result)
+            require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出局所結果の保持後に期限を超過しました")
+            return deepcopy(result)
+
+    def game_exit_evidence(self, instance, session, deadline):
+        """元M/Cの保持証拠を停止結果のhash参照へ束縛する。
+
+        最終確定時は同txのsave_evidenceで正本/原文も照合する。
+        OS/file/IPC作用は行わない。Ready承認・CLOSED・handle解放は含めない。
+        """
+        deadline = min(deadline, session["stop_deadline"])
+        with self.lock:
+            require(self.sessions.get(instance) is session, "STALE_OPERATION", "元game退出sessionがありません")
+            slot = session["game_exit"]
+        require("result" in slot and session["done"].is_set() and session["error"] is None,
+                "CONTROL_UNKNOWN", "開始済みgame退出観測が未確定です")
+        require(tuple(session[k] for k in ("stop_operation", "stop_fingerprint", "control_operation")) == slot["stop"],
+                "STALE_OPERATION", "game退出の元stopが変更されました")
+        snapshot = json.loads(slot["snapshot"])
+        process, current = self.runtime._game_process(snapshot["run"])
+        require(process is slot["process"] and canonical(current) == slot["snapshot"],
+                "PROCESS_MISMATCH", "game退出の元Mが変更されました")
+        observer = slot["observer"]
+        require(observer.process is slot["observer_process"] and canonical(observer.record) == slot["observer_snapshot"],
+                "PROCESS_MISMATCH", "観測Cの保持object/recordが変更されました")
+        result = json.loads(slot["result"])
+        frame = json.loads(slot["frame"])
+        request = json.loads(observer.request)
+        candidate = slot["candidate"]
+        selected = session.get("game_exit_input")
+        if selected is not None or "input" in slot:
+            require(selected is not None and selected["error"] is None and selected["submitted"]
+                    and selected.get("accepted") is True and selected.get("raw") == slot.get("input"),
+                    "STALE_OPERATION", "観測に使った明示候補入力が変更されました")
+            value = json.loads(slot["input"])
+            binding = {"instanceId": instance, "runId": session["run"], "stopOperationId": session["stop_operation"],
+                       "descriptorSha256": wire.sha256(session["raw"])}
+            require(selected["binding"] == canonical(binding)
+                    and slot["input"] == canonical(dict(binding, candidate=candidate, deadline=value["deadline"])),
+                    "STALE_OPERATION", "観測に使った明示候補入力が変更されました")
+            deadline = min(deadline, value["deadline"])
+        require(observer.game_exit_result == slot["result"] and observer.record["gameExit"] == result
+                and canonical(observer.game_exit_frame) == slot["frame"]
+                and all(frame[k] == v for k,v in slot["inputs"][0].items())
+                and all(request[k] == v for k,v in frame.items())
+                and frame["operationId"] == session["stop_operation"] == result["operationId"]
+                and frame["expectedStateSha256"] == candidate["stateSha256"]
+                and frame["expectedRevision"] == candidate["stateRevision"]
+                and digest(slot["inputs"][1]) == candidate["stateSha256"]
+                and digest(slot["inputs"][2]) == frame["saveProofSha256"]
+                and all(frame[k] == candidate[k] for k in ("worldUuid", "runUuid"))
+                and result["requestSha256"] == digest(observer.request)
+                and result["responseSha256"] == digest(observer.game_exit_response),
+                "STALE_OPERATION", "同候補の観測C要求/応答/結果が一致しません")
+        require(result["status"] == "GAME_EXIT_OBSERVED" and type(result["exitCode"]) is int
+                and result["exitCode"] == 0 and result["allChildrenExited"] is True
+                and result["gameOwner"] == frame["gameOwner"] == snapshot["owner"]
+                and result["gameGroup"] == process.group
+                and observer.record["identity"] == observer.identity
+                and observer.record["controlIdentity"] == observer.data_identity == result["observer"] == request["owner"]
+                and observer.process.pid == observer.identity["pid"] == observer.data_identity["pid"] == observer.record["creation"]["pid"]
+                and observer.process.group == observer.record["creation"]["ownerGroup"] == result["observerGroup"]
+                and observer.process.group != process.group,
+                "PROCESS_MISMATCH", "元M/観測Cの正常終了bindingが一致しません")
+        require(time.monotonic() < deadline, "STOP_TIMEOUT", "game退出証拠の最終照合後に期限を超過しました")
+        return {"candidate": deepcopy(candidate), "observationSha256": digest(slot["result"]),
+                "requestSha256": result["requestSha256"], "responseSha256": result["responseSha256"],
+                "observerRecordSha256": digest(slot["observer_snapshot"])}
+
+    def release(self, instance, run_id):
+        with self.lock:
+            session = self.sessions[instance]
+            require(session["run"] == run_id and session["done"].is_set() and session["error"] is None,
+                    "CONTROL_UNKNOWN", "未終端control slotを解放しません")
+            if "game_exit" in session:
+                self.runtime._remember_game_exit(instance, session)
+            self.sessions.pop(instance)
+            self.startup.sessions.pop(instance)
+
+    @staticmethod
+    def reply(request, phase, payload):
+        message = wire.decode_frame_v3(request)
+        body = canonical(dict(message, type="response", phase=phase,
+                              payload={"requestBodySha256": wire.sha256(request[4:]), **payload}))
+        reply = struct.pack(">I", len(body)) + body
+        wire.correlate_response_v3(request, reply)
+        return reply
+
+    def reserve_stop(self, instance, session):
+        with self.runtime._lock_wait(time.monotonic() + 30), self.runtime._transaction(instance) as connection:
+            row = self.registry._instance(connection, instance)
+            gate = _admission(connection, row)
+            require(row["run_id"] == session["run"] and gate["descriptor_hash"] == wire.sha256(session["raw"]),
+                    "STALE_RUN", "別runへ停止要求を適用しません")
+            if row["state"] == "STOPPING":
+                require(row["pending"] and gate["gate"] == "BLOCKED", "CONTROL_BLOCKED", "停止予約が一致しません")
+                return
+            require(row["state"] == "RUNNING" and not row["pending"] and gate["gate"] == "OPEN",
+                    "CONTROL_BLOCKED", "稼働中の元runだけを停止します")
+            _change(connection, row, gate["revision"], "BLOCKED")
+            connection.execute("UPDATE instances SET state='STOPPING',pending=1 WHERE id=?", (instance,))
+
+    def drain(self, instance, session, deadline):
+        require(session["drain_lock"].acquire(timeout=max(0, deadline - time.monotonic())),
+                "WRITER_PENDING", "同runのdrainが未完了です")
+        try:
+            with self.runtime._lock_wait(deadline):
+                self._drain(instance, session, deadline)
+        finally:
+            session["drain_lock"].release()
+
+    def _drain(self, instance, session, deadline):
+        while True:
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                row = self.registry._instance(connection, instance)
+                require(row["run_id"] == session["run"], "STALE_RUN", "drain中にrunが変更されました")
+                claims = connection.execute("SELECT 1 FROM reservations WHERE instance=? AND reference LIKE 'writer-call:%'", (instance,)).fetchone()
+                sessions = [dict(value) for value in connection.execute("SELECT * FROM writer_sessions WHERE instance=? AND run=? AND status!='CLOSED'", (instance, session["run"]))]
+            require(time.monotonic() < deadline, "WRITER_PENDING", "writer drain期限を超過しました")
+            if claims:
+                time.sleep(0.01)
+                continue
+            if not sessions:
+                return
+            for writer in sessions:
+                payload = dict(session["token"], sessionId=writer["id"], runId=session["run"],
+                               nonce=writer["nonce"], drained=True, disconnected=True)
+                require(writer["id"] in self.registry.writer.database_proxies,
+                        "WRITER_PENDING", "外部writerのdrain/終了証拠がありません")
+                operation = session["close_ids"].setdefault(writer["id"], uuid.uuid4().hex)
+                fingerprint = digest(canonical({"command": "writer-close", "payload": payload}))
+                try:
+                    result = self.registry.writer._database_close(payload, operation, fingerprint, False, deadline=deadline)
+                except RegistryError as error:
+                    with self.runtime._transaction(instance, read_only=True) as connection:
+                        accepted = connection.execute("SELECT 1 FROM writer_operations WHERE id=?", (operation,)).fetchone()
+                        competing = connection.execute("SELECT 1 FROM reservations WHERE instance=? AND reference LIKE 'writer-call:%'", (instance,)).fetchone()
+                    if error.code == "WRITER_PENDING" and accepted is None and competing:
+                        break
+                    raise
+                require(result.get("closed") is True, "WRITER_PENDING", "proxy/child終了が未確認です")
+
+    def snapshot(self, connection, instance, session):
+        row = self.registry._instance(connection, instance)
+        gate = _admission(connection, row)
+        require(row["run_id"] == session["run"] and row["state"] == "STOPPING" and row["pending"]
+                and gate["gate"] == "BLOCKED" and not row["writers"] and not row["children"],
+                "WRITER_PENDING", "同runの閉門・全writer/child終了が未確認です")
+        require(not connection.execute("SELECT 1 FROM reservations WHERE instance=? AND reference LIKE 'writer-call:%'", (instance,)).fetchone(),
+                "WRITER_PENDING", "writer callが残っています")
+        writers = _closed_writers(connection, instance, session["run"])
+        return row, gate, writers

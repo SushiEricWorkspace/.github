@@ -37,12 +37,15 @@ def dispatch(registry: Registry, message: dict) -> dict:
             instance = identifier(payload["instanceId"], "instanceId")
             if instance not in {row["instanceId"] for row in registry.inventory["instances"]}:
                 raise RegistryError("NOT_FOUND", "instanceが登録されていません")
-            with private_lock(registry.root / "manager" / "locks" / f"instance-{instance}.lock"):
-                if command in {"prepare", "template-init", "import", "restore", "reset", "recover", "snapshot"}:
-                    with private_lock(registry.root / "manager" / "locks" / "deployment.lock"):
+            if command in {"start", "stop", "writer-open", "writer-io", "writer-check", "writer-close"}:
+                result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
+            else:
+                with private_lock(registry.root / "manager" / "locks" / f"instance-{instance}.lock"):
+                    if command in {"prepare", "template-init", "import", "restore", "reset", "recover", "snapshot"}:
+                        with private_lock(registry.root / "manager" / "locks" / "deployment.lock"):
+                            result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
+                    else:
                         result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
-                else:
-                    result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
         else:
             result = registry.execute(command, payload, operation_id=operation_id, dry_run=message["dryRun"])
         return {"ok": True, "operationId": operation_id, "result": result}
@@ -59,9 +62,14 @@ def dispatch(registry: Registry, message: dict) -> dict:
         return {"ok": False, "operationId": operation_id, "error": {"code": "INVALID_STATE", "message": "入力・権限・実体の検証に失敗しました"}}
 
 
-def supervise(root: Path) -> None:
+def supervise(root: Path, *, approval_file=None, approval_sha256=None) -> None:
     """singleton OS lockを全期間保持する。再起動で不明枠を再貸出ししない。"""
     registry = Registry(root)
+    if approval_file is not None:
+        from .mod_control_runtime import ManagedRuntime, approved_input
+        raw, approvals = approved_input(approval_file, approval_sha256, root, registry.inventory)
+        registry.runtime.managed = ManagedRuntime(registry.runtime, approvals)
+        registry.runtime.managed.approval_raw = raw
     with private_lock(root / "manager" / "locks" / "supervisor.lock"):
         with listener(root) as server:
             boot = registry.begin_supervision()

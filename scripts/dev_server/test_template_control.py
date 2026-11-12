@@ -126,9 +126,9 @@ class TemplateTests(unittest.TestCase):
         self.report("persistent-01", "create", self.generation)
         self.command("snapshot", dict(self.token, action="candidate", snapshotId="candidate-01", sourceSnapshotId="snapshot-01"), "candidate-01")
         self.other = self.acquire("persistent-02", "acquire-other")
-        self.command("restore", dict(self.other, artifactId=self.artifact, generationId="restored-01", acceptEula=True, snapshotId="candidate-01"), "restore-other")
-        self.other["expectedGeneration"] = "restored-01"
-        self.restored = self.root / "instances/persistent-02/generations/restored-01"
+        self.command("restore", dict(self.other, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000012", acceptEula=True, snapshotId="candidate-01"), "restore-other")
+        self.other["expectedGeneration"] = "00000000-0000-4000-8000-000000000012"
+        self.restored = self.root / "instances/persistent-02/generations/00000000-0000-4000-8000-000000000012"
         self.command("start", dict(self.other, timeoutSeconds=2), "start-other")
         self.report("persistent-02", "verify", self.restored)
         self.command("stop", dict(self.other, timeoutSeconds=2), "stop-other")
@@ -164,9 +164,9 @@ class TemplateTests(unittest.TestCase):
         request = json.loads((self.root / "manager/operations/template-promote-01/requested.json").read_bytes())
         self.assertEqual("codex-test", request["owner"])
         self.assert_code("EXISTING_DATA", lambda: self.promote("another-promote"))
-        payload = dict(self.other, artifactId=self.artifact, generationId="reset-01", templateId="smoke-v1", acceptEula=True)
+        payload = dict(self.other, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000013", templateId="smoke-v1", acceptEula=True)
         self.command("reset", payload, "reset-template")
-        target = self.root / "instances/persistent-02/generations/reset-01"
+        target = self.root / "instances/persistent-02/generations/00000000-0000-4000-8000-000000000013"
         self.assertEqual((self.restored / self.fixture_names[0]).read_bytes(), (target / self.fixture_names[0]).read_bytes())
         self.assertEqual(original, (self.destination / "manifest.json").read_bytes())
         self.assertEqual(candidate, (self.root / "snapshots/candidate-01/manifest.json").read_bytes())

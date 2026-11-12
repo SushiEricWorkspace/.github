@@ -30,7 +30,7 @@ class FakeProcess:
         self.pid = self.group = None
         self.stage = "NOT_CREATED"
 
-    def start(self, arguments, cwd, log, nonce, created):
+    def start(self, arguments, cwd, log, nonce, created, *, environment=None):
         adapter = self.adapter
         self.pid = adapter.next_pid
         self.group = nonce
@@ -39,6 +39,7 @@ class FakeProcess:
         self.exit_code = None
         self.children = []
         self.closed = False
+        self.environment = environment
         values = [json.loads(line) for line in Path(arguments[1][1:]).read_text().splitlines()]
         self.props = dict(value.removeprefix("-Dsushieric.managed.").split("=", 1)
                           for value in values if value.startswith("-Dsushieric.managed."))
@@ -124,6 +125,51 @@ class FakeAdapter:
         return result
 
 
+class FakeManaged:
+    """既存runtime試験の通信境界。wire/native自体は専用試験で検証する。"""
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.sessions = {}
+        self.transport = SimpleNamespace(native=SimpleNamespace(transport='windows-pipe', host_boot=lambda: ('a' * 64, 'native-boot')))
+
+    def approved(self, row, generation):
+        pass
+
+    def prepare(self, row, run, generation):
+        from .runtime_bundle import _expand_managed_launch
+        leaf = self.runtime.registry.root / 'manager/control' / run['runId']
+        leaf.mkdir(parents=True)
+        make_private(leaf, directory=True)
+        launch = dict(bundle=str(generation / 'runtime'), run=str(generation), auxiliary=str(leaf / 'auxiliary'),
+                      privateTmp=str(leaf / 'private-tmp'), controlDescriptor=str(leaf / 'mod-control.json'),
+                      controlDescriptorSha256='a' * 64, runtimeManifest=str(generation / 'runtime/runtime.json'),
+                      proofPath=run['proofPath'], instanceId=row['id'], generationId=row['generation'], startNonce=run['nonce'])
+        profile = json.loads((generation / 'runtime/launch/managed-server-candidate.json').read_bytes())
+        session = dict(launch=launch, observed=_expand_managed_launch(profile, launch),
+                       stop=threading.Event(), done=threading.Event(), error=None)
+        session['done'].set()
+        self.sessions[row['id']] = session
+        return session
+
+    def handshake(self, token, run, session, deadline):
+        pass
+
+    def ready(self, row, connection):
+        pass
+
+    def listen(self, instance):
+        pass
+
+    def drain(self, instance, session, deadline):
+        with self.runtime._transaction(instance, read_only=True) as connection:
+            pending = connection.execute("SELECT 1 FROM writer_sessions WHERE instance=? AND pending!=0", (instance,)).fetchone()
+            claim = connection.execute("SELECT 1 FROM reservations WHERE instance=? AND reference LIKE 'writer-call:%'", (instance,)).fetchone()
+            if pending or claim:
+                raise RegistryError("WRITER_PENDING", "合成drainも未確定writerを成功化しません")
+
+    def release(self, instance, run):
+        self.sessions.pop(instance)
+
 @unittest.skipUnless(sys.platform in ("darwin", "win32"), "対象OSのprivate rootを使う試験")
 class RuntimeControlTests(RegistryFixture, unittest.TestCase):
     quota_bytes = 10000000
@@ -133,14 +179,19 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.bundle_fixture = bundle_tests.RuntimeBundleTests("test_launch_has_no_source_cache_or_gradle_dependency")
         self.bundle_fixture.setUp()
         self.addCleanup(self.bundle_fixture.doCleanups)
-        source = (bundle_tests.saved_v1_bundle(self.bundle_fixture.store)
-                  if getattr(self, "bundle_version", 2) == 1 else self.bundle_fixture.freeze())
+        if getattr(self, "bundle_version", 2) == 1:
+            source = bundle_tests.saved_v1_bundle(self.bundle_fixture.store)
+        else:
+            _, _, candidate = self.bundle_fixture.managed_candidate()
+            source = self.bundle_fixture.freeze_managed(candidate)
         self.artifact = source.name
         shutil.copytree(source, self.root / "artifacts" / self.artifact)
         self.adapter = FakeAdapter(self.inventory)
         self.registry.runtime = RuntimeControl(self.registry, process_adapter=self.adapter)
+        self.registry.runtime.managed = FakeManaged(self.registry.runtime)
         self.token = self.acquire()
-        self.prepare_payload = dict(self.token, artifactId=self.artifact, generationId="generation-01", seed=17, acceptEula=True)
+        self.prepare_payload = dict(self.token, artifactId=self.artifact, generationId=("generation-01" if getattr(self, "bundle_version", 2) == 1
+                                                                 else "00000000-0000-4000-8000-000000000001"), seed=17, acceptEula=True)
         self.stop_fault = None
         self.rcon_calls = 0
         self.rcon = patch("dev_server.runtime_control.runtime_rcon.stop", side_effect=self.rcon_stop)
@@ -163,7 +214,7 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
     def prepare(self):
         result = self.command("prepare", self.prepare_payload, "prepare-01")
         self.token["expectedGeneration"] = result["generation"]
-        return self.root / "instances/persistent-01/generations/generation-01"
+        return self.root / "instances/persistent-01/generations" / self.prepare_payload["generationId"]
 
     def start(self, operation="start-01"):
         return self.command("start", dict(self.token, timeoutSeconds=2), operation)
@@ -174,6 +225,64 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
     def state(self):
         with self.registry.transaction(read_only=True) as connection:
             return dict(connection.execute("SELECT * FROM instances WHERE id='persistent-01'").fetchone())
+
+    def test_start_io_releases_locks_and_same_request_never_respawns(self):
+        from .supervisor import private_lock
+        self.prepare()
+        entered, finish = threading.Event(), threading.Event()
+        from .runtime_bundle import launch_command
+        def launch(*args, **kwargs):
+            entered.set()
+            self.assertTrue(finish.wait(5))
+            return launch_command(*args, **kwargs)
+        with patch("dev_server.runtime_control.launch_command", side_effect=launch), ThreadPoolExecutor() as workers:
+            future = workers.submit(self.start)
+            try:
+                self.assertTrue(entered.wait(5))
+                with private_lock(self.root / "manager/locks/instance-persistent-01.lock"):
+                    with self.registry.transaction(read_only=True) as connection:
+                        self.assertEqual("STARTING", connection.execute("SELECT state FROM instances WHERE id='persistent-01'").fetchone()[0])
+                self.assert_code("RECOVERY_REQUIRED", self.start)
+                self.assertEqual([], self.adapter.created)
+            finally:
+                finish.set()
+            self.assertTrue(future.result()["running"])
+        self.assertEqual(1, len(self.adapter.created))
+
+    def test_run_record_cas_preserves_competing_stop_record(self):
+        self.prepare()
+        self.start()
+        original_stop = self.rcon_stop
+        def stop(*args, **kwargs):
+            original_stop(*args, **kwargs)
+            with self.registry.transaction() as connection:
+                row = connection.execute("SELECT id,record FROM runs").fetchone()
+                record = json.loads(row["record"])
+                record["competingRecord"] = True
+                connection.execute("UPDATE runs SET record=? WHERE id=?", (json.dumps(record), row["id"]))
+        with patch("dev_server.runtime_control.runtime_rcon.stop", side_effect=stop):
+            self.assert_code("STALE_OPERATION", self.stop)
+        run = self.registry.runtime._load_run(self.state())
+        self.assertTrue(run["competingRecord"])
+        self.assertNotIn("stopAcknowledged", run)
+        self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
+
+    def test_start_result_does_not_overwrite_changed_run_binding(self):
+        from .runtime_control import write_json
+        self.prepare()
+        def save(path, value):
+            write_json(path, value)
+            if path.name == "startup-proof.json":
+                with self.registry.transaction() as connection:
+                    connection.execute("UPDATE instances SET run_id='newer-run' WHERE id='persistent-01'")
+        with patch("dev_server.runtime_control.write_json", side_effect=save):
+            self.assert_code("STALE_OPERATION", self.start)
+        state = self.state()
+        self.assertEqual(("newer-run", "STARTING", 1), (state["run_id"], state["state"], state["pending"]))
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual("PENDING", connection.execute("SELECT status FROM runtime_operations WHERE id='start-01'").fetchone()[0])
+        self.assertEqual(1, len(self.adapter.created))
+        self.assertEqual(0, self.rcon_calls)
 
     def test_prepare_start_stop_replay_restart_and_no_snapshot_clean(self):
         generation = self.prepare()
@@ -199,6 +308,160 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.assertTrue(self.command("release", self.token, "release-prepared")["released"])
         self.token = self.acquire(operation="acquire-next-owner")
         self.assert_code("INVALID_STATE", lambda: self.start("start-next-owner"))
+
+    def test_stopping_proof_keeps_existing_database_drain_on_management_listener(self):
+        self.prepare()
+        self.start()
+        runtime = self.registry.runtime
+        process = self.adapter.created[0]
+        with runtime._transaction(self.token["instanceId"]) as connection:
+            connection.execute("UPDATE instances SET state='STOPPING',pending=1")
+            connection.execute("UPDATE run_admission SET gate='BLOCKED',revision=revision+1")
+        process.proof["phase"] = "STOPPING"
+        process.save_proof()
+        self.adapter.socket_fault = lambda sockets: sockets.__setitem__(slice(None), [process.endpoints["management"]])
+        runtime._running(self.state(), closing=True)
+        self.assert_code("PROOF_MISMATCH", lambda: runtime._running(self.state()))
+        self.adapter.socket_fault = lambda sockets: sockets.clear()
+        self.assert_code("LISTENER_MISMATCH", lambda: runtime._running(self.state(), closing=True))
+
+    def test_direct_stop_can_confirm_owned_exit_that_precedes_observer(self):
+        self.prepare()
+        started = self.start()
+        runtime = self.registry.runtime
+        session = runtime.managed.sessions[self.token["instanceId"]]
+        session.update(run=started["runId"], raw=b"held-descriptor", token=self.token.copy())
+        session["stop"].set()
+        with runtime._transaction(self.token["instanceId"]) as connection:
+            connection.execute("UPDATE instances SET state='STOPPING',pending=1")
+            connection.execute("UPDATE run_admission SET gate='BLOCKED',revision=revision+1")
+        process = self.adapter.created[0]
+        process.stopped_proof()
+        process.exit_code = 0
+        runtime._direct_stop(self.token["instanceId"], session)
+        self.assertEqual("LEASED_STOPPED", self.state()["state"])
+        self.assertFalse(self.state()["pending"])
+        self.assertTrue(process.closed)
+        self.assertEqual(0, self.rcon_calls)
+        self.assertNotIn(started["runId"], runtime.processes)
+
+    def test_expired_stop_preserves_lease_and_replay_then_explicit_recover_renews(self):
+        self.prepare()
+        self.start()
+        before = self.state()
+        self.now = before["expires"]
+        dry = self.command("stop", dict(self.token, timeoutSeconds=2), "stop-dry", True)
+        self.assertTrue(dry["dryRun"])
+        self.assertEqual("RUNNING", self.state()["state"])
+        self.assertEqual(0, self.rcon_calls)
+        result = self.stop()
+        self.assertTrue(result["jvmAndChildrenExited"])
+        self.assertTrue(result["modSaveCompleted"])
+        after = self.state()
+        self.assertEqual("LEASED_STOPPED", after["state"])
+        for key in ("expires", "owner", "lease", "epoch", "generation"):
+            self.assertEqual(before[key], after[key], key)
+        self.assertTrue(self.stop()["replayed"])
+        self.assertEqual(1, self.rcon_calls)
+        for command, payload in (("start", dict(self.token, timeoutSeconds=2)),
+                                 ("renew", dict(self.token, ttlSeconds=60)), ("release", self.token)):
+            with self.subTest(command=command):
+                self.assert_code("LEASE_EXPIRED", lambda: self.command(command, payload, command + "-expired"))
+        recovered = self.command("recover", dict(self.token, action="resume", targetOperationId=None, ttlSeconds=60), "recover-expired")
+        self.assertTrue(recovered["recovered"])
+        self.assertEqual(self.now + 60, self.state()["expires"])
+        self.assertEqual(before["epoch"], self.state()["epoch"])
+        self.assertEqual(before["owner"], self.state()["owner"])
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM endpoint_reservations").fetchone()[0])
+        self.start("next-start")
+        self.assert_code("STALE_OPERATION", self.stop)
+        self.assertEqual(1, self.rcon_calls)
+        self.stop("next-stop")
+
+    def test_stop_can_cross_expiration_before_registration_and_during_shutdown(self):
+        self.prepare()
+        self.start()
+        expires = self.state()["expires"]
+        original = self.registry.runtime._active
+        def expire_after_initial_check(row):
+            result = original(row)
+            self.now = expires
+            return result
+        self.stop_fault = lambda process: setattr(self, "now", expires + 1)
+        with patch.object(self.registry.runtime, "_active", side_effect=expire_after_initial_check):
+            self.stop()
+        self.assertEqual("LEASED_STOPPED", self.state()["state"])
+        self.assertEqual(expires, self.state()["expires"])
+        self.assertTrue(self.state()["runtime_proof"])
+
+    def test_expired_stop_rejects_stale_tokens_without_operation_or_rcon(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        for key, value, code in (("leaseId", "old", "STALE_LEASE"), ("epoch", 0, "STALE_LEASE"),
+                                 ("expectedGeneration", "old", "STALE_GENERATION")):
+            with self.subTest(key=key):
+                self.assert_code(code, lambda: self.command("stop", dict(self.token, timeoutSeconds=2, **{key: value}), "stale-" + key.lower()))
+        self.assertEqual(0, self.rcon_calls)
+        self.assertEqual("RUNNING", self.state()["state"])
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM runtime_operations WHERE command='stop'").fetchone()[0])
+
+    def test_expired_stop_identity_mismatch_requires_recovery(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        self.adapter.identity_fault = lambda identity: identity.update(bootId="different-boot")
+        self.assert_code("RECOVERY_REQUIRED", self.stop)
+        self.assertEqual(0, self.rcon_calls)
+        self.assertIsNone(self.adapter.created[0].poll())
+        self.assertFalse(self.adapter.created[0].closed)
+
+    def test_expired_stop_socket_mismatch_does_not_send_rcon(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        self.adapter.socket_fault = lambda values: values.clear()
+        self.assert_code("RECOVERY_REQUIRED", self.stop)
+        self.assertEqual(0, self.rcon_calls)
+        self.assertIsNone(self.adapter.created[0].poll())
+        self.assertFalse(self.adapter.created[0].closed)
+
+    def test_expired_stop_save_failure_keeps_recovery_and_no_success_proof(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        def failed(process):
+            process.proof["saves"]["results"]["player-data"] = False
+            process.save_proof()
+        self.stop_fault = failed
+        self.assert_code("SAVE_FAILED", self.stop)
+        self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
+        self.assertIsNone(self.state()["runtime_proof"])
+        with self.registry.transaction(read_only=True) as connection:
+            operation = connection.execute("SELECT status FROM runtime_operations WHERE id='stop-01'").fetchone()
+            self.assertEqual("RECOVERY_REQUIRED", operation[0])
+            self.assertEqual(1, connection.execute("SELECT count(*) FROM reservations WHERE operation='stop-01'").fetchone()[0])
+
+    def test_expired_stop_child_timeout_preserves_owned_group_and_reservations(self):
+        self.prepare()
+        self.start()
+        self.now = self.state()["expires"]
+        self.stop_fault = lambda process: process.children.append(22001)
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with patch("dev_server.runtime_control.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("dev_server.runtime_control.time.sleep", side_effect=advance):
+            self.assert_code("STOP_TIMEOUT", self.stop)
+        self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
+        self.assertFalse(self.adapter.created[0].closed)
+        self.assertFalse(self.registry.runtime._load_run(self.state())["jvmAndChildrenExited"])
+        with self.registry.transaction(read_only=True) as connection:
+            self.assertEqual(3, connection.execute("SELECT count(*) FROM endpoint_reservations").fetchone()[0])
 
     def test_prepare_preserves_existing_data_and_requires_empty_slot(self):
         root = self.root / "instances/persistent-01"
@@ -252,24 +515,24 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.adapter.start_fault = lambda process: process.proof.update(startNonce="previous-run")
         self.assert_code("PROOF_MISMATCH", self.start)
         self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
-        self.assertEqual(1, self.rcon_calls)
-        self.assertTrue(self.adapter.created[0].closed)
+        self.assertEqual(0, self.rcon_calls)
+        self.assertFalse(self.adapter.created[0].closed)
         with self.registry.transaction(read_only=True) as connection:
-            self.assertEqual(0, connection.execute("SELECT count(*) FROM endpoint_reservations").fetchone()[0])
+            self.assertEqual(3, connection.execute("SELECT count(*) FROM endpoint_reservations").fetchone()[0])
 
     def test_effective_root_mismatch_is_not_running(self):
         self.prepare()
         self.adapter.start_fault = lambda process: process.proof["startup"]["roots"].update(world=str(self.root / "wrong-world"))
         self.assert_code("ROOT_MISMATCH", self.start)
         self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
-        self.assertEqual(1, self.rcon_calls)
+        self.assertEqual(0, self.rcon_calls)
 
     def test_management_bind_failure_is_not_running(self):
         self.prepare()
         self.adapter.start_fault = lambda process: process.proof["startup"].update(ready=False, managementStarted=False)
         self.assert_code("START_REJECTED", self.start)
         self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
-        self.assertEqual(1, self.rcon_calls)
+        self.assertEqual(0, self.rcon_calls)
 
     def test_runtime_hash_mismatch_is_not_running(self):
         self.prepare()
@@ -379,21 +642,21 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.prepare()
         record = self.registry.runtime._record
         failed = []
-        def fail_once(run):
+        def fail_once(run, **kwargs):
             if run.get("creation") and not failed:
                 failed.append(True)
                 raise OSError("作成記録DB失敗")
-            record(run)
+            return record(run, **kwargs)
         with patch.object(self.registry.runtime, "_record", side_effect=fail_once):
             self.assert_creation_preserved("CREATED")
 
     def test_persistent_creation_db_failure_keeps_memory_owner_and_reservations(self):
         self.prepare()
         record = self.registry.runtime._record
-        def fail(run):
+        def fail(run, **kwargs):
             if run.get("creation"):
                 raise OSError("作成記録DB継続失敗")
-            record(run)
+            return record(run, **kwargs)
         with patch.object(self.registry.runtime, "_record", side_effect=fail):
             self.assert_code("RUNTIME_FAILED", self.start)
         run = self.registry.runtime._load_run(self.state())
@@ -415,13 +678,13 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.adapter.creation_fault = fail
         self.assert_creation_preserved("VERIFIED")
 
-    def test_start_timeout_stops_only_identified_owned_rcon(self):
+    def test_start_timeout_preserves_owned_process_and_original_reservations(self):
         self.prepare()
         self.adapter.start_fault = lambda process: process.proof.update(phase="INITIALIZING")
         with patch("dev_server.runtime_control.time.monotonic", side_effect=[0, 3, 3]):
             self.assert_code("START_TIMEOUT", self.start)
-        self.assertEqual(1, self.rcon_calls)
-        self.assertTrue(self.adapter.created[0].closed)
+        self.assertEqual(0, self.rcon_calls)
+        self.assertFalse(self.adapter.created[0].closed)
         self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
 
     def test_crash_does_not_replay_fake_running(self):
@@ -504,7 +767,13 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
         self.prepare()
         self.start()
         self.stop_fault = lambda process: process.children.append(22001)
-        with patch("dev_server.runtime_control.time.monotonic", side_effect=[0, 3]):
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with patch("dev_server.runtime_control.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("dev_server.runtime_control.time.sleep", side_effect=advance):
             self.assert_code("STOP_TIMEOUT", self.stop)
         self.assertFalse(self.adapter.created[0].closed)
         self.assertEqual("RECOVERY_REQUIRED", self.state()["state"])
@@ -549,7 +818,7 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
                 busy = dispatch(self.registry, new_request("prepare", self.prepare_payload, operation_id="prepare-other"))
                 self.assertEqual("LOCK_BUSY", busy["error"]["code"])
                 second_token = self.acquire("persistent-02", "acquire-second-slot")
-                second = dict(second_token, artifactId=self.artifact, generationId="generation-02", seed=17, acceptEula=True)
+                second = dict(second_token, artifactId=self.artifact, generationId="00000000-0000-4000-8000-000000000002", seed=17, acceptEula=True)
                 competing = dispatch(self.registry, new_request("prepare", second, operation_id="prepare-second-slot"))
                 self.assertEqual("LOCK_BUSY", competing["error"]["code"])
                 self.assertEqual("BUSY", dispatch(self.registry, new_request("shutdown", {}))["error"]["code"])

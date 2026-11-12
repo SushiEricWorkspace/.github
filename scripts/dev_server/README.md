@@ -8,6 +8,7 @@
 管理接続の固定設定・短命の貸出引継ぎは[接続プロファイルガイド](connection-profile-guide.md)を参照してください。
 別PCからの開発用接続と切断証跡は[SSH仲介ガイド](ssh-guide.md)を参照してください。
 Managerの管理接続と終了証明は[管理writerガイド](writer-guide.md)を参照してください。
+Mod専用controlの先行wire・検証境界は[wireガイド](mod-control-guide.md)を参照してください。
 正常停止した全データの保存・完全性検証は[snapshotガイド](snapshot-guide.md)を参照してください。
 世代の構築・restore/reset・障害復旧は[世代ガイド](generation-guide.md)を参照してください。
 固定fixtureの生成・独立検証・明示昇格は[テンプレートガイド](template-guide.md)を参照してください。
@@ -60,3 +61,5 @@ prepare/template-init/import/restore/resetの世代構築、固定fixtureの検�
 契約テストの成功だけでこれらの実試験や停電耐性を証明しません。
 運用の初期対象はmacOS 15とWindows、Python 3.12/JDK 21です。
 各OSのnative IPC・lock試験と運用適合試験を分け、片方の成功をもう片方の証明にしません。
+
+停止中controller Cの固定入口と未接続範囲は[停止中controllerガイド](offline-controller-guide.md)を参照してください。

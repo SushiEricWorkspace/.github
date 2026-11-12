@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import importlib.util
 import os
 import socket
+import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -64,6 +65,10 @@ class NativeProcessTests(unittest.TestCase):
                     self.assertIn(child["pid"], process.members())
                     self.assertIsNotNone(runtime_process.identity(child["pid"]))
                     self.assertIn(child["pid"], runtime_process.recorded_members(creation, nonce))
+                    if os.name == "nt":
+                        with self.assertRaises(RegistryError) as error, runtime_process.observe_exit(recorded[0], creation, nonce):
+                            pass
+                        self.assertEqual("PROCESS_MISMATCH", error.exception.code)
                 finally:
                     (root / "parent-exit").touch(exist_ok=True)
                     (root / "child-exit").touch(exist_ok=True)
@@ -96,6 +101,92 @@ class NativeProcessTests(unittest.TestCase):
                              ("tcp", "127.0.0.1", mapped.getsockname()[1])} <= actual, actual)
 
 
+@unittest.skipUnless(os.name == "nt", "Windows終了objectとnamed Jobのnative試験")
+class ObservedExitNativeTests(unittest.TestCase):
+    def test_live_zero_nonzero_start_boot_job_and_reopened_handles(self):
+        for exit_code in (0, 2):
+            with self.subTest(exitCode=exit_code), tempfile.TemporaryDirectory(prefix="observed-exit-") as directory:
+                root = Path(directory).resolve()
+                executable = runtime_process.identity(os.getpid())["executable"]
+                program = ("import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); end=time.monotonic()+10; "
+                           "exec('while not p.exists() and time.monotonic()<end: time.sleep(0.02)'); sys.exit(int(sys.argv[2]))")
+                arguments = [executable, "-B", "-c", program, str(root / "exit"), str(exit_code)]
+                recorded = []
+                nonce = os.urandom(16).hex()
+                process = runtime_process.OwnedProcess()
+                with (root / "console.log").open("xb") as log:
+                    process.start(arguments, root, log, nonce, lambda: recorded.append(runtime_process.identity(process.pid)))
+                    expected = recorded[0]
+                    creation = {"pid": process.pid, "ownerGroup": process.group}
+                    try:
+                        with self.assertRaises(RegistryError) as error, runtime_process.observe_exit(expected, creation, nonce):
+                            pass
+                        self.assertEqual("PROCESS_MISMATCH", error.exception.code)
+                        (root / "exit").touch()
+                        deadline = time.monotonic() + 10
+                        while process.poll() is None or process.members():
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.02)
+                        if exit_code:
+                            with self.assertRaises(RegistryError) as error, runtime_process.observe_exit(expected, creation, nonce):
+                                pass
+                            self.assertEqual("SAVE_FAILED", error.exception.code)
+                        else:
+                            with runtime_process.observe_exit(expected, creation, nonce) as proof:
+                                self.assertEqual(0, proof["exitCode"])
+                                self.assertEqual(expected["startId"], proof["startId"])
+                                self.assertIsNone(runtime_process.identity(process.pid))
+                            for values, group in ((dict(expected, startId="wrong"), creation),
+                                                  (dict(expected, bootId="wrong"), creation),
+                                                  (expected, dict(creation, ownerGroup="wrong"))):
+                                with self.assertRaises(RegistryError) as error, runtime_process.observe_exit(values, group, nonce):
+                                    pass
+                                self.assertEqual("PROCESS_MISMATCH", error.exception.code)
+                            # observerが自分の読取handleだけを閉じ、生成元のhandleを壊さないことを確認する。
+                            self.assertEqual(0, process.poll())
+                            self.assertEqual([], process.members())
+                    finally:
+                        (root / "exit").touch(exist_ok=True)
+                        deadline = time.monotonic() + 12
+                        while process.poll() is None or process.members():
+                            self.assertLess(time.monotonic(), deadline, "自己終了待ち。強制終了しません")
+                            time.sleep(0.02)
+                        process.close()
+
+    def test_missing_process_or_job_is_not_an_empty_success(self):
+        expected = {"pid": 123, "bootId": runtime_process.boot_id(), "startId": "1"}
+        creation = {"pid": 123, "ownerGroup": "Local\\sushieric-runtime-test"}
+        with patch.object(runtime_process.kernel, "OpenProcess", return_value=None), self.assertRaises(RegistryError) as error, \
+                runtime_process.observe_exit(expected, creation, "test"):
+            pass
+        self.assertEqual("PROCESS_UNVERIFIED", error.exception.code)
+        with patch.object(runtime_process.kernel, "OpenProcess", return_value=99), \
+                patch.object(runtime_process.kernel, "GetProcessTimes", side_effect=OSError("times unavailable")), \
+                patch.object(runtime_process.kernel, "CloseHandle") as close, self.assertRaises(OSError), \
+                runtime_process.observe_exit(expected, creation, "test"):
+            pass
+        close.assert_called_once_with(99)
+        def times(handle, created, *rest):
+            ctypes.cast(created, ctypes.POINTER(runtime_process.w.FILETIME)).contents.dwLowDateTime = 1
+            return True
+        with patch.object(runtime_process.kernel, "OpenProcess", return_value=99), \
+                patch.object(runtime_process.kernel, "GetProcessTimes", side_effect=times), \
+                patch.object(runtime_process._winapi, "WaitForSingleObject", return_value=0), \
+                patch.object(runtime_process._winapi, "GetExitCodeProcess", return_value=0), \
+                patch.object(runtime_process.kernel, "OpenJobObjectW", return_value=None, create=True), \
+                patch.object(runtime_process.kernel, "CloseHandle") as close, self.assertRaises(RegistryError) as error, \
+                runtime_process.observe_exit(expected, creation, "test"):
+            pass
+        self.assertEqual("PROCESS_UNVERIFIED", error.exception.code)
+        close.assert_called_once_with(99)
+
+    def test_unsupported_platform_is_explicit(self):
+        with patch.object(runtime_process.os, "name", "posix"), self.assertRaises(RegistryError) as error, \
+                runtime_process.observe_exit({}, {}, "test"):
+            pass
+        self.assertEqual("UNSUPPORTED_PROCESS", error.exception.code)
+
+
 class MacAdapterFaultTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -103,6 +194,42 @@ class MacAdapterFaultTests(unittest.TestCase):
         cls.adapter = importlib.util.module_from_spec(spec)
         with patch("os.name", "posix"):
             spec.loader.exec_module(cls.adapter)
+
+    def identity_with_lsof(self, result):
+        adapter = self.adapter
+        def pidpath(pid, buffer, size):
+            buffer.value = b"/fixture/python"
+            return len(buffer.value)
+        native = Mock(status=1, seconds=2, micros=3, uid=501)
+        arguments = struct.pack("i", 1) + b"/fixture/python\0\0/fixture/python\0"
+        with patch.object(adapter, "bsd", return_value=native), \
+                patch.object(adapter, "sysctl", return_value=arguments), \
+                patch.object(adapter, "library", return_value=Mock(proc_pidpath=pidpath)), \
+                patch.object(adapter, "boot_id", return_value="fixture-boot"), \
+                patch.object(adapter.subprocess, "run", side_effect=[result]):
+            return adapter.identity(123)
+
+    def test_lsof_cwd_return_one_is_unknown_oserror_with_cause(self):
+        failure = self.adapter.subprocess.CalledProcessError(1, ["/usr/sbin/lsof"])
+        with self.assertRaises(OSError) as raised:
+            self.identity_with_lsof(failure)
+        self.assertIsNone(raised.exception.errno)
+        self.assertIs(failure, raised.exception.__cause__)
+
+    def test_lsof_cwd_other_failure_is_not_hidden(self):
+        failure = self.adapter.subprocess.CalledProcessError(2, ["/usr/sbin/lsof"])
+        with self.assertRaises(self.adapter.subprocess.CalledProcessError) as raised:
+            self.identity_with_lsof(failure)
+        self.assertIs(failure, raised.exception)
+
+    def test_lsof_cwd_success_keeps_native_identity(self):
+        completed = self.adapter.subprocess.CompletedProcess(["/usr/sbin/lsof"], 0, b"p123\0n/fixture/world\0")
+        actual = self.identity_with_lsof(completed)
+        self.assertEqual({"pid": 123, "startId": "2:3", "startMillis": 2000,
+                          "bootId": "fixture-boot", "owner": "501",
+                          "cwd": str(Path("/fixture/world").resolve()),
+                          "executable": str(Path("/fixture/python").resolve()),
+                          "commandHash": self.adapter.command_hash(["/fixture/python"])}, actual)
 
     def test_listpids_errno_failure_never_proves_empty_children(self):
         adapter = self.adapter

@@ -27,8 +27,12 @@ EULAへの同意は運用者の許可後だけ指定します。`--dry-run`は�
 同じoperationIdと同じpayloadの再送は記録済み結果を返します。失敗した実行の再送でもJVMを再生成しません。
 再試験では新しいrunIdとoperationIdを明示し、元の失敗証跡を残します。結果不明・所有確認未完了の実行を自動再試行しません。
 
-`temporary/<runId>/`にworld/config/launchを、`diagnostics/`に要求・プロセス識別・標準出力・Mod証跡・結果を保存します。
-JUnit XMLはrun直下の`report.xml`です。実効seed、artifact、template未使用（null）、所有者、終了コードを結果・Registryへ記録します。
+新GTのworld/config/launchは管理rootのsibling `<root名>-gametest-private/<runId>/`に排他作成します。
+この固定専用領域と全祖先は通常directoryで管理markerがないこと、領域が所有者限定であることを検査します。
+運用者は配置・用途・容量を承認してから実行してください。任意cwd指定や既存runの移動は行いません。
+要求・プロセス識別・標準出力・Mod証跡・結果は管理rootの`temporary/<runId>/diagnostics/`に保存します。
+JUnit XMLは専用cwd直下の`report.xml`です。両方を同一run記録で照合し、quotaには両領域を合算します。
+物理free/reserveもそれぞれで検査しますが、将来増加のhardquotaは保証しません。実効seed、artifact、template未使用（null）、所有者、終了コードを結果・Registryへ記録します。
 永続枠を使わず、inventoryの`gameTestConcurrency`（通常1、負荷試験時2）をDBで予約します。
 未確定・復旧待ちの実行も枠を占有します。監督再起動で未確定の実行を再生成しません。
 終了したJVMだけでなく所有Job/groupの子の終了まで確認します。期限超過・未予約待受・識別不一致では保全し、自動killしません。
@@ -48,7 +52,12 @@ GameTestの正常終了を、永続データの正常保存、snapshot clean、t
 
 成功worldは結果保全後のGC候補、失敗worldは7日、ログと結果は30日の保持期限をRegistryへ記録します。
 GCの候補提示・参照再照合・実削除は[GCガイド](gc-guide.md)に従い、GameTest終了時にworldを自動削除しません。
-未確定の実行は期限だけで回収しません。
+未確定の実行は期限だけで回収しません。pin・未終端・保留operationは診断anchorと専用cwdの両方を保護します。
+保持期限後の明示GCでは専用cwdを`gametest:<runId>`、診断anchorを`run:<runId>`として提示します。
+専用領域の回収は同じ親directoryへ隔離してから削除し、途中失敗は両領域とjournalを保全します。
+旧runは元のcwd・診断場所のまま扱い、未知のlayoutは保護して拒否します。
+INITIALIZING証跡は本人相関だけを読み、ready以降の成功条件と区別します。identity取得失敗は元原因とphaseを保持し、
+所有JVM/Jobの自然終端が確認できた場合だけ失敗終端とします。生存・終端不明は保全し、自動killしません。
 
 完了した実行を同じownerでpinする場合は、gametestへ次のpayloadを指定します。解除はpinned=falseです。
 pinの正本はRegistryであり、固定した過去のresult.jsonは変更しません。

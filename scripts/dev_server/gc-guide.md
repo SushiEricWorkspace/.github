@@ -1,6 +1,6 @@
 # 参照保護・容量管理・明示GC
 
-管理root内の保存物を回収するときに使用します。Python 3.12と起動済みsupervisorを使用します。
+管理rootと固定GameTest専用領域の保存物を回収するときに使用します。Python 3.12と起動済みsupervisorを使用します。
 正常停止・保存証跡は[snapshotガイド](snapshot-guide.md)、世代の復元は[世代ガイド](generation-guide.md)を参照してください。
 
 ## 候補の確認と適用
@@ -36,20 +36,20 @@ python3.12 -B scripts/dev-server.py gc --root /absolute/dev-root --operation-id 
 {"action":"retire-template","templateId":"obsolete-template","approvedBy":"inventoryのoperator"}
 ```
 
-pinは`artifact:<hash>`、`snapshot:<id>`、`generation:<instance>/<generation>`、`run:<id>`に対応します。
+pinは`artifact:<hash>`、`snapshot:<id>`、`generation:<instance>/<generation>`、`run:<id>`、`gametest:<id>`に対応します。GTのrunまたはgametestをpinすると診断anchorと実行cwdを両方保護します。
 保持設定は全項目を正の整数で指定します。active・直前世代などの必須保護は変更できません。
 失敗worldの期限をログ・結果より長く設定した場合、worldを含むrun全体と復元用artifactもworldの期限まで保護します。
 template退役は使用を禁止し、参照保護から外します。templateファイルは削除せず記録を残します。
 世代から参照されるartifactは、その世代を回収した後の新しい計画で候補になります。
-保持期限を過ぎたGameTestのrunと専用artifactは、他の保護参照がなければ同じ計画に出ます。両方を回収する場合は両参照の明示選択が必要です。
+保持期限を過ぎたGameTestのrunと専用artifactは、他の保護参照がなければ同じ計画に出ます。回収する参照は個別に明示選択します。新layoutの`gametest:<id>`は専用cwd、`run:<id>`は診断anchorです。専用cwdを残して診断anchorだけを回収することはできません。同時選択では要求の並び順によらず専用cwdを先に回収し、その失敗時は診断anchorを保持します。
 
 ## 容量不足と途中失敗
 
-`quotaBytes`は管理rootの通常ファイル全体を対象にします。候補コピーと記録の増分に`reserveBytes`を加え、quotaと物理空きを事前検査します。
+`quotaBytes`は管理rootと固定siblingの`<root名>-gametest-private`の通常ファイルを合算します。物理空きも両領域で検査します。候補コピーと記録の増分に`reserveBytes`を加え、quotaと物理空きを事前検査します。
 コピー中も各ファイルの書込前に物理空きを確認します。必要容量が不足した場合は`NO_SPACE`で拒否し、自動GCしません。
 snapshot・世代は通常コピーです。hardlink・CoWによる共有を前提にしません。
 
-回収対象を同一FSのquarantineへ移動した後、事前に記録した通常ファイルだけを照合して削除します。
+回収対象を同一FSのquarantine（GT実行cwd/worldは同じ親の`gc-<operationId>-<参照hash>`）へ移動した後、事前に記録した通常ファイルだけを照合して削除します。
 権限エラーや内容変化などで失敗すると`RECOVERY_REQUIRED`にし、残存物と`manager/operations/gc-<operationId>/`のjournalを保全します。
 途中GCの自動再試行・強制削除・保留解除は実装していません。人間が元の承認、選択対象、残存物、DB、証跡を照合するまで新しい参照操作を開始できません。
 この状態でも診断、既存leaseの更新、writerのclose、稼働サーバーの正常停止は可能です。それぞれ既存のlease・writer照合を省略しません。

@@ -1,5 +1,6 @@
 """OS開始識別・boot・cwd・socket所有と、killしない子プロセス所有adapter。"""
 import ctypes
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
@@ -160,7 +161,7 @@ if os.name == "nt":
             self.group = None
             self.stage = "NOT_CREATED"
 
-        def start(self, arguments, cwd, log, name, created):
+        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None, environment=None):
             self.group = "Local\\sushieric-runtime-" + name
             with security_descriptor() as descriptor:
                 attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
@@ -174,14 +175,15 @@ if os.name == "nt":
             with open(os.devnull, "rb") as empty:
                 start = subprocess.STARTUPINFO()
                 start.dwFlags = subprocess.STARTF_USESTDHANDLES
-                start.hStdInput = msvcrt.get_osfhandle(empty.fileno())
-                start.hStdOutput = start.hStdError = msvcrt.get_osfhandle(log.fileno())
-                start.lpAttributeList = {"handle_list": [start.hStdInput, start.hStdOutput]}
+                start.hStdInput = msvcrt.get_osfhandle(empty.fileno() if input_fd is None else input_fd)
+                start.hStdOutput = msvcrt.get_osfhandle(log.fileno() if output_fd is None else output_fd)
+                start.hStdError = msvcrt.get_osfhandle(log.fileno())
+                start.lpAttributeList = {"handle_list": list(dict.fromkeys([start.hStdInput, start.hStdOutput, start.hStdError]))}
                 for handle in start.lpAttributeList["handle_list"]:
                     os.set_handle_inheritable(handle, True)
                 try:
                     self.handle, self.thread, self.pid, _ = _winapi.CreateProcess(arguments[0], subprocess.list2cmdline(arguments), None, None,
-                        True, 0x4 | subprocess.CREATE_NO_WINDOW, None, str(cwd), start)
+                        True, 0x4 | subprocess.CREATE_NO_WINDOW, environment, str(cwd), start)
                     self.stage = "CREATED"
                 finally:
                     for handle in start.lpAttributeList["handle_list"]:
@@ -211,7 +213,7 @@ if os.name == "nt":
 
         def close(self):
             _winapi.CloseHandle(self.handle)
-            kernel.CloseHandle(self.job)
+            _check(kernel.CloseHandle(self.job))
 
 else:
     class BsdInfo(ctypes.Structure):
@@ -276,8 +278,13 @@ else:
         lib = library()
         executable = ctypes.create_string_buffer(4096)
         require(lib.proc_pidpath(pid, executable, len(executable)) > 0, "PROCESS_UNVERIFIED", "実行元を取得できません")
-        output = subprocess.run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-F0pn"],
-                                capture_output=True, check=True).stdout
+        try:
+            output = subprocess.run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-F0pn"],
+                                    capture_output=True, check=True).stdout
+        except subprocess.CalledProcessError as error:
+            if error.returncode != 1:
+                raise
+            raise OSError("プロセスの実cwdを照合できません") from error
         names = [os.fsdecode(part.lstrip(b"\n")[1:]) for part in output.split(b"\0") if part.lstrip(b"\n").startswith(b"n")]
         require(len(names) == 1, "PROCESS_UNVERIFIED", "実cwdを一意に取得できません")
         return {"pid": pid, "startId": f"{value.seconds}:{value.micros}",
@@ -319,8 +326,9 @@ else:
             self.process = self.pid = self.group = None
             self.stage = "NOT_CREATED"
 
-        def start(self, arguments, cwd, log, name, created):
-            self.process = subprocess.Popen(arguments, cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None, environment=None):
+            self.process = subprocess.Popen(arguments, cwd=cwd, stdin=subprocess.DEVNULL if input_fd is None else input_fd,
+                                            stdout=log if output_fd is None else output_fd, stderr=log, start_new_session=True, env=environment)
             self.pid = self.process.pid
             self.group = self.pid
             self.stage = "CREATED"
@@ -375,6 +383,40 @@ def recorded_members(creation: dict, nonce: str) -> list[int]:
     require(creation.get("ownerGroup") == creation["pid"], "PROCESS_MISMATCH", "所有group識別が一致しません")
     probe.pid = creation["pid"]
     return probe.members()
+
+
+@contextmanager
+def observe_exit(expected: dict, creation: dict, nonce: str):
+    """Windowsの終了objectとnamed Jobを読取handleで保持する。終了後のフルidentity取得ではない。"""
+    require(os.name == "nt", "UNSUPPORTED_PROCESS", "終了objectの観測はWindowsだけに対応しています")
+    require(type(expected.get("pid")) is int and expected["pid"] > 0
+            and creation.get("pid") == expected["pid"] and expected.get("bootId") == boot_id(),
+            "PROCESS_MISMATCH", "記録PIDまたはOS bootが一致しません")
+    name = "Local\\sushieric-runtime-" + nonce
+    require(creation.get("ownerGroup") == name, "PROCESS_MISMATCH", "所有job識別が一致しません")
+    handle = kernel.OpenProcess(0x1000 | 0x100000, False, expected["pid"])
+    require(bool(handle), "PROCESS_UNVERIFIED", "終了process objectを読み取れません")
+    job = None
+    try:
+        times = [w.FILETIME() for _ in range(4)]
+        _check(kernel.GetProcessTimes(handle, *[ctypes.byref(value) for value in times]))
+        started = str(times[0].dwLowDateTime | (times[0].dwHighDateTime << 32))
+        require(started == expected.get("startId"), "PROCESS_MISMATCH", "process objectの開始FILETIMEが一致しません")
+        require(_winapi.WaitForSingleObject(int(handle), 0) == _winapi.WAIT_OBJECT_0,
+                "PROCESS_MISMATCH", "process objectが終了していません")
+        code = _winapi.GetExitCodeProcess(int(handle))
+        require(code == 0, "SAVE_FAILED", "process objectが正常終了していません")
+        function(kernel, "OpenJobObjectW", [w.DWORD, w.BOOL, w.LPCWSTR], w.HANDLE)
+        job = kernel.OpenJobObjectW(4, False, name)
+        require(bool(job), "PROCESS_UNVERIFIED", "保持されたnamed Jobを読み取れません")
+        probe = OwnedProcess()
+        probe.job = job
+        require(not probe.members(), "PROCESS_MISMATCH", "所有jobに子プロセスが残っています")
+        yield {"pid": expected["pid"], "startId": started, "bootId": expected["bootId"], "exitCode": code}
+    finally:
+        if job:
+            kernel.CloseHandle(job)
+        kernel.CloseHandle(handle)
 
 
 def require_identity(expected: dict, actual: dict | None) -> None:

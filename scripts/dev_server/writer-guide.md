@@ -27,8 +27,13 @@ CLIの`writer-open`/`writer-io`/`writer-close`はoperationIdと以下の共通pa
 登録や完了証跡を追加せず、終了済み・結果不明のwriterを監視の根拠にしません。
 
 openにはpid/startMillis/cwdを加えます。監督はnative PID・開始識別・boot・cwd・実行ファイル・command hash・OS ownerを記録し、
-操作ごとに再照合します。native照合、FS、通信はSQL write transaction外で行い、
-枠のinstance lockは保存/APIの応答とCloseまで保持します。stop/startと同時に書き込みません。
+操作ごとに再照合します。instance OS lock→短いDB transactionの順で予約・確定し、native照合、FS、proxy通信・終了待機は両方の外で行います。
+I/O受付は既writer操作と同じtransactionに内部`writer-call:<fingerprint>`予約を記録し、別processを含む同じinstanceのcallと競合を検出します。
+同IDの再提示も実行中の予約を引き継ぎません。INSERTのcommitが成功したcallerだけが、call終端時にlease/epoch/世代/run/操作と予約全列を再照合して解除します。
+call予約の解除はUNKNOWN proxyの終端やwriterのpending解除ではなく、別sessionの既受付条件も変更しません。解除失敗・crashでは予約を保全し、期限で回収しません。
+DB closeは元IOの永続operationId/fingerprintを照合し、現在のclose自身のcall予約下で受理済みIOを完結します。元IOのcall予約は再生成しません。
+`read`/`list`/`server-read`もI/O中は予約しますが、成功時は読取操作とcall予約を同じtransactionで削除し、本文を永続化しません。同IDの再読取りは新しい結果を返します。
+stop/startは未完了writerまたはcall予約を作用前に拒否します。
 管理rootのprivate IPC/ACLは既存契約を維持します。
 
 常用のstatus/API/ファイル読取りはRegistryとactive.json・generation.json、journal/staging不在、
@@ -59,6 +64,20 @@ Managerのcommand/money-history-save/achievement-saveは監督の単発WebSocket
 `success:false`を保存成功へ書き換えません。監視専用socketにはmutationを送らず、古いcallbackはsession境界で無視します。
 管理接続は自動reconnectしません。
 
+## DB専用writer
+
+`writer-io`の`action: database`は型付きManagement要求を1本の専用socketへ送ります。`message`と1〜30秒の`timeoutSeconds`だけを指定します。対象はcontext、履歴Start/Page/End、商品Products/DirectoryManifests/Edit、money-history-saveです。任意command・SQL・pathは扱いません。公開world/runと、監督側のinstance/generation/private nonceを区別して照合します。
+
+固定bundleのHost CLIは非管理DB用です。稼働管理DBへHost CLIを直接接続せず、固定Java proxyから所有Mod JVMの公開codec/APIへ仲介します。Host ZIP/POM、Java source・生成JAR・Mod codec classdir・依存GAV・全classpath・JDKは作成OSのbundle hashへ含まれます。未同梱bundleの新DB入口だけを拒否し、既存API/FS操作は維持します。
+
+監督はDB proxyを最大4本まで、各writerで未完要求1件と保持応答1件に制限します。私設frameはprefix込み64KiB、Management wireはUTF-8で60KiB、内側の商品要求は56KiBまでです。満杯は受付前に拒否し、UNKNOWNの証拠を期限や容量都合で破棄しません。本文・秘密を監督DB、生成command、診断logへ保存せず、既存writer正本へ状態とhashだけを記録します。
+
+正本commit後だけ保持応答をackします。PENDINGは同じsocketの既送要求の遅延応答だけを照合し、UNKNOWNや部分送信を別socketへ再送しません。監督再起動で失われた本文を再生成せず、既知終端の状態/hashだけを返します。全UNKNOWNが読取りで解消する保証はありません。同本人・同operationId/hashでbootstrapのOPENと元DB要求未送信を確認できる中断だけは、`completed:true`・`rejectedBeforeEffect:true`・`code: DB_BOOTSTRAP_INTERRUPTED`として作用前拒否を確定します。UNKNOWNや証拠欠落へこの分類を適用しません。
+
+close受付後は新規要求を遮断し、受理済みStart/Pageの終端、全履歴End、peer Close、helperと全childの実終了を確認して既存writer正本をCLOSEDにします。これは当該writerの終了証拠であり、Mod全体のdrain、main-thread cache更新、game/player保存や正常停止証拠の代わりではありません。全体停止統合は後続#64/#597の境界です。
+
+固定Data b157/Mod472では起動admissionが未接続です。codec・固定helper・自己所有loopback試験の成功を実管理DB/サーバーの統合成功として扱いません。
+
 ## 拒否と終了証明
 
 保存受付前の形式/対象パス拒否、FILE_NOT_FOUND、ALREADY_EXISTS、検査時のpermission拒否等には`error.rejectedBeforeEffect:true`を返します。
@@ -66,7 +85,7 @@ Managerはこの明示情報がある失敗だけOPENを維持できます。err
 保存受付後のOS/DB障害、API応答喪失/Close未完、CLI応答不明はUNKNOWNとし、未完了操作とwriter登録を保持します。
 検査時点と実操作の間にOS状態が変わった場合も、受付後の失敗は保留です。
 同じoperationIdの完了済み再送は識別とsession状態を再確認します。UNKNOWN/PENDINGを再実行しません。
-API本文はDBへ記録せず応答hashだけを残すため、再送結果からAPI本文を再取得できません。
+`action: api`の本文はDBへ記録せず応答hashだけを残すため、再送結果からAPI本文を再取得できません。DB専用writerは同じhelperが保持する応答だけを返し、保持本文を失った場合は`responseAvailable:false`と状態/hashを返します。完了済みDB操作のdry-run再提示は状態/hashだけを返し、保持応答の受信・ACK・call予約を行いません。
 
 切断は新規受付を閉じ、受理済みAPIキューを結果確定まで実行します。
 executor待機はI/O lock外、writer-closeは実行中I/Oが終わった後です。
@@ -78,7 +97,7 @@ supervisor再起動時には枠をRECOVERY_REQUIREDにし、復旧機能が接�
 statusのwriters/writerSessionsは登録正本です。runtimeStopProofとwriter不在の両方が揃ったときだけcleanEligibleを返します。
 これはsnapshot作成へ進める候補判定です。snapshotCleanはsnapshot作成の全検証が成功した後だけtrueになります。
 同一OSユーザーの非協調的な直接編集、登録外writer、FS停電耐久性の証明は含みません。
-Registry DB/INITIALIZEDはversion=4です。旧開発DBは拒否・保全し、移行や既存rootの上書きは行いません。
+Registry DB/INITIALIZEDはversion=5です。旧version=4も拒否・保全し、自動移行しません。旧開発DBは拒否・保全し、移行や既存rootの上書きは行いません。
 試験には新しい空rootを用意してください。
 
 ## 自動検証

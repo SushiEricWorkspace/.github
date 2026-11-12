@@ -1,1 +1,4 @@
 scripts/human-server.sh text eol=lf
+scripts/dev_server/mod-control-vectors-v3-local.json -text
+scripts/dev_server/management-stop-vectors.json -text
+scripts/dev_server/management-stop-trace.json -text

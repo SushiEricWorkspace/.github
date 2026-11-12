@@ -34,7 +34,7 @@ python3.12 -B scripts/dev-server.py init --root /absolute/minecraft-dev --invent
 Windowsでは`python3.12`を`py -3.12`へ置き換え、`--root`を`C:/...`形式にします。
 初期化を中断してrootへ部分データが残った場合は自動再初期化・削除せず止まります。
 完了済みinitは同じinventoryと同じoperationIdだけが再送可能です。
-inventory契約はschemaVersion=1、Registry DBとINITIALIZED markerはversion=4です。
+inventory契約はschemaVersion=1、Registry DBとINITIALIZED markerはversion=5です。旧version=4のrootは保全して拒否し、自動移行・再初期化を行いません。
 旧DB/markerは保全して拒否し、移行・再初期化しません。検証には新しい空rootを用意してください。
 
 ## supervisorと要求

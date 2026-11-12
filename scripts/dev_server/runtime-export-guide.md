@@ -20,7 +20,10 @@ SushiEricDataModelをtask専用Mavenへ発行し、取得した完全座標でMo
 登録全repoを入力集合に含め、exporterもtask `.github`の入力として固定します。
 登録にManagerがあればManagerもビルドし、CombatCoreがあれば検証・発行します。変更repoとして登録した場合も同じです。
 `--manager`・`--with-core`で追加検証を要求する場合も、対応するrepoの登録が必要です。
-Modが実際にCombatCoreへ依存していない状態ではCoreをModの依存へ追加しません。
+Coreが登録されていれば、発行した完全座標と同じbuild UUID内のMaven/coreを、
+Modの`combatCoreDevelopmentCoordinate`と`combatCoreDevelopmentRepository`へ渡します。
+Core未登録時は両propertyを渡しません。Modが実際にCombatCoreへ依存していない状態では、
+helperからModの依存宣言を追加しません。
 通常の開発ビルドは共有開発SushiEricDataModelの動的参照を維持します。正式版を開発bundleへ使用はできません。
 
 ## Gradleとの境界
@@ -54,7 +57,7 @@ Javaの長いclasspathはrun側のargfileへ展開し、OSのコマンド長上�
 既定はrun/.launchを新規作成し、`auxiliary`を渡すとrun-id専用の別pathへ出力します。
 cwd/world/configを変えず同世代を再起動できます。既存の補助path・bundleは上書きしません。
 bundleの内部へ実行データを置けませんが、generation/runtimeの配備は許可します。
-管理propertyは全5項目または未指定です。プロセス開始・正常停止・保存証跡は
+通常Mは承認済みexact Profileと全7管理property、GameTestは既5項目です。プロセス開始・正常停止・保存証跡は
 [runtime制御](runtime-control-guide.md)の責務です。
 
 ## runtimeのversionと切替
@@ -106,3 +109,85 @@ build helperの試験は、変更repoと固定依存の検査、未登録依存�
 `test_gradle_publication.py`を実行します。二つの独立コピーへ異なるresourceを追加し、並列発行後に両consumerの完全座標と内容を確認します。
 通常の単体試験ではこの重いGradle試験をスキップします。
 Windowsでの結果はmacOS 15の運用適合・停電耐久性の証明ではありません。
+
+## 固定DB Host配布
+
+新規bundleは同じDataModel発行版のHost runtime ZIPとPOMを発行lockへ記録し、`adapter/host.json`と全展開fileをartifact hashへ含めます。配布内DataModel JARはModの固定入力JARとbyte一致を必要とし、公開entrypointは`HostAdapterCli`だけです。`host_adapter_command`はbundle内JDKとclasspathだけを選び、作成OS/architectureの不一致、未同梱、差替えを拒否します。本文や秘密をcommand lineへ追加しません。
+
+保存済みruntimeの通常検証契約は維持しますが、Host配布がないbundleからDB adapterを実行する代替探索は行いません。Host CLIの管理root拒否は維持し、稼働管理DBは所有Mod JVMの型付きManagement要求へ仲介します。停止中OFFLINE ownerとrun-state/snapshotの接続は後続#64の責務です。
+
+## 固定DB proxy配布
+
+現在の`.github`を入力に含む新規bundleは`adapter/proxy.json`と専用Java helperを収録します。公開Data/Mod DTO・serializer・codecをJDK 21でコンパイルし、Java source、生成JAR、コンパイラー、Modの解決済みKotlin/serialization/Data依存GAV、codec classdirの全classfileを既存artifact collectionへ固定します。Host CLI用classpathは分離し、proxyへ混在させません。同一DataModel JARのbyte一致、依存の一意性、作成OS/architecture、全classpathのhashを作用前に検証します。JAR manifestの外部Class-Pathと、classpath区切り文字を含む要素は拒否します。
+
+`proxy_command`はbundle内JDKと固定main/classpathだけを使います。未同梱の古いbundleは通常の検証・API/FS動作を維持しますが、新DB入口で代替helperを探索しません。1writer/1socket、本人登録、要求上限、UNKNOWNと終了証明は[writer契約](writer-guide.md#db専用writer)に従います。固定helperの生成・公開codec互換・自己所有loopback試験と、実Mod/DBへの結合は別の検証です。
+
+## M/serverの明示候補
+
+`export-dev-runtime.py`の任意引数`--managed-profile PATH`には、既exact Profile v1の完全なUTF-8 JSONを指定します。
+encoding、完全environment、管理property等を含む明示入力で、部分設定からの補完や承認済みprofileの生成は行いません。
+Windowsの通常launchが使う`mbcs`は実ACP依存であり、候補の`utf-8`又は`windows-31j`を自動選択する根拠にはしません。
+exportのLoom明示envと候補の完全envは別の入力です。候補で明示した空mappingも、実process環境の監査結果を意味しません。
+
+```text
+python3.12 -B scripts/export-dev-runtime.py --recipe RECIPE --source-lock LOCK --store STORE --managed-profile PROFILE
+```
+
+既存receiptを再利用・上書きしません。ビルド前lockと現在の実recipeに一致する候補を用意してください。
+従来の一括手順`build-dev-runtime.py --managed-profile PROFILE`は維持しています。新しい二段階手順では、まずProfileを渡さず`prepare`を実行します。prepareは一度だけpublish/describeし、新GAVとclasspath、準備IDを出力します。準備物はstore内の`.prepared/<build ID>`に保存され、上書きできません。
+
+```text
+python3.12 -B scripts/build-dev-runtime.py prepare --task-root TASK_ROOT --owner OWNER --store STORE
+python3.12 -B scripts/build-dev-runtime.py freeze --task-root TASK_ROOT --owner OWNER --store STORE --prepared-id BUILD_ID --managed-profile PROFILE
+```
+
+独立に承認された完全Profileを用意してから、同じtask・owner・storeのfreezeへ渡してください。freezeは登録状態、source lock、recipe、公開物hashを再検証し、再build/re-publishせず記録済みexporterを一度だけ呼びます。準備記録はexport開始前に消費済みとなり、失敗後も再利用できません。やり直しは新しいprepareから行います。準備記録と診断用Maven出力はtaskの既存build記録・明示回収規約に従います。approvalとexpectedEvidenceは別途供給し、prepare出力から生成しません。
+整合性検査・現在のtask登録確認で発生した例外は準備をINVALIDにしますが、KeyboardInterrupt等の中断は失効処理の対象にしません。失効記録の保存に失敗した場合も検査時の元例外を主例外として報告し、保存失敗をnoteへ添えます。
+store/.preparedの準備記録・snapshotは自動GCしません。回収はtask ownerがtaskのbuild記録・artifact保全方針を確認してから明示的に行います。パス検証にはjunction/TOCTOUの既知制約があり、#64 R7と同様に同時の敵対的差替えまでは防ぎません。
+未指定時は通常freezeのbundle内容を維持し、CLI出力は`managedCandidate: null`と未指定理由を示します。
+指定したProfileの不足・不整合はfreeze失敗となり、候補なしの正常出力へ切り替えません。
+旧bundleへ候補を後付けせず、候補を含むbundleは別artifact IDになります。候補不在の保存済みv1/v2 bundleの通常検証・launchは維持します。
+
+候補は`launch/managed-server-candidate.json`へ元JSON bytesのまま保存し、既`runtime.files`のsize/SHA-256とartifact IDに束縛します。
+候補へartifact IDや新しいmetadata fieldは加えません。native/archive由来が未対応でも値を推測して埋めません。
+main/classpath/argsはexportと同一、DLIとremapはFreezerが実際に保存したUTF-8 bytesの内容だけを使います。
+DLIの`${run}/.launch`から`${auxiliary}`への置換以外に本文を生成せず、remap欠落をclasspathから補いません。
+
+元JVM列は順序と値を維持し、DLI補助pathのslot置換だけを行います。
+追加可能なのはProfileに明示した7管理property、`-XX:+DisableAttachMechanism`、`java.io.tmpdir`、任意の`org.sqlite.tmpdir`の既tokenだけです。
+値なしのJVM system propertyは、キーが空でない`-Dkey`に限りProfileへ追加できます。元の引数文字列を維持し、管理propertyには値が必要です。
+元引数の欠落・上書き・順序変更や、それ以外のheap/native設定等の追加は未対応として拒否します。
+元recipeに含まれる引数がこの照合に通ることは、意味上の許可やnative閉包の承認ではありません。
+
+`validate_bundle_managed_launch(bundle, context, observed)`はbundle全検証と候補の元bytes照合後、callerが独立に渡す既Context/Observedを`validate_managed_launch`へ渡します。
+Observedのargv/cwd/envと3補助file bytesを候補自身から作るAPIではありません。Contextのbundle/runtimeManifestは指定bundleへ束縛します。
+候補が存在しなければこの候補専用入口を拒否し、通常launchへfallbackしません。
+P正本Context/native本人と独立承認の供給は通常supervise/startへ接続しています。具体Profileの承認、Fabric追加code閉包、JNA/SQLiteの実load由来、実サーバー・OS別受入の完了を示しません。
+診断のCOMCTL/conhost例外を製品へ流用せず、通常launch・startgate・Data-v2世代拒否の条件は変更しません。
+
+関連確認は`test_runtime_bundle.py`、`test_managed_profile.py`、`test_task_maven.py`で行います。
+合成bundle/独立入力/CLIの確認であり、実JVM・native・OS受入の成功とは区別します。
+
+## 通常管理起動へ渡す境界
+
+Profile v1 candidateの固定位置・元UTF-8 bytes・既7管理propertyと、
+Pがdescriptor/listenerをM生成前に用意する契約は、
+[通常管理起動の共有合意](mod-control-guide.md)に従います。
+通常Pのsupervise/startがこの境界へ接続します。candidateやbundleの検証から承認を生成せず、
+運用者の承認入力とhashをPが保持し、exact argv/environment/補助bytesを所有M起動へ接続します。
+wire ACKはMのManagement受付許可、通常startの完成は既STARTED proofと実listenerのP照合後に分けます。
+既`freeze`/`validate_bundle_managed_launch`が承認・実起動・通常readyを実証したとは扱いません。
+
+通常接続の`codeSources`は、固定Knot登録search sourceと指定launcher anchorの実出典を
+独立bundleへ対応させる限定保証です。全JVM/全loader/未観測loaderや全期間不変は保証しません。
+論理origin/id、nested/directory/privateTmpの独立出典、UNKNOWN拒否は
+[共有合意のcodeSources domain](mod-control-guide.md#codesourcesの承認観測domain)に従います。
+Mの観測配列から承認側expectedを作らず、candidate存在を承認へ昇格させません。
+
+PはM生成前に、descriptorの同run専用leaf直下へ互いに重ならないauxiliary/privateTmpを用意し、
+独立context11値と補助3file原bytesを固定します。Mのnative cwd/argv・owned argfile抽出は候補観測であり、
+options/descriptor/root/専有leafへの束縛と再生成raw完全一致を経て照合します。
+[配置と所有寿命](mod-control-guide.md#同runの補助fileprivatetmpと所有寿命)に従い、
+transport closeを削除許可にせず、失敗/終端不明はownerが保全します。
+Freezerはこのrun用directoryやcontextを生成せず、既通常launchの5property/mbcsをこの接続へ流用しません。
+実装・合成試験と、具体Profile/native集合の独立承認・実P/Mの通常起動停止・OS別受入は区別します。

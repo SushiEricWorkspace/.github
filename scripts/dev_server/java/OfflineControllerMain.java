@@ -1,0 +1,462 @@
+package io.github.sushiericworkspace.devserver;
+
+import io.github.sushiericworkspace.sushiericdatamodel.database.run.*;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterAction;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterCodec;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterRequest;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterResponse;
+import io.github.sushiericworkspace.sushiericdatamodel.database.host.HostAdapterStatus;
+import io.github.sushiericworkspace.sushiericdatamodel.database.SushiEricDatabase;
+import kotlinx.serialization.json.*;
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.charset.*;
+import java.nio.file.Path;
+import java.util.*;
+
+/**
+ * Pが所有するprivate stdio専用の停止中controller。受付遮断・drain・start排他は起動元Pの責務。
+ * EOFや作用後失敗でownerを自動closeしない。complete/CLOSEの返答はRegistry結果やCの実終了・Registry CLOSEDの証明ではない。
+ */
+public final class OfflineControllerMain {
+    static final int FRAME = 65_536;
+    private static final Json JSON = Json.Default;
+    private final DataInputStream input;
+    private final DataOutputStream output;
+    private final OutputStream sink;
+    private WorldProcessIdentity parent;
+    private WorldProcessIdentity self;
+    private WorldOfflineWriterSession writer;
+    private WorldRunLifecycle lifecycle;
+    private String operationHash;
+    private String session;
+    private String nonce;
+    private String openId;
+    private boolean effect;
+
+    OfflineControllerMain(InputStream input, OutputStream output) {
+        this.input = new DataInputStream(input);
+        this.output = new DataOutputStream(output);
+        this.sink = output;
+    }
+
+    public static void main(String[] arguments) throws Exception {
+        require(arguments.length == 0);
+        new OfflineControllerMain(System.in, System.out).run();
+    }
+
+    void run() throws Exception {
+        for (;;) {
+            JsonObject frame;
+            try { frame = read(input); }
+            catch (EOFException end) {
+                if (effect) throw new IOException("owner終了は未確認です");
+                return;
+            } catch (Exception invalid) {
+                write(packet(effect ? "UNKNOWN" : "REJECTED", null, null));
+                if (effect) throw new IOException("controller入力不明。元stateを保全してください");
+                return;
+            }
+            boolean gameExit = JsonElementKt.JsonPrimitive("observe-game-exit").equals(frame.get("command"));
+            String id = null;
+            String hash = null;
+            try {
+                id = string(frame, "operationId");
+                hash = string(frame, "requestHash");
+                identifier(id); sha256(hash);
+                String command = string(frame, "command");
+                JsonObject response;
+                if (command.equals("open")) response = open(frame, id, hash);
+                else if (command.equals("observe-game-exit")) response = observeGameExit(frame, id, hash);
+                else if (command.equals("assign")) response = assign(frame, id, hash);
+                else if (command.equals("complete")) response = complete(frame, id, hash);
+                else if (command.equals("close")) response = close(frame, id, hash);
+                else throw new IllegalArgumentException("未知のcontroller操作です");
+                write(response);
+                if (command.equals("close") || command.equals("observe-game-exit")) return;
+            } catch (Exception failure) {
+                write(packet(effect ? "UNKNOWN" : "REJECTED", id, hash));
+                // Dataのcurrent公開後に返答だけ失われた可能性も含め、再取得しない。
+                if (effect || gameExit) throw new IOException("controller結果不明。元stateを保全してください");
+                return;
+            }
+        }
+    }
+
+    /** Pの全child/全writer観測後専用。返却Readyから次openの期待値を自動決定しない。 */
+    private JsonObject observeGameExit(JsonObject frame, String id, String hash) {
+        fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "leaseId", "epoch",
+                "generation", "controller", "owner", "drainSha256", "worldRoot", "shopDirectory",
+                "worldUuid", "runUuid", "expectedStateSha256", "expectedRevision", "gameOwner",
+                "saveProofSha256", "requestedStateSha256");
+        validateStart(frame);
+        sha256(string(frame, "saveProofSha256")); sha256(string(frame, "requestedStateSha256"));
+        require(writer == null && !effect);
+        self = identity(object(frame, "owner"));
+        parent = identity(object(frame, "controller"));
+        require(self.equals(WorldProcessIdentities.INSTANCE.current()));
+        require(ProcessHandle.current().parent().orElseThrow().pid() == parent.getPid());
+        checkActors();
+        WorldProcessIdentity game = identity(object(frame, "gameOwner"));
+        require(!game.equals(self) && !game.equals(parent) &&
+                game.getHostHash().equals(self.getHostHash()) && game.getBootId().equals(self.getBootId()));
+        WorldManagementBinding management = new WorldManagementBinding(string(frame, "leaseId"),
+                number(frame, "epoch"), string(frame, "generation"), parent, string(frame, "drainSha256"));
+        lifecycle = new WorldRunLifecycle(Path.of(string(frame, "worldRoot")), Path.of(string(frame, "shopDirectory")),
+                UUID.fromString(string(frame, "worldUuid")), 5000);
+        WorldRunStatus expected = lifecycle.readStatus();
+        WorldRunState state = expected.getState();
+        require(expected.getSha256().equals(string(frame, "expectedStateSha256")) &&
+                state.getStateRevision() == number(frame, "expectedRevision") &&
+                state.getWorldUuid().equals(string(frame, "worldUuid")) &&
+                state.getRunUuid().equals(string(frame, "runUuid")) &&
+                state.getGeneration().equals(management.getGeneration()) &&
+                string(frame, "requestedStateSha256").equals(state.getPreviousStateSha256()) &&
+                state.getPayload() instanceof WorldRunPhase.SavedPendingExit);
+        WorldRunPhase.SavedPendingExit saved = (WorldRunPhase.SavedPendingExit) state.getPayload();
+        require(game.equals(saved.getOwner()) && management.equals(saved.getManagement()) &&
+                saved.getSaveProofSha256().equals(string(frame, "saveProofSha256")));
+        session = string(frame, "sessionId"); nonce = string(frame, "nonce");
+        checkActors();
+        effect = true;
+        WorldRunStatus ready = lifecycle.observeExit(expected);
+        Map<String, JsonElement> response = new LinkedHashMap<>(status("GAME_EXITED", id, hash, ready));
+        response.put("worldUuid", JsonElementKt.JsonPrimitive(ready.getState().getWorldUuid()));
+        response.put("candidateStateSha256", JsonElementKt.JsonPrimitive(expected.getSha256()));
+        response.put("saveProofSha256", JsonElementKt.JsonPrimitive(saved.getSaveProofSha256()));
+        return new JsonObject(response);
+    }
+
+    private JsonObject open(JsonObject frame, String id, String hash) {
+        validateOpen(frame);
+        require(writer == null && !effect);
+        self = identity(object(frame, "owner"));
+        parent = identity(object(frame, "controller"));
+        require(self.equals(WorldProcessIdentities.INSTANCE.current()));
+        require(ProcessHandle.current().parent().orElseThrow().pid() == parent.getPid());
+        checkActors();
+        WorldManagementBinding management = new WorldManagementBinding(
+                string(frame, "leaseId"), number(frame, "epoch"), string(frame, "generation"),
+                parent, string(frame, "drainSha256"));
+        lifecycle = new WorldRunLifecycle(
+                Path.of(string(frame, "worldRoot")), Path.of(string(frame, "shopDirectory")),
+                UUID.fromString(string(frame, "worldUuid")), 5000);
+        WorldRunStatus expected = lifecycle.readStatus();
+        require(expected.getSha256().equals(string(frame, "expectedStateSha256")) &&
+                expected.getState().getStateRevision() == number(frame, "expectedRevision") &&
+                expected.getState().getRunUuid().equals(string(frame, "runUuid")) &&
+                expected.getState().getGeneration().equals(management.getGeneration()) &&
+                expected.getState().getPayload() instanceof WorldRunPhase.Ready);
+        session = string(frame, "sessionId");
+        nonce = string(frame, "nonce");
+        openId = id;
+        checkActors();
+        effect = true;
+        writer = lifecycle.openManagedOfflineWriter(expected, new WorldOfflineOwnerBinding(self, management));
+        return status("OPEN", id, hash, writer.getStatus());
+    }
+
+    private JsonObject assign(JsonObject frame, String id, String hash) {
+        require(writer != null);
+        WorldRunStatus expected = writer.getStatus();
+        require(expected.getState().getPayload() instanceof WorldRunPhase.OfflineIdle);
+        fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "openOperationId",
+                "expectedStateSha256", "expectedRevision", "runUuid", "worker", "request");
+        uuid(id);
+        require(!id.equals(openId) && session.equals(string(frame, "sessionId")) &&
+                nonce.equals(string(frame, "nonce")) && openId.equals(string(frame, "openOperationId")) &&
+                expected.getSha256().equals(string(frame, "expectedStateSha256")) &&
+                expected.getState().getStateRevision() == number(frame, "expectedRevision") &&
+                expected.getState().getRunUuid().equals(string(frame, "runUuid")));
+        HostAdapterRequest request = HostAdapterCodec.INSTANCE.decodeRequest(
+                object(frame, "request").toString().getBytes(StandardCharsets.UTF_8));
+        require(request.getRequestId().equals(id) &&
+                request.getWorldUuid().equals(expected.getState().getWorldUuid()) &&
+                request.getAction() instanceof HostAdapterAction.Edit);
+        Long deadline = request.getDeadlineEpochMillis();
+        require(deadline == null || System.currentTimeMillis() < deadline);
+        WorldProcessIdentity worker = identity(object(frame, "worker"));
+        require(worker.getPid() != self.getPid() && worker.getPid() != parent.getPid());
+        require(worker.getHostHash().equals(self.getHostHash()) && worker.getBootId().equals(self.getBootId()));
+        checkActors();
+        WorldProcessIdentities.INSTANCE.requireAlive(worker);
+        WorldRunStatus assigned = writer.assignWorker(worker, request, expected);
+        operationHash = hash;
+        WorldRunPhase.OfflineAssigned phase = (WorldRunPhase.OfflineAssigned) assigned.getState().getPayload();
+        Map<String, JsonElement> response = new LinkedHashMap<>(status("ASSIGNED", id, hash, assigned));
+        response.put("editRequestSha256", JsonElementKt.JsonPrimitive(phase.getRequestSha256()));
+        return new JsonObject(response);
+    }
+
+    private JsonObject complete(JsonObject frame, String id, String hash) {
+        require(writer != null);
+        WorldRunStatus assigned = writer.getStatus();
+        require(assigned.getState().getPayload() instanceof WorldRunPhase.OfflineAssigned);
+        WorldRunPhase.OfflineAssigned phase = (WorldRunPhase.OfflineAssigned) assigned.getState().getPayload();
+        fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "openOperationId",
+                "expectedStateSha256", "expectedRevision", "worldUuid", "runUuid", "receiptSha256", "editRequestSha256");
+        require(session.equals(string(frame, "sessionId")) && nonce.equals(string(frame, "nonce")) &&
+                openId.equals(string(frame, "openOperationId")) && phase.getOperationId().equals(id) &&
+                operationHash.equals(hash) && phase.getRequestSha256().equals(string(frame, "editRequestSha256")) &&
+                assigned.getState().getWorldUuid().equals(string(frame, "worldUuid")) &&
+                id.equals(string(frame, "runUuid")) &&
+                number(frame, "expectedRevision") == assigned.getState().getStateRevision() + 2);
+        checkActors();
+        WorldRunStatus expected = lifecycle.readStatus();
+        require(expected.getState().getPayload() instanceof WorldRunPhase.OfflineSavedPendingExit);
+        WorldRunPhase.OfflineSavedPendingExit saved = (WorldRunPhase.OfflineSavedPendingExit) expected.getState().getPayload();
+        require(saved.getWorker().equals(phase.getWorker()));
+        WorldOfflineCandidate candidate = new WorldOfflineCandidate(string(frame, "expectedStateSha256"), string(frame, "receiptSha256"),
+                string(frame, "worldUuid"), string(frame, "runUuid"), number(frame, "expectedRevision"));
+        checkActors();
+        HostAdapterResponse completed = writer.complete(candidate);
+        require(id.equals(completed.getRequestId()) && completed.getStatus() != HostAdapterStatus.UNKNOWN);
+        Map<String, JsonElement> response = new LinkedHashMap<>(status("COMPLETED", id, hash, writer.getStatus()));
+        response.put("candidateStateSha256", JsonElementKt.JsonPrimitive(candidate.getStateSha256()));
+        response.put("receiptSha256", JsonElementKt.JsonPrimitive(candidate.getReceiptSha256()));
+        response.put("result", JSON.parseToJsonElement(new String(HostAdapterCodec.INSTANCE.encodeResponse(completed), StandardCharsets.UTF_8)));
+        return new JsonObject(response);
+    }
+
+    private JsonObject close(JsonObject frame, String id, String hash) {
+        require(writer != null);
+        WorldRunStatus expected = writer.getStatus();
+        validateClose(frame, session, nonce, openId, expected.getSha256(), expected.getState().getStateRevision());
+        checkActors();
+        writer.close();
+        return status("OWNER_CLOSED", id, hash, writer.getStatus());
+    }
+
+    private void checkActors() {
+        require(self.equals(WorldProcessIdentities.INSTANCE.current()));
+        WorldProcessIdentities.INSTANCE.requireAlive(parent);
+    }
+
+    static void validateClose(JsonObject frame, String session, String nonce, String openId,
+                              String stateHash, long revision) {
+        fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "openOperationId",
+                "expectedStateSha256", "expectedRevision");
+        require(string(frame, "command").equals("close") && !string(frame, "operationId").equals(openId));
+        identifier(string(frame, "operationId")); sha256(string(frame, "requestHash"));
+        require(session.equals(string(frame, "sessionId")) && nonce.equals(string(frame, "nonce")) &&
+                openId.equals(string(frame, "openOperationId")) &&
+                stateHash.equals(string(frame, "expectedStateSha256")) &&
+                revision == number(frame, "expectedRevision"));
+    }
+
+    static void validateOpen(JsonObject frame) {
+        fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "leaseId", "epoch",
+                "generation", "controller", "owner", "drainSha256", "worldRoot", "shopDirectory",
+                "worldUuid", "runUuid", "expectedStateSha256", "expectedRevision");
+        require(string(frame, "command").equals("open"));
+        validateStart(frame);
+    }
+
+    private static void validateStart(JsonObject frame) {
+        identifier(string(frame, "operationId")); identifier(string(frame, "sessionId"));
+        identifier(string(frame, "nonce")); sha256(string(frame, "requestHash"));
+        uuid(string(frame, "leaseId")); uuid(string(frame, "generation"));
+        uuid(string(frame, "worldUuid")); uuid(string(frame, "runUuid"));
+        require(number(frame, "epoch") >= 0 && number(frame, "expectedRevision") >= 0);
+        sha256(string(frame, "drainSha256")); sha256(string(frame, "expectedStateSha256"));
+        WorldProcessIdentity owner = identity(object(frame, "owner"));
+        WorldProcessIdentity controller = identity(object(frame, "controller"));
+        require(!owner.equals(controller) && owner.getHostHash().equals(controller.getHostHash()) &&
+                owner.getBootId().equals(controller.getBootId()));
+        require(Path.of(string(frame, "worldRoot")).isAbsolute() &&
+                Path.of(string(frame, "shopDirectory")).isAbsolute());
+    }
+
+    static JsonObject read(DataInputStream input) throws Exception {
+        // header途中のEOFを空入力と区別する。受信済みframeの残りを再要求しない。
+        int first = input.read();
+        if (first < 0) throw new EOFException();
+        byte[] tail = input.readNBytes(3);
+        require(tail.length == 3);
+        int size = (first << 24) | ((tail[0] & 255) << 16) | ((tail[1] & 255) << 8) | (tail[2] & 255);
+        require(size > 0 && size <= FRAME - 4);
+        byte[] body = input.readNBytes(size);
+        require(body.length == size);
+        for (byte value : body) require(value != 10 && value != 13);
+        String text = StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(body)).toString();
+        JsonElement element = JSON.parseToJsonElement(text);
+        require(element instanceof JsonObject);
+        return (JsonObject) element;
+    }
+
+    private void write(JsonObject frame) throws IOException {
+        byte[] body = frame.toString().getBytes(StandardCharsets.UTF_8);
+        require(body.length + 4 <= FRAME);
+        output.writeInt(body.length); output.write(body); output.flush();
+        if (sink instanceof PrintStream stream && stream.checkError())
+            throw new IOException("私設frame出力を確認できません");
+    }
+
+    private JsonObject status(String state, String id, String hash, WorldRunStatus value) {
+        Map<String, JsonElement> result = new LinkedHashMap<>(packet(state, id, hash));
+        result.put("sessionId", JsonElementKt.JsonPrimitive(session));
+        result.put("nonce", JsonElementKt.JsonPrimitive(nonce));
+        result.put("stateSha256", JsonElementKt.JsonPrimitive(value.getSha256()));
+        result.put("stateRevision", JsonElementKt.JsonPrimitive(value.getState().getStateRevision()));
+        result.put("runUuid", JsonElementKt.JsonPrimitive(value.getState().getRunUuid()));
+        return new JsonObject(result);
+    }
+
+    private static JsonObject packet(String status, String id, String hash) {
+        Map<String, JsonElement> values = new LinkedHashMap<>();
+        values.put("status", JsonElementKt.JsonPrimitive(status));
+        if (id != null) values.put("operationId", JsonElementKt.JsonPrimitive(id));
+        if (hash != null) values.put("requestHash", JsonElementKt.JsonPrimitive(hash));
+        return new JsonObject(values);
+    }
+
+    private static WorldProcessIdentity identity(JsonObject value) {
+        fields(value, "hostHash", "bootId", "pid", "startId");
+        sha256(string(value, "hostHash"));
+        return new WorldProcessIdentity(string(value, "hostHash"), string(value, "bootId"),
+                number(value, "pid"), string(value, "startId"));
+    }
+    private static JsonObject object(JsonObject value, String key) { JsonElement item = value.get(key); require(item instanceof JsonObject); return (JsonObject)item; }
+    private static String string(JsonObject value, String key) { JsonElement item = value.get(key); require(item instanceof JsonPrimitive && ((JsonPrimitive)item).isString()); return ((JsonPrimitive)item).getContent(); }
+    private static long number(JsonObject value, String key) { JsonElement item = value.get(key); require(item instanceof JsonPrimitive && !((JsonPrimitive)item).isString()); String text = ((JsonPrimitive)item).getContent(); require(text.matches("0|[1-9][0-9]*")); return Long.parseLong(text); }
+    private static void fields(JsonObject value, String... keys) { require(value.keySet().equals(Set.of(keys))); }
+    private static void identifier(String value) { require(value.matches("[a-z0-9][a-z0-9-]{0,127}")); }
+    private static void sha256(String value) { require(value.matches("[0-9a-f]{64}")); }
+    private static void uuid(String value) { require(UUID.fromString(value).toString().equals(value)); }
+    private static void require(boolean value) { if (!value) throw new IllegalArgumentException("限定controller契約に一致しません"); }
+
+    /** P専用の単発W。候補公開は最終SUCCESSではなく、実終了とC completeはP/Cが別途照合する。 */
+    public static final class Worker {
+        private final OfflineControllerMain wire;
+        private WorldProcessIdentity controller;
+        private WorldRunLifecycle lifecycle;
+        private WorldRunStatus prepared;
+        private WorldOfflineWriter owner;
+        private HostAdapterRequest request;
+        private Path shop;
+        private String id;
+        private String hash;
+        private boolean effect;
+
+        Worker(InputStream input, OutputStream output) { wire = new OfflineControllerMain(input, output); }
+
+        public static void main(String[] arguments) throws Exception {
+            require(arguments.length == 0);
+            new Worker(System.in, System.out).run();
+        }
+
+        void run() throws Exception {
+            try {
+                prepare(read(wire.input));
+                wire.write(wire.status("PREPARED", id, hash, prepared));
+                JsonObject frame = read(wire.input);
+                WorldRunStatus assigned = admit(frame);
+                effect = true;
+                WorldOfflineOperation operation = lifecycle.beginOfflineEdit(assigned, request);
+                HostAdapterResponse response;
+                try (SushiEricDatabase database = operation.openDatabase(false, 5000)) {
+                    response = database.shopDefinitions(shop).execute(request, () -> Thread.currentThread().isInterrupted());
+                }
+                require(id.equals(response.getRequestId()) && response.getStatus() != HostAdapterStatus.UNKNOWN);
+                checkActors();
+                WorldOfflineCandidate candidate = operation.finish(response);
+                Map<String, JsonElement> result = new LinkedHashMap<>(packet("CANDIDATE", id, hash));
+                result.put("sessionId", JsonElementKt.JsonPrimitive(wire.session));
+                result.put("nonce", JsonElementKt.JsonPrimitive(wire.nonce));
+                result.put("stateSha256", JsonElementKt.JsonPrimitive(candidate.getStateSha256()));
+                result.put("receiptSha256", JsonElementKt.JsonPrimitive(candidate.getReceiptSha256()));
+                result.put("worldUuid", JsonElementKt.JsonPrimitive(candidate.getWorldUuid()));
+                result.put("runUuid", JsonElementKt.JsonPrimitive(candidate.getRunUuid()));
+                result.put("stateRevision", JsonElementKt.JsonPrimitive(candidate.getStateRevision()));
+                result.put("editRequestSha256", JsonElementKt.JsonPrimitive(
+                        ((WorldRunPhase.OfflineAssigned) assigned.getState().getPayload()).getRequestSha256()));
+                wire.write(new JsonObject(result));
+            } catch (Exception failure) {
+                wire.write(packet(effect ? "UNKNOWN" : "REJECTED", id, hash));
+                throw new IOException("worker結果を保全してください");
+            }
+        }
+
+        private void prepare(JsonObject frame) {
+            fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "leaseId", "epoch",
+                    "generation", "controller", "owner", "worker", "drainSha256", "worldRoot", "shopDirectory",
+                    "worldUuid", "runUuid", "expectedStateSha256", "expectedRevision", "request");
+            require(string(frame, "command").equals("prepare"));
+            id = string(frame, "operationId"); hash = string(frame, "requestHash");
+            uuid(id); sha256(hash);
+            wire.session = string(frame, "sessionId"); wire.nonce = string(frame, "nonce");
+            identifier(wire.session); identifier(wire.nonce);
+            uuid(string(frame, "leaseId")); uuid(string(frame, "generation"));
+            uuid(string(frame, "worldUuid")); uuid(string(frame, "runUuid"));
+            require(number(frame, "epoch") >= 0);
+            sha256(string(frame, "drainSha256"));
+            wire.parent = identity(object(frame, "controller"));
+            controller = identity(object(frame, "owner"));
+            wire.self = identity(object(frame, "worker"));
+            require(wire.self.getPid() != controller.getPid() && wire.self.getPid() != wire.parent.getPid() &&
+                    controller.getPid() != wire.parent.getPid());
+            require(wire.self.getHostHash().equals(controller.getHostHash()) &&
+                    wire.self.getBootId().equals(controller.getBootId()));
+            require(ProcessHandle.current().parent().orElseThrow().pid() == wire.parent.getPid());
+            checkActors();
+            Path world = Path.of(string(frame, "worldRoot"));
+            shop = Path.of(string(frame, "shopDirectory"));
+            require(world.isAbsolute() && shop.isAbsolute());
+            request = HostAdapterCodec.INSTANCE.decodeRequest(object(frame, "request").toString().getBytes(StandardCharsets.UTF_8));
+            require(request.getRequestId().equals(id) && request.getWorldUuid().equals(string(frame, "worldUuid")) &&
+                    request.getAction() instanceof HostAdapterAction.Edit);
+            requireCurrentDeadline();
+            lifecycle = new WorldRunLifecycle(world, shop, UUID.fromString(request.getWorldUuid()), 5000);
+            prepared = lifecycle.readStatus();
+            expected(frame, prepared);
+            require(prepared.getState().getWorldUuid().equals(request.getWorldUuid()) &&
+                    prepared.getState().getGeneration().equals(string(frame, "generation")) &&
+                    prepared.getState().getPayload() instanceof WorldRunPhase.OfflineIdle);
+            owner = ((WorldRunPhase.OfflineIdle) prepared.getState().getPayload()).getWriter();
+            require(owner.getOwner().equals(controller) && owner.getManagement() != null &&
+                    owner.getSessionId().equals(prepared.getState().getRunUuid()));
+            require(owner.getManagement().equals(new WorldManagementBinding(string(frame, "leaseId"),
+                    number(frame, "epoch"), string(frame, "generation"), wire.parent, string(frame, "drainSha256"))));
+        }
+
+        private WorldRunStatus admit(JsonObject frame) {
+            fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "preparedStateSha256",
+                    "expectedStateSha256", "expectedRevision", "runUuid", "editRequestSha256");
+            require(string(frame, "command").equals("admit") && id.equals(string(frame, "operationId")) &&
+                    hash.equals(string(frame, "requestHash")) && wire.session.equals(string(frame, "sessionId")) &&
+                    wire.nonce.equals(string(frame, "nonce")) && prepared.getSha256().equals(string(frame, "preparedStateSha256")));
+            sha256(string(frame, "editRequestSha256"));
+            requireCurrentDeadline();
+            checkActors();
+            WorldRunStatus assigned = lifecycle.readStatus();
+            expected(frame, assigned);
+            require(assigned.getState().getPayload() instanceof WorldRunPhase.OfflineAssigned &&
+                    assigned.getState().getWorldUuid().equals(prepared.getState().getWorldUuid()) &&
+                    assigned.getState().getGeneration().equals(prepared.getState().getGeneration()) &&
+                    assigned.getState().getRunUuid().equals(prepared.getState().getRunUuid()) &&
+                    prepared.getSha256().equals(assigned.getState().getPreviousStateSha256()));
+            WorldRunPhase.OfflineAssigned phase = (WorldRunPhase.OfflineAssigned) assigned.getState().getPayload();
+            require(phase.getWriter().equals(owner) && phase.getWorker().equals(wire.self) &&
+                    phase.getOperationId().equals(id) && phase.getRequestSha256().equals(string(frame, "editRequestSha256")) &&
+                    phase.getResumePendingSha256() == null);
+            return assigned;
+        }
+
+        private void checkActors() {
+            wire.checkActors();
+            WorldProcessIdentities.INSTANCE.requireAlive(controller);
+        }
+
+        private void requireCurrentDeadline() {
+            Long deadline = request.getDeadlineEpochMillis();
+            require(deadline == null || System.currentTimeMillis() < deadline);
+        }
+
+        private static void expected(JsonObject frame, WorldRunStatus status) {
+            require(status.getSha256().equals(string(frame, "expectedStateSha256")) &&
+                    status.getState().getStateRevision() == number(frame, "expectedRevision") &&
+                    status.getState().getRunUuid().equals(string(frame, "runUuid")));
+        }
+    }
+}

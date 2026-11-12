@@ -150,8 +150,11 @@ class TaskMaven:
         for item in record["publications"]:
             validate_relative_path(item["path"])
             path = maven / item["path"]
-            _require(path.suffix in (".jar", ".pom") and digest(regular_bytes(path)) == item["sha256"],
-                     "maven: 発行POM/JARが一致しません")
+            host_module = "io.github.sushiericworkspace:sushieric-datamodel-host-adapter-dev:"
+            host_zip = item["coordinate"].startswith(host_module) and path.name == (
+                "sushieric-datamodel-host-adapter-dev-" + item["coordinate"][len(host_module):] + "-runtime.zip")
+            _require((path.suffix in (".jar", ".pom") or host_zip) and digest(regular_bytes(path)) == item["sha256"],
+                     "maven: 発行POM/JAR/Host ZIPが一致しません")
             expected.append((item["coordinate"], path.name, item["sha256"]))
         observed = []
         for item in json.loads(regular_bytes(bundle / "inputs/publications.json")):

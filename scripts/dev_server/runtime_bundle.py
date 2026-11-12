@@ -7,7 +7,8 @@ import re
 import shutil
 import stat
 import tempfile
-from pathlib import Path
+import uuid
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .build_inputs import canonical, digest, portable_lock, regular_bytes, verify_sources
 from .contracts import ContractError, LAYOUT_ID, validate, validate_relative_path
@@ -16,6 +17,260 @@ from .contracts import ContractError, LAYOUT_ID, validate, validate_relative_pat
 def _require(condition: bool, message: str):
     if not condition:
         raise ContractError(message)
+
+
+def require_data_generation(manifest: dict, generation: str) -> None:
+    """verify_bundle済みDataModel runtime（v2）の管理世代だけをcanonical UUIDへ限定する。
+
+    旧Common runtime（v1）やtemplateId等の名前は対象にせず、既存値を変換しない。
+    """
+    if manifest["schemaVersion"] != 2:
+        return
+    message = "DataModel runtimeの管理世代はcanonical UUIDで指定してください"
+    _require(type(generation) is str, message)
+    try:
+        canonical = str(uuid.UUID(generation))
+    except ValueError:
+        raise ContractError(message) from None
+    _require(canonical == generation, message)
+
+
+def _managed_argfile(arguments: list[str], encoding: str) -> bytes:
+    codec = {"utf-8": "utf-8", "windows-31j": "cp932"}.get(encoding)
+    _require(codec is not None, "managed launch: 未対応のencodingです")
+    lines = []
+    for argument in arguments:
+        _require(type(argument) is str and argument and not any((ord(c) < 32 or ord(c) == 127) for c in argument),
+                 "managed launch: 引数が不正です")
+        try:
+            raw = argument.encode(codec)
+            _require(raw.decode(codec) == argument, "managed launch: encodingが往復一致しません")
+        except UnicodeError:
+            raise ContractError("managed launch: 引数をencodingで表現できません") from None
+        lines.append(json.dumps(raw.decode("latin-1"), ensure_ascii=False).encode("latin-1"))
+    return b"\n".join(lines) + b"\n"
+
+
+_MANAGED_CANDIDATE = "launch/managed-server-candidate.json"
+_MANAGED_PATHS = ("bundle", "run", "auxiliary", "privateTmp", "controlDescriptor", "runtimeManifest", "proofPath")
+_MANAGED_PROPERTIES = {"sushieric.managed." + name: name for name in
+                       ("instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest",
+                        "controlDescriptor", "controlDescriptorSha256")}
+_MANAGED_PROPERTIES.update({"java.io.tmpdir": "privateTmp", "fabric.dli.config": "auxiliary"})
+
+
+def _managed_fields(value, names):
+    _require(type(value) is dict and value.keys() == set(names), "managed launch: field集合が不正です")
+
+
+def _managed_text(value, multiline=False):
+    _require(type(value) is str and bool(value) and not any(
+        (ord(c) < 32 or ord(c) == 127) and not (multiline and c in "\n\t") for c in value),
+        "managed launch: textが不正です")
+    try:
+        _require(len(value.encode("utf-8")) <= 65532, "managed launch: textが上限外です")
+    except UnicodeError:
+        raise ContractError("managed launch: UTF-8 textが不正です") from None
+
+
+def _managed_tokens(value, allowed):
+    _managed_text(value, multiline=True)
+    tokens = re.findall(r"\$\{([^{}]+)\}", value)
+    _require(all(name in allowed for name in tokens), "managed launch: tokenのslotが不正です")
+    _require("${" not in re.sub(r"\$\{[^{}]+\}", "", value), "managed launch: token構文が不正です")
+
+
+def _managed_environment(value):
+    _require(type(value) is dict, "managed launch: envはmappingが必要です")
+    for key, item in value.items():
+        _managed_text(key)
+        _managed_text(item)
+        _require(key.isascii() and "=" not in key and "${" not in key, "managed launch: env keyが不正です")
+
+
+def _validate_managed_profile(profile):
+    _managed_fields(profile, ("version", "purpose", "role", "platform", "argfileEncoding", "mainClass", "classpath",
+                              "jvmArgs", "args", "environment", "dliText", "remapClasspath"))
+    _require(type(profile["version"]) is int and profile["version"] == 1
+             and profile["purpose"] == "managed-launch-exact" and profile["role"] == "M",
+             "managed launch: version/purpose/roleが不正です")
+    _require(type(profile["platform"]) is str and profile["platform"] in ("Windows", "Darwin"),
+             "managed launch: OSが不正です")
+    _require(type(profile["argfileEncoding"]) is str and profile["argfileEncoding"] in
+             (("utf-8", "windows-31j") if profile["platform"] == "Windows" else ("utf-8",)),
+             "managed launch: encodingがOSと一致しません")
+    _managed_environment(profile["environment"])
+    keys = [key.casefold() if profile["platform"] == "Windows" else key for key in profile["environment"]]
+    _require(len(keys) == len(set(keys)), "managed launch: env keyが重複しています")
+    for value in profile["environment"].values():
+        _managed_tokens(value, {"privateTmp"})
+    _managed_text(profile["mainClass"])
+    _managed_tokens(profile["mainClass"], set())
+    for name in ("jvmArgs", "args", "classpath", "remapClasspath"):
+        _require(type(profile[name]) is list, "managed launch: 引数/pathはlistが必要です")
+        for value in profile[name]:
+            _managed_text(value)
+    for name in ("classpath", "remapClasspath"):
+        _require(bool(profile[name]) and len(profile[name]) == len(set(profile[name])),
+                 "managed launch: classpathが空又は重複しています")
+        for value in profile[name]:
+            validate_relative_path(value)
+            _managed_tokens(value, set())
+    for value in profile["args"]:
+        _managed_tokens(value, set())
+        _require(not value.startswith("@"), "managed launch: 追加argfileは禁止です")
+    expected_properties = {key: "${" + name + "}" for key, name in _MANAGED_PROPERTIES.items()}
+    expected_properties["fabric.dli.config"] += "/server-launch.cfg"
+    flags, actual_properties = set(), {}
+    for argument in profile["jvmArgs"]:
+        _require(not argument.startswith("@") and argument not in ("-cp", "-classpath", "--class-path")
+                 and not argument.startswith("--class-path="), "managed launch: classpath/argfile混入は禁止です")
+        allowed = set()
+        if argument.startswith("-D"):
+            key, separator, value = argument[2:].partition("=")
+            _require(bool(key), "managed launch: propertyが不正です")
+            flag = "property:" + key
+            actual_properties[key] = value
+            if key in _MANAGED_PROPERTIES:
+                allowed.add(_MANAGED_PROPERTIES[key])
+            elif key == "org.sqlite.tmpdir":
+                _require(value == "${privateTmp}", "managed launch: SQLite temp slotが不正です")
+                allowed.add("privateTmp")
+        elif argument.startswith(("-Xms", "-Xmx")):
+            flag = argument[:4]
+        elif argument.startswith("-XX:"):
+            flag = "XX:" + argument[4:].lstrip("+-").split("=", 1)[0]
+        else:
+            flag = argument
+        _require(flag not in flags, "managed launch: JVM flag/propertyが重複しています")
+        flags.add(flag)
+        _managed_tokens(argument, allowed)
+    _require(all(actual_properties.get(key) == value for key, value in expected_properties.items()),
+             "managed launch: 必須propertyのtokenが一致しません")
+    _require("-XX:+DisableAttachMechanism" in profile["jvmArgs"], "managed launch: attach禁止が必要です")
+    _managed_text(profile["dliText"], multiline=True)
+    _require("\ufeff" not in profile["dliText"], "managed launch: DLIのBOMは禁止です")
+    _managed_tokens(profile["dliText"], {"bundle", "auxiliary"})
+
+
+def validate_managed_launch(profile: dict, context: dict, observed: dict) -> None:
+    """承認済みM/server templateとP正本値から展開済み起動入力の完全一致を純粋に検査する。
+
+    file/OS/環境を読み取らず、引数も変更しない。不一致はContractError。
+    通常launchでも使用する。profile承認・native本人・実起動は呼出側で別途検証する。
+    """
+    _validate_managed_profile(profile)
+    _managed_fields(context, (*_MANAGED_PATHS, "instanceId", "generationId", "startNonce", "controlDescriptorSha256"))
+    path_type = PureWindowsPath if profile["platform"] == "Windows" else PurePosixPath
+    for name, value in context.items():
+        _managed_text(value)
+        _require("${" not in value, "managed launch: context内のtokenは禁止です")
+        if name in _MANAGED_PATHS:
+            _require(path_type(value).is_absolute(), "managed launch: 絶対pathが必要です")
+    for name in ("instanceId", "startNonce"):
+        _require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", context[name]) is not None,
+                 "managed launch: 識別子が不正です")
+    require_data_generation({"schemaVersion": 2}, context["generationId"])
+    _require(re.fullmatch(r"[0-9a-f]{64}", context["controlDescriptorSha256"]) is not None,
+             "managed launch: descriptor hashが不正です")
+    _managed_fields(observed, ("argv", "cwd", "environment", "auxiliaryFiles"))
+    _managed_text(observed["cwd"])
+    _require(path_type(observed["cwd"]).is_absolute(), "managed launch: cwdが不正です")
+    _managed_environment(observed["environment"])
+    keys = [key.casefold() if profile["platform"] == "Windows" else key for key in observed["environment"]]
+    _require(len(keys) == len(set(keys)), "managed launch: env keyが重複しています")
+    expected = _expand_managed_launch(profile, context)
+    _managed_fields(observed["auxiliaryFiles"], expected["auxiliaryFiles"])
+    _require(all(type(value) is bytes for value in observed["auxiliaryFiles"].values()),
+             "managed launch: 補助fileはbytesが必要です")
+    _require(observed == expected, "managed launch: 展開後の起動入力が一致しません")
+
+
+def _expand_managed_launch(profile, context):
+    path_type = PureWindowsPath if profile["platform"] == "Windows" else PurePosixPath
+    expand = lambda value: re.sub(r"\$\{([^{}]+)\}", lambda match: context[match[1]], value)
+    expected_env = {key: expand(value) for key, value in profile["environment"].items()}
+    dli = expand(profile["dliText"])
+    if profile["platform"] == "Windows":
+        dli = dli.replace("\n", "\r\n")
+    separator = ";" if profile["platform"] == "Windows" else ":"
+    bundle = path_type(context["bundle"])
+    classpath = separator.join(str(bundle / value) for value in profile["classpath"])
+    remap = separator.join(str(bundle / value) for value in profile["remapClasspath"])
+    arguments = [*map(expand, profile["jvmArgs"]), "-cp", classpath, profile["mainClass"], *profile["args"]]
+    expected_files = {"java.args": _managed_argfile(arguments, profile["argfileEncoding"]),
+                      "server-launch.cfg": dli.encode("utf-8"),
+                      "server-remap-classpath.txt": remap.encode("utf-8")}
+    java = bundle / "jdk/bin" / ("java.exe" if profile["platform"] == "Windows" else "java")
+    expected_argv = [str(java), "@" + str(path_type(context["auxiliary"]) / "java.args")]
+    _require(all(len(raw) <= 65532 for raw in expected_files.values())
+             and len(canonical(expected_argv)) <= 65532 and len(canonical(expected_env)) <= 65532,
+             "managed launch: 補助file/argv/envが上限外です")
+    return {"argv": expected_argv, "cwd": context["run"], "environment": expected_env, "auxiliaryFiles": expected_files}
+
+
+def _read_managed_profile(data: bytes) -> dict:
+    _require(type(data) is bytes and 0 < len(data) <= 65532, "managed candidate: サイズが上限外です")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            _require(key not in result, "managed candidate: JSON keyが重複しています")
+            result[key] = value
+        return result
+    try:
+        profile = json.loads(data.decode("utf-8"), object_pairs_hook=unique)
+    except (UnicodeError, json.JSONDecodeError):
+        raise ContractError("managed candidate: UTF-8 JSONが必要です") from None
+    _validate_managed_profile(profile)
+    return profile
+
+
+def _match_managed_candidate(root: Path, profile: dict):
+    descriptor = json.loads(regular_bytes(root / "launch/profiles.json"))
+    _require(profile["platform"] == descriptor["platform"], "managed candidate: 作成OSが一致しません")
+    source = descriptor["profiles"]["server"]
+    for key in ("mainClass", "classpath", "args"):
+        _require(profile[key] == source[key], "managed candidate: exportのmain/classpath/argsが一致しません")
+    _require((root / "launch/server-launch.cfg").exists()
+             and (root / "launch/server-remap-classpath.txt").exists(),
+             "managed candidate: 実DLI/remap入力がありません")
+    dli = regular_bytes(root / "launch/server-launch.cfg").decode("utf-8")
+    _require(profile["dliText"] == dli.replace("${run}/.launch", "${auxiliary}"),
+             "managed candidate: exportのDLI bytesが一致しません")
+    separator = ";" if profile["platform"] == "Windows" else ":"
+    remap = regular_bytes(root / "launch/server-remap-classpath.txt").decode("utf-8").split(separator)
+    _require(all(value.startswith("${bundle}/") for value in remap)
+             and profile["remapClasspath"] == [value[len("${bundle}/"):] for value in remap],
+             "managed candidate: exportのremap bytesが一致しません")
+    additions = {"-D" + key + "=${" + value + "}" for key, value in _MANAGED_PROPERTIES.items()
+                 if key != "fabric.dli.config"}
+    additions.update({"-XX:+DisableAttachMechanism", "-Dorg.sqlite.tmpdir=${privateTmp}"})
+    original = [value.replace("${run}/.launch", "${auxiliary}") for value in source["jvmArgs"]]
+    index = 0
+    for argument in profile["jvmArgs"]:
+        if index < len(original) and argument == original[index]:
+            index += 1
+        else:
+            _require(argument in additions, "managed candidate: export外のJVM差分は未対応です")
+    _require(index == len(original), "managed candidate: exportのJVM引数が欠落又は変更されています")
+
+
+def validate_bundle_managed_launch(root: Path, context: dict, observed: dict) -> None:
+    """検証済みbundleの候補を読み、caller独立のContext/Observedと既exact契約で照合する。
+
+    candidate不在・bytes改変・束縛不一致はContractError。入力を生成せず、通常launchも呼ばない。
+    candidate承認、native由来、P正本contextの真正性や管理受付の保証は行わない。
+    """
+    root = root.absolute()
+    manifest = verify_bundle(root)
+    entries = [entry for entry in manifest["files"] if entry["path"] == _MANAGED_CANDIDATE]
+    _require(len(entries) == 1, "managed candidate: bundleに候補がありません")
+    data = regular_bytes(root / _MANAGED_CANDIDATE)
+    _require(digest(data) == entries[0]["sha256"], "managed candidate: raw hashが一致しません")
+    _require(type(context) is dict and context.get("bundle") == str(root)
+             and context.get("runtimeManifest") == str(root / "runtime.json"),
+             "managed candidate: Contextのbundle/runtimeManifestが一致しません")
+    validate_managed_launch(_read_managed_profile(data), context, observed)
 
 
 def _directory(path: Path):
@@ -194,8 +449,12 @@ class Freezer:
         return {"mainClass": recipe["mainClass"], "classpath": classpath, "jvmArgs": jvm, "args": recipe["args"]}
 
 
-def freeze(recipe_path: Path, source_lock_path: Path, store: Path) -> Path:
-    """完成したbundleだけをhash名で公開する。失敗stagingは診断用に残す。"""
+def freeze(recipe_path: Path, source_lock_path: Path, store: Path, *, managed_profile_path: Path | None = None) -> Path:
+    """完成したbundleだけをhash名で公開する。失敗stagingは診断用に残す。
+
+    managed_profile_pathは既exact Profileの完全な明示候補。未指定時は候補を生成しない。
+    指定時は実export入力との不整合を拒否し、元UTF-8 bytesをbundleへ保存する。承認や起動は行わない。
+    """
     recipe = json.loads(regular_bytes(recipe_path))
     lock = json.loads(regular_bytes(source_lock_path))
     _require(type(recipe.get("recipeVersion")) is int and recipe["recipeVersion"] == 2
@@ -223,6 +482,10 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path) -> Path:
     profiles = {name: freezer.profile(name, recipe["profiles"][name]) for name in ("server", "gameTest")}
     freezer.write("launch/profiles.json", canonical({"version": 1, "platform": platform.system(),
                                                    "machine": platform.machine(), "profiles": profiles}))
+    if managed_profile_path is not None:
+        data = freezer.read(managed_profile_path)
+        _match_managed_candidate(staging, _read_managed_profile(data))
+        freezer.write(_MANAGED_CANDIDATE, data)
     freezer.write("inputs/source-lock.json", canonical(portable_lock(lock)))
     # 未追跡の実入力も保存して、hashだけでは再現不能にならないようにする。
     for source in lock["sources"]:
@@ -245,6 +508,12 @@ def freeze(recipe_path: Path, source_lock_path: Path, store: Path) -> Path:
         _require(digest(freezer.read(path)) == item["sha256"], "publication: 発行直後から変更されています")
         publications.append({"coordinate": item["coordinate"], "sha256": item["sha256"], "file": freezer.copy(path)})
     freezer.write("inputs/publications.json", canonical(publications))
+    from .database_adapter import freeze_host_adapter
+    freeze_host_adapter(freezer, lock, recipe["dataModelCoordinate"], data_model_jar)
+    from .offline_controller_bundle import freeze_offline_controller
+    freeze_offline_controller(freezer, lock, recipe)
+    from .database_proxy_bundle import freeze_proxy
+    freeze_proxy(freezer, lock, recipe, profiles)
     tools = [{"name": "jdk", "version": recipe["javaVersion"],
               "sha256": freezer.copy_tree(Path(recipe["javaHome"]), "jdk")},
              {"name": "gradle", "version": recipe["gradleVersion"],
@@ -295,16 +564,52 @@ def verify_bundle(root: Path) -> dict:
              "runtime: artifactIdまたはCOMPLETEが一致しません")
     observed = [entry for entry in _files(root) if entry["path"] not in {"runtime.json", "COMPLETE"}]
     _require(observed == manifest["files"], "runtime: ファイル集合・サイズ・hashが一致しません")
+    from .database_adapter import DESCRIPTOR, verify_host_adapter
+    if (root / DESCRIPTOR).exists():
+        verify_host_adapter(root)
+    from .offline_controller_bundle import DESCRIPTOR as OFFLINE_DESCRIPTOR, DIRECTORY as OFFLINE_DIRECTORY, verify_offline_controller
+    if (root / OFFLINE_DIRECTORY).exists() or (root / OFFLINE_DESCRIPTOR).exists():
+        verify_offline_controller(root)
+    from .database_proxy_bundle import DESCRIPTOR as PROXY_DESCRIPTOR, DIRECTORY as PROXY_DIRECTORY, verify_proxy
+    if (root / PROXY_DIRECTORY).exists() or (root / PROXY_DESCRIPTOR).exists():
+        verify_proxy(root)
+    if any(entry["path"] == _MANAGED_CANDIDATE for entry in manifest["files"]):
+        _match_managed_candidate(root, _read_managed_profile(regular_bytes(root / _MANAGED_CANDIDATE)))
     return manifest
 
 
 def launch_command(root: Path, profile: str, run: Path, *, auxiliary: Path | None = None,
-                   jvm_properties: dict[str, str] | None = None) -> list[str]:
+                   jvm_properties: dict[str, str] | None = None, managed_context: dict | None = None) -> list[str]:
     """補助設定だけを新規auxiliaryへ出力し、runのcwd/rootは変更しない。
 
-    管理propertyは全5項目または未指定。JVMの開始・世代操作は呼出側の責務。
+    通常Mはmanaged_contextと全7項目、GTは既5項目。承認・JVM開始は呼出側の責務。
     """
     verify_bundle(root)
+    if managed_context is not None:
+        _require(profile == "server" and jvm_properties is not None
+                 and jvm_properties.keys() == {"instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest",
+                                               "controlDescriptor", "controlDescriptorSha256"}
+                 and all(managed_context[key] == value for key, value in jvm_properties.items()),
+                 "launch: 通常managed serverは全7項目が必要です")
+        candidate = _read_managed_profile(regular_bytes(root / _MANAGED_CANDIDATE))
+        observed = _expand_managed_launch(candidate, managed_context)
+        validate_managed_launch(candidate, managed_context, observed)
+        validate_bundle_managed_launch(root, managed_context, observed)
+        from .local_ipc import make_private, plain_path
+        auxiliary = Path(managed_context["auxiliary"])
+        private_tmp = Path(managed_context["privateTmp"])
+        for directory in (auxiliary, private_tmp):
+            plain_path(directory)
+            directory.mkdir(exist_ok=False)
+            make_private(directory, directory=True)
+        for name, raw in observed["auxiliaryFiles"].items():
+            path = auxiliary / name
+            with path.open("xb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            make_private(path)
+        return observed["argv"]
     descriptor = json.loads(regular_bytes(root / "launch/profiles.json"))
     _require(descriptor["version"] == 1 and descriptor["platform"] == platform.system()
              and descriptor["machine"] == platform.machine(), "launch: 作成OS/アーキテクチャと一致しません")
@@ -313,8 +618,9 @@ def launch_command(root: Path, profile: str, run: Path, *, auxiliary: Path | Non
     _require(root != run and root not in run.parents, "launch: bundle内へ実行データを置けません")
     auxiliary = auxiliary if auxiliary is not None else run / ".launch"
     properties = jvm_properties if jvm_properties is not None else {}
-    _require(not properties or properties.keys() == {"instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest"},
-             "launch: 管理propertyは全項目が必要です")
+    _require(not properties or profile == "gameTest" and properties.keys() == {
+        "instanceId", "generationId", "startNonce", "proofPath", "runtimeManifest"},
+        "launch: 旧5項目の管理propertyはGameTest専用です。通常Mには承認済みcontextと7項目が必要です")
     _require(all(type(value) is str and value for value in properties.values()), "launch: 管理propertyが不正です")
     _require(auxiliary.is_absolute() and not auxiliary.exists(), "launch: 新しい絶対補助pathが必要です")
     _require(root != auxiliary and root not in auxiliary.parents, "launch: bundleへ起動補助を書き込めません")
