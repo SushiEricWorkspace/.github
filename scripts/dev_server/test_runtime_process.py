@@ -263,6 +263,32 @@ class MacAdapterFaultTests(unittest.TestCase):
         native.kill.assert_not_called()
         native.wait.assert_not_called()
 
+    def test_expired_creation_guard_prevents_macos_process(self):
+        process = self.adapter.OwnedProcess()
+        created = Mock()
+        def before_create():
+            raise RegistryError('START_TIMEOUT', '起動期限を超過しました')
+        with patch.object(self.adapter.subprocess, 'Popen', side_effect=AssertionError('期限後のprocess生成')) as create, \
+                self.assertRaises(RegistryError) as raised:
+            process.start(['python'], Path.cwd(), None, 'nonce', created, before_create=before_create)
+        self.assertEqual('START_TIMEOUT', raised.exception.code)
+        self.assertEqual((None, None, None, 'NOT_CREATED'), (process.process, process.pid, process.group, process.stage))
+        create.assert_not_called()
+        created.assert_not_called()
+
+    def test_creation_guard_precedes_macos_spawn_and_created_callback(self):
+        process = self.adapter.OwnedProcess()
+        events = []
+        native = Mock(pid=123)
+        def spawn(*args, **kwargs):
+            events.append('spawn')
+            return native
+        with patch.object(self.adapter.subprocess, 'Popen', side_effect=spawn):
+            process.start(['python'], Path.cwd(), None, 'nonce', lambda: events.append('created'),
+                          before_create=lambda: events.append('guard'))
+        self.assertEqual(['guard', 'spawn', 'created'], events)
+        self.assertEqual((123, 123, 'RUNNING'), (process.pid, process.group, process.stage))
+
 
 @unittest.skipUnless(os.name == "nt", "Windows native生成APIの故障注入")
 class WindowsCreationFaultTests(unittest.TestCase):

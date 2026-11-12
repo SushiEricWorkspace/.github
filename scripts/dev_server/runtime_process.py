@@ -161,7 +161,8 @@ if os.name == "nt":
             self.group = None
             self.stage = "NOT_CREATED"
 
-        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None, environment=None):
+        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None, environment=None, before_create=None):
+            """生成準備後のbefore_createが成功した場合だけprocessを生成し、失敗時も所有handleを保持する。"""
             self.group = "Local\\sushieric-runtime-" + name
             with security_descriptor() as descriptor:
                 attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
@@ -182,8 +183,11 @@ if os.name == "nt":
                 for handle in start.lpAttributeList["handle_list"]:
                     os.set_handle_inheritable(handle, True)
                 try:
-                    self.handle, self.thread, self.pid, _ = _winapi.CreateProcess(arguments[0], subprocess.list2cmdline(arguments), None, None,
-                        True, 0x4 | subprocess.CREATE_NO_WINDOW, environment, str(cwd), start)
+                    executable, command, directory = arguments[0], subprocess.list2cmdline(arguments), str(cwd)
+                    if before_create is not None:
+                        before_create()
+                    self.handle, self.thread, self.pid, _ = _winapi.CreateProcess(executable, command, None, None,
+                        True, 0x4 | subprocess.CREATE_NO_WINDOW, environment, directory, start)
                     self.stage = "CREATED"
                 finally:
                     for handle in start.lpAttributeList["handle_list"]:
@@ -326,7 +330,10 @@ else:
             self.process = self.pid = self.group = None
             self.stage = "NOT_CREATED"
 
-        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None, environment=None):
+        def start(self, arguments, cwd, log, name, created, *, input_fd=None, output_fd=None, environment=None, before_create=None):
+            """生成直前のbefore_createを呼び、生成後の識別記録をcreatedへ委ねる。"""
+            if before_create is not None:
+                before_create()
             self.process = subprocess.Popen(arguments, cwd=cwd, stdin=subprocess.DEVNULL if input_fd is None else input_fd,
                                             stdout=log if output_fd is None else output_fd, stderr=log, start_new_session=True, env=environment)
             self.pid = self.process.pid

@@ -105,6 +105,7 @@ class StartupTests(unittest.TestCase):
         self.inputs = dict(profile_raw=self.profile, launch_context=self.launch, observed=self.observed, context=self.context,
                            revision=0, deadline=12.0)
         stack = self.enterContext(ExitStack())
+        stack.enter_context(patch.object(startup, "time", SimpleNamespace(monotonic=lambda: 0.0)))
         self.bundle_validator = stack.enter_context(patch.object(startup, "validate_bundle_managed_launch"))
         stack.enter_context(patch.object(startup, "regular_bytes", return_value=self.manifest_raw))
         stack.enter_context(patch.object(startup, "verify_bundle", return_value={"artifactId": self.run["artifactId"],
@@ -351,7 +352,7 @@ class StartupTests(unittest.TestCase):
         self.runtime._active = Mock(return_value=Path(self.launch['run']))
         self.runtime._space = Mock()
         self.runtime.managed = Mock(sessions={})
-        def start(row, payload, generation, endpoints, operation):
+        def start(row, payload, generation, endpoints, operation, deadline):
             self.run['startOperationId'] = operation
             self.run['startRequestHash'] = self.db.execute('SELECT fingerprint FROM runtime_operations WHERE id=?', (operation,)).fetchone()[0]
             self.runtime._record(self.run)

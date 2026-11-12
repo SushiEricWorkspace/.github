@@ -30,7 +30,9 @@ class FakeProcess:
         self.pid = self.group = None
         self.stage = "NOT_CREATED"
 
-    def start(self, arguments, cwd, log, nonce, created, *, environment=None):
+    def start(self, arguments, cwd, log, nonce, created, *, environment=None, before_create=None):
+        if before_create is not None:
+            before_create()
         adapter = self.adapter
         self.pid = adapter.next_pid
         self.group = nonce
@@ -680,8 +682,12 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
 
     def test_start_timeout_preserves_owned_process_and_original_reservations(self):
         self.prepare()
-        self.adapter.start_fault = lambda process: process.proof.update(phase="INITIALIZING")
-        with patch("dev_server.runtime_control.time.monotonic", side_effect=[0, 3, 3]):
+        clock = [0.0]
+        def started(process):
+            process.proof.update(phase="INITIALIZING")
+            clock[0] = 3.0
+        self.adapter.start_fault = started
+        with patch("dev_server.runtime_control.time.monotonic", side_effect=lambda: clock[0]):
             self.assert_code("START_TIMEOUT", self.start)
         self.assertEqual(0, self.rcon_calls)
         self.assertFalse(self.adapter.created[0].closed)

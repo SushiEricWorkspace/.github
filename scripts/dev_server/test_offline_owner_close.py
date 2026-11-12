@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from . import offline_control, offline_process, runtime_control
+from . import offline_control, offline_process, runtime_control, mod_control_startup
 from . import test_offline_complete as completed
 from . import test_offline_prepare as prepared
 from . import test_offline_repeat as repeated
@@ -107,7 +107,7 @@ class OfflineOwnerCloseTests(unittest.TestCase):
         self.enterContext(patch.object(processes.Pipe, 'send', sending))
         self.enterContext(patch.object(processes.Pipe, 'receive', receiving))
         clock = SimpleNamespace(monotonic=lambda: self.clock, sleep=time.sleep)
-        for module in (offline_control, offline_process, runtime_control):
+        for module in (offline_control, offline_process, runtime_control, mod_control_startup):
             self.enterContext(patch.object(module, 'time', clock))
 
     def saved(self):

@@ -338,7 +338,7 @@ class RuntimeControl:
         fields(payload, TOKEN | {"timeoutSeconds"})
         identifier(payload["instanceId"], "instanceId")
         ttl(payload["timeoutSeconds"])
-        deadline = time.monotonic() + payload["timeoutSeconds"] if command == "stop" else None
+        deadline = time.monotonic() + payload["timeoutSeconds"]
         wait = self._lock_wait(deadline) if command == "stop" and self.managed is not None else nullcontext()
         with wait:
             if not dry_run:
@@ -371,6 +371,8 @@ class RuntimeControl:
                     require(current["state"] == row["state"] and not current["pending"], "STALE_OPERATION", "再提示中にrunが変更されました")
                 if command == "stop" and not dry_run:
                     self._stop_handle_release(payload, response, deadline, replay=True)
+                if command == "start":
+                    require(time.monotonic() < deadline, "START_TIMEOUT", "起動結果の再提示前に期限を超過しました")
                 return dict(response, replayed=True, dryRun=dry_run)
             row = self._row(payload, allow_expired=command == "stop")
             joining_stop = command == "stop" and self.managed is not None and row["state"] == "STOPPING"
@@ -401,6 +403,8 @@ class RuntimeControl:
             if dry_run:
                 if command == "stop":
                     self._running(row)
+                else:
+                    require(time.monotonic() < deadline, "START_TIMEOUT", "起動事前確認中に期限を超過しました")
                 return {"dryRun": True, "wouldExecute": command, "instanceId": row["id"]}
             session = self.managed.sessions.get(row["id"]) if self.managed is not None else None
             if joining_stop and session is not None and session.get("direct_stop"):
@@ -438,6 +442,8 @@ class RuntimeControl:
                     if not join_direct and gate["gate"] != "BLOCKED":
                         _change(connection, current, gate["revision"], "BLOCKED")
                 if not join_direct:
+                    if command == "start":
+                        require(time.monotonic() < deadline, "START_TIMEOUT", "起動予約前に期限を超過しました")
                     response = {"instanceId": row["id"], "pending": True}
                     connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
                                        (operation_id, fingerprint, command, row["id"], "PENDING", json.dumps(response)))
@@ -452,7 +458,7 @@ class RuntimeControl:
             committed = False
             try:
                 if command == "start":
-                    result = self._start(row, payload, generation, endpoints, operation_id)
+                    result = self._start(row, payload, generation, endpoints, operation_id, deadline)
                 else:
                     result = self._stop(row, payload, generation, deadline)
                 with self._transaction(row["id"]) as connection:
@@ -471,6 +477,7 @@ class RuntimeControl:
                         else:
                             require(gate["descriptor_hash"] is None and gate["gate"] == "CLOSED",
                                     "CONTROL_BLOCKED", "専用startupの受付を通常proofで開けません")
+                        require(time.monotonic() < deadline, "START_TIMEOUT", "起動結果の確定前に期限を超過しました")
                         _change(connection, current, gate["revision"], "OPEN")
                         connection.execute("UPDATE instances SET state='RUNNING',pending=0 WHERE id=?", (row["id"],))
                     else:
@@ -485,11 +492,16 @@ class RuntimeControl:
                             require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop結果の最終照合後に期限を超過しました")
                         connection.execute("UPDATE instances SET state='LEASED_STOPPED',pending=0,runtime_proof=? WHERE id=?",
                                            (json.dumps(result), row["id"]))
-                    connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (json.dumps(result), operation_id))
+                    encoded = json.dumps(result)
+                    if command == "start":
+                        require(time.monotonic() < deadline, "START_TIMEOUT", "起動結果の記録前に期限を超過しました")
+                    connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?", (encoded, operation_id))
                     connection.execute("DELETE FROM reservations WHERE operation=?", (operation_id,))
                     if command == "stop":
                         connection.execute("DELETE FROM reservations WHERE reference=?", ("stop:" + operation_id,))
                 committed = True
+                if command == "start":
+                    require(time.monotonic() < deadline, "START_TIMEOUT", "起動結果の返却前に期限を超過しました")
                 if command == "stop" and self.managed is not None:
                     try:
                         if "managedSave" in result:
@@ -501,7 +513,7 @@ class RuntimeControl:
                     require(time.monotonic() < deadline, "STOP_TIMEOUT", "stop返却前に期限を超過しました")
                 return result
             except BaseException as error:
-                if committed and command == "stop" and "managedSave" in result:
+                if committed and (command == "start" or "managedSave" in result):
                     raise
                 code = error.code if isinstance(error, RegistryError) else "RUNTIME_FAILED"
                 with self._transaction(row["id"]) as connection:
@@ -569,7 +581,7 @@ class RuntimeControl:
                     "PROOF_MISMATCH", "起動完了phaseが一致しません")
         return proof
 
-    def _start(self, row, payload, generation, endpoints, operation_id):
+    def _start(self, row, payload, generation, endpoints, operation_id, deadline):
         nonce = uuid.uuid4().hex
         run_id = "run-" + nonce
         diagnostics = self._paths(row["id"]) / "diagnostics" / run_id
@@ -581,6 +593,7 @@ class RuntimeControl:
                "proofPath": str(diagnostics / "proof.json"), "cwd": str(generation.resolve()),
                "manifestHash": digest((generation / "runtime/runtime.json").read_bytes()), "endpoints": endpoints,
                "stopRequested": False, "jvmAndChildrenExited": False, "runtimeSaveCompleted": False}
+        require(time.monotonic() < deadline, "START_TIMEOUT", "起動記録前に期限を超過しました")
         expected = self._record(run)
         with self._transaction(row["id"]) as connection:
             current = self.registry._instance(connection, row["id"])
@@ -594,7 +607,6 @@ class RuntimeControl:
             reserve(connection, row["id"], run_id, endpoints)
             connection.execute("UPDATE instances SET run_id=? WHERE id=?", (run_id, row["id"]))
         row["reserved_run_id"] = run_id
-        deadline = time.monotonic() + payload["timeoutSeconds"]
         session = self.managed.prepare(row, run, generation)
         properties = {"instanceId": row["id"], "generationId": row["generation"], "startNonce": nonce,
                       "proofPath": run["proofPath"], "runtimeManifest": str(generation / "runtime/runtime.json")}
@@ -626,12 +638,19 @@ class RuntimeControl:
             make_private(diagnostics / "console.log")
             process = self.process_adapter.OwnedProcess()
             self.processes[run_id] = process
+
+            def before_create():
+                require(time.monotonic() < deadline, "START_TIMEOUT", "OS生成直前に起動期限を超過しました")
+
             try:
-                process.start(arguments, generation, log, nonce, created, environment=session["observed"]["environment"])
+                before_create()
+                process.start(arguments, generation, log, nonce, created,
+                              environment=session["observed"]["environment"], before_create=before_create)
             finally:
                 run["creation"] = {"pid": process.pid, "stage": process.stage, "ownerGroup": process.group}
                 expected = self._record(run, expected=expected)
             self.managed.handshake({key: payload[key] for key in TOKEN}, run, session, deadline)
+            require(time.monotonic() < deadline, "START_TIMEOUT", "起動ACK後に期限を超過しました")
             self.managed.listen(row["id"])
             while True:
                 require(process.poll() is None, "START_FAILED", "起動途中でJVMが終了しました")
@@ -642,10 +661,12 @@ class RuntimeControl:
                         proof = self._proof(run, generation)
                         require_listeners(endpoints, proof["startup"]["listeners"], self.process_adapter.sockets(process.pid))
                         runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
+                        require(time.monotonic() < deadline, "START_TIMEOUT", "起動proof記録前に期限を超過しました")
                         write_json(diagnostics / "startup-proof.json", proof)
                         break
                 require(time.monotonic() < deadline, "START_TIMEOUT", "起動期限を超過しました。自動killしません")
                 time.sleep(0.1)
+        require(time.monotonic() < deadline, "START_TIMEOUT", "起動proof返却前に期限を超過しました")
         return {"instanceId": row["id"], "generation": row["generation"], "runId": run_id, "running": True, "snapshotClean": False}
 
     def _rcon_stop(self, run, generation, process, timeout, *, expected):

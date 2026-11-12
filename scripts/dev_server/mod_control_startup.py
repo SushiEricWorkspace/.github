@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import threading
 import struct
+import time
 
 from . import mod_control_operations as operations
 from . import mod_control_wire as wire
@@ -173,7 +174,8 @@ class _Startup:
             session["request"] = session["hello"] = hello
             grant_frame = _reply(hello, context, "GRANT")
             self.grant(hello, grant_frame, context)
-            self._save(token, context, revision, hello, grant_frame)
+            self._save(token, context, revision, hello, grant_frame, deadline)
+            require(time.monotonic() < deadline, "START_TIMEOUT", "GRANT送信前に起動期限を超過しました")
             require(channel.send_frame(grant_frame, deadline) == len(grant_frame),
                     "CONTROL_UNKNOWN", "GRANT全bytesの送信を確認できません")
             request = channel.receive_frame(deadline)
@@ -184,25 +186,31 @@ class _Startup:
             ack_frame = _reply(request, context, "ACK")
             ack = self.response(request, ack_frame)
             require(ack["type"] == "response" and ack["phase"] == "ACK", "INVALID_INPUT", "成功ACKの原文が必要です")
-            self._save(token, context, revision, request, ack_frame)
+            self._save(token, context, revision, request, ack_frame, deadline)
+            require(time.monotonic() < deadline, "START_TIMEOUT", "ACK送信前に起動期限を超過しました")
             require(channel.send_frame(ack_frame, deadline) == len(ack_frame),
                     "CONTROL_UNKNOWN", "ACK全bytesの送信を確認できません")
+            require(time.monotonic() < deadline, "START_TIMEOUT", "ACK送信後に起動期限を超過しました")
             if defer_ready:
                 session["acknowledged"] = True
                 session["revision"] = revision
                 return ack_frame
             with self.runtime._transaction(token["instanceId"]) as connection:
                 row, _, _, gate = self._row(connection, token, context, revision)
+                require(time.monotonic() < deadline, "START_TIMEOUT", "起動ACK確定前に期限を超過しました")
                 _change(connection, row, revision, "OPEN")
                 connection.execute("UPDATE instances SET state='RUNNING',pending=0 WHERE id=?", (row["id"],))
                 result = {"instanceId": row["id"], "generation": row["generation"], "runId": row["run_id"],
                           "running": True, "snapshotClean": False}
+                encoded = json.dumps(result)
+                require(time.monotonic() < deadline, "START_TIMEOUT", "起動ACK結果の記録前に期限を超過しました")
                 changed = connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=? AND instance=? AND command='start' AND status='PENDING' AND fingerprint=?",
-                    (json.dumps(result), gate["start_operation"], row["id"], gate["start_fingerprint"]))
+                    (encoded, gate["start_operation"], row["id"], gate["start_fingerprint"]))
                 require(changed.rowcount == 1, "STALE_OPERATION", "元起動予約だけを完成できます")
                 deleted = connection.execute("DELETE FROM reservations WHERE operation=? AND reference=? AND instance=? AND lease=? AND epoch=?",
                     (gate["start_operation"], "artifact:" + row["artifact"], row["id"], row["lease"], row["epoch"]))
                 require(deleted.rowcount == 1, "STALE_OPERATION", "元artifact予約だけを解放できます")
+            require(time.monotonic() < deadline, "START_TIMEOUT", "起動ACK返却前に期限を超過しました")
             return ack_frame
         except BaseException:
             if session["checkpoint"] is not None:
@@ -258,9 +266,10 @@ class _Startup:
             if operations.readback(connection, row["id"], request) is not None:
                 operations.unknown(connection, row["id"], request)
 
-    def _save(self, token, context, revision, request, response):
+    def _save(self, token, context, revision, request, response, deadline):
         with self.runtime._transaction(token["instanceId"]) as connection:
             row, _, _, _ = self._row(connection, token, context, revision)
+            require(time.monotonic() < deadline, "START_TIMEOUT", "起動応答記録前に期限を超過しました")
             require(operations.reserve(connection, row["id"], request) is None,
                     "CONTROL_PENDING", "保存済み要求へ作用・応答送信を再実行しません")
             operations.complete(connection, row["id"], request, response)
