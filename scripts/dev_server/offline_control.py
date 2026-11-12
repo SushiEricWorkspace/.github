@@ -861,6 +861,42 @@ class _OfflineOpen:
             finished()
             return returned
 
+    def check_closed_ready(self, token, *, open_operation_id, ready, deadline):
+        """独立明示Readyを保持した元offline終端証拠と照合する。
+
+        新しい呼出期限を使い、元C/W・解放原文・CLOSED/予約終端正本を再照合する。
+        戻り値はclose時Readyとの一致証拠であり、現在のData Readyやstartの許可ではない。
+        Data原本の確認と起動予約・ACK・最終返却までの継続照合は起動側で必要。
+        """
+        token, ready = deepcopy((token, ready))
+        fields(token, TOKEN)
+        identifier(open_operation_id, 'openOperationId')
+        fields(ready, {'worldUuid', 'runUuid', 'stateSha256', 'stateRevision'})
+        for name in ('worldUuid', 'runUuid'):
+            _canonical_uuid(ready[name])
+        _hash(ready['stateSha256'])
+        require(type(ready['stateRevision']) is int and 0 <= ready['stateRevision'] <= 9223372036854775807,
+                'INVALID_INPUT', 'Ready revisionが範囲外です')
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            slot = self.retired.get((token['instanceId'], open_operation_id))
+            require(slot is not None and 'encoded' in slot,
+                    'PROOF_REQUIRED', '保持した完成済みoffline終端証拠が必要です')
+            with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                self._terminal(connection, token, slot, deadline)
+                response = json.loads(slot['controller'].close_response)
+                response['worldUuid'] = slot['opened']['worldUuid']
+                require(ready == {name: response[name] for name in ready},
+                        'PROOF_MISMATCH', '独立明示Readyと元close応答が一致しません')
+                result = dict(status='OFFLINE_CLOSED_READY_VERIFIED', instanceId=token['instanceId'],
+                    generationId=slot['row']['generation'], openOperationId=open_operation_id,
+                    terminationSha256=digest(slot['controller'].termination_response),
+                    writerClosedSha256=digest(slot['controller'].writer_closed_response), ready=ready)
+            returned = deepcopy(result)
+            with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                self._terminal(connection, token, slot, deadline)
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready終端証拠の返却前に期限を超過しました')
+            return returned
+
     def complete(self, token, *, operation_id, deadline):
         """記録済み元W終了証拠からC本人completeを接続し、応答hashを正本へ記録する。
 

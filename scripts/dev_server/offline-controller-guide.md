@@ -387,3 +387,11 @@ P内部の`runtime._offline_finish_close(token, operation_id=元close操作ID, d
 close時と呼出時の短い期限を意図・局所記録・最終直列化/SQL・transaction内の終端照合・commit後照合・返却まで引き継ぎます。最終SQL後の不一致やcommit失敗ではDBをrollbackし、退避済み元object・意図・局所結果は保持します。この場合active枠は復元せず、元pending/予約が後続取得を遮断します。commit後の期限切れ/不一致でも既知終端を巻き戻さず正常返却を拒否します。通常入口から再終端・再生成・自動recoverしません。
 
 予約解放だけで既存startが通らないよう、同世代のoffline終端正本を事前確認と最終予約transactionの双方で拒否します。新しいRuntimeControlでも永続正本を参照し、旧runのprofile承認を再利用して起動しません。独立明示Ready+CLOSEDを受理する肯定gate、公開呼出元の接続、#54復旧・正規recoverと実OS/native本人受入は後続です。
+
+### 独立明示ReadyとCLOSED終端の一致証拠
+
+`RuntimeControl._offline_check_closed_ready(token, open_operation_id=..., ready=..., deadline=...)` は、呼出元が独立に固定した `worldUuid/runUuid/stateSha256/stateRevision` を、保持した元Cのclose応答と照合します。入力は検査前にsnapshotへ固定し、以後はそのsnapshotだけを検査・照合・返却に使います。worldUuidは元C取得要求との一致を要求します。Ready入力の省略や終端応答・旧承認からの自動補完は行いません。
+
+完成済みの退避slotだけを専用照合へ渡します。終端SQL更新の失敗でresult/encoded未作成のslotが残った場合は、元object・原文・元予約を保全してPROOF_REQUIREDで拒否します。前後のread transactionでは、元C/全Wのobject・解放原文・生成binding・全RELEASED進捗、CLOSEDとoffline-open COMPLETEDの正本、予約不在、元lease/世代/run/閉門/停止証拠を再照合します。終了済みC/Wの再観測・再close・旧PENDING callback・局所記録の追加は行いません。失敗は元object・原文・正本を保全します。新しい照合期限を返却まで適用し、完了済みcloseの旧期限は変更しません。
+
+`OFFLINE_CLOSED_READY_VERIFIED` はclose時Readyと終端証拠の一致だけを表します。Dataの現在のReady、chain/receiptの妥当性、Mod startを許可するものではありません。Data原本の確認から起動予約・OS生成直前・ACK・最終記録/返却までの継続照合と公開入力の接続は後続です。この照合に成功しても、第33スライスの既存start遮断を維持します。保持証拠のない新しいRuntimeControlでは、証拠の自動再構築をせず拒否します。
