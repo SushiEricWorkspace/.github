@@ -32,7 +32,7 @@ class LegacyRuntimeTests(unittest.TestCase):
         with patch.object(RuntimeControl, '_start', self.historical_start):
             generation_tests.GenerationTests.setUp(self)
 
-    def historical_start(self, row, payload, generation, endpoints, operation):
+    def historical_start(self, row, payload, generation, endpoints, operation, deadline):
         runtime = self.registry.runtime
         nonce = 'historical-nonce'
         run_id = 'historical-run'
