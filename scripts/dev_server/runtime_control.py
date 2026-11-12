@@ -97,6 +97,11 @@ class RuntimeControl:
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
         return self._offline.record_writer_closed(token, operation_id=operation_id, deadline=deadline)
 
+    def _offline_finish_close(self, token, *, operation_id, deadline):
+        """CLOSED正本から元予約を終端する。旧run承認によるstartの許可は返さない。"""
+        require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
+        return self._offline.finish_close(token, operation_id=operation_id, deadline=deadline)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
@@ -313,6 +318,14 @@ class RuntimeControl:
             require(value is not None, "PROOF_REQUIRED", "起動記録がありません")
             return (json.loads(value[0]), value[0]) if with_record else json.loads(value[0])
 
+    @staticmethod
+    def _offline_start_guard(connection, row):
+        operations = connection.execute("SELECT response FROM runtime_operations WHERE instance=? AND command='offline-open' AND status='COMPLETED'",
+                                        (row['id'],)).fetchall()
+        require(not any(json.loads(operation['response']).get('termination', {}).get('generationId') == row['generation']
+                        for operation in operations),
+                'CONTROL_BLOCKED', 'offline終端後は独立したReady+CLOSEDのstart照合が必要です')
+
     def execute(self, command, payload, *, operation_id, dry_run=False):
         identifier(operation_id, "operationId")
         require(command in {"start", "stop"}, "INVALID_INPUT", "runtime制御はstart/stopだけです")
@@ -357,6 +370,9 @@ class RuntimeControl:
             joining_stop = command == "stop" and self.managed is not None and row["state"] == "STOPPING"
             require(row["generation_bound"] and row["generation"] is not None and (not row["pending"] or joining_stop),
                     "INVALID_STATE", "このleaseへ完成generationが結び付いていません")
+            if command == "start":
+                with self._transaction(row["id"], read_only=True) as connection:
+                    self._offline_start_guard(connection, row)
             generation = self._active(row)
             if command == "start":
                 require(row["state"] in ("READY", "LEASED_STOPPED") and not row["writers"] and not row["children"],
@@ -396,6 +412,8 @@ class RuntimeControl:
                     and current["run_id"] == session["run"] and current["state"] == "LEASED_STOPPED" and not current["pending"])
                 require((current["state"] == row["state"] or joining_current) and (not current["pending"] or joining_current),
                         "BUSY", "枠の状態が変更されました")
+                if command == "start":
+                    self._offline_start_guard(connection, current)
                 pending_writers = connection.execute("SELECT id FROM writer_sessions WHERE instance=? AND pending!=0", (row["id"],)).fetchall()
                 calls = connection.execute("SELECT w.session FROM reservations r LEFT JOIN writer_operations w ON w.id=r.operation WHERE r.instance=? AND r.reference LIKE 'writer-call:%'", (row["id"],)).fetchall()
                 drainable = self.managed is not None and command == "stop" and all(
