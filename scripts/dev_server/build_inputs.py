@@ -18,13 +18,19 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def regular_bytes(path: Path) -> bytes:
-    """リンク・特殊ファイルを拒否し、読み取り中の差替えも拒否する。"""
+def regular_bytes(path: Path, *, maximum: int | None = None) -> bytes:
+    """リンク・特殊ファイルと読取中の差替えを拒否する。maximum指定時は読込も上限+1byteに制限する。"""
     before = path.lstat()
     if (not stat.S_ISREG(before.st_mode) or
             getattr(before, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
         raise ContractError("input: 通常ファイル以外は使用できません")
-    data = path.read_bytes()
+    if maximum is None:
+        data = path.read_bytes()
+    else:
+        with path.open("rb", buffering=0) as source:
+            data = source.read(maximum + 1)
+        if len(data) > maximum:
+            raise ContractError("input: ファイルが読込上限を超えています")
     after = path.lstat()
     if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
         raise ContractError("input: 読み取り中に変更されました")

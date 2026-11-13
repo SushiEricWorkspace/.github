@@ -9,7 +9,7 @@ from .mod_control_runtime import _closed_writers
 from .local_ipc import plain_path
 from .snapshot_data import portable_properties, properties
 from .mod_control_startup import _admission, _change
-from .mod_control_wire import _canonical_uuid, _hash
+from .mod_control_wire import _canonical_uuid, _hash, _json
 from .offline_process import OfflineProcess
 from .registry import fields, identifier, require
 from .runtime_bundle import verify_bundle, require_data_generation
@@ -895,6 +895,81 @@ class _OfflineOpen:
             with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
                 self._terminal(connection, token, slot, deadline)
             require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'Ready終端証拠の返却前に期限を超過しました')
+            return returned
+
+    def read_ready_original(self, token, *, open_operation_id, ready, deadline):
+        """独立Readyと元終端に一致する現在原文を、固定generationから読み返す。
+
+        world-id/current/不変stateと元C/Wの保持証拠を返却前にも照合する。chain/receiptの
+        意味検証と起動予約は呼出元の後続責務であり、この結果だけでstartを受理しない。
+        """
+        token, ready = deepcopy((token, ready))
+        fields(token, TOKEN)
+        identifier(open_operation_id, 'openOperationId')
+        key = token['instanceId'], open_operation_id
+
+        def read(path, maximum=16 * 1024 * 1024):
+            require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready原文読取前に期限を超過しました')
+            plain_path(path)
+            info = path.lstat()
+            require(info.st_nlink == 1 and info.st_size <= maximum,
+                    'PROOF_MISMATCH', 'Ready原文は上限内の単独通常fileが必要です')
+            raw = regular_bytes(path, maximum=maximum)
+            require(path.lstat().st_nlink == 1, 'PROOF_MISMATCH', 'Ready原文のlink数が変更されました')
+            require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready原文読取後に期限を超過しました')
+            return raw
+
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            slot = self.retired.get(key)
+            closed = self.check_closed_ready(token, open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+            require(slot is not None and self.retired.get(key) is slot,
+                    'STALE_OPERATION', '元offline終端の退避先が変更されました')
+            generation = self.runtime._active_generation(slot['row'])
+            settings_path = generation / 'server.properties'
+            settings_raw = read(settings_path)
+            settings = properties(portable_properties(settings_raw))
+            world = generation / settings['level-name']
+            shop = generation / 'config/SushiEricServerMod/shop_data'
+            require(slot['opened']['worldRoot'] == str(world) and slot['opened']['shopDirectory'] == str(shop),
+                    'PROOF_MISMATCH', '元Cのworld/shopと固定generationが一致しません')
+            data = world / 'sushieric'
+            world_path = data / 'world-id'
+            world_raw = read(world_path, 128)
+            require(world_raw.decode('utf-8').strip() == ready['worldUuid'],
+                    'PROOF_MISMATCH', '固定world-idと独立Readyが一致しません')
+            current_path = data / 'run-state/current.json'
+            current_raw = read(current_path)
+            require(digest(current_raw) == ready['stateSha256'],
+                    'PROOF_MISMATCH', '現在Ready原文と独立hashが一致しません')
+            state_path = data / 'run-state/states' / (ready['stateSha256'] + '.json')
+            state_raw = read(state_path)
+            require(state_raw == current_raw, 'PROOF_MISMATCH', 'currentと不変state原文が一致しません')
+            state = _json(current_raw)
+            fields(state, {'format', 'worldUuid', 'generation', 'runUuid', 'stateRevision', 'paths',
+                           'originSha256', 'previousStateSha256', 'payload'})
+            require(type(state['format']) is int and state['format'] == 1
+                    and type(state['stateRevision']) is int and state['stateRevision'] == ready['stateRevision']
+                    and state['worldUuid'] == ready['worldUuid'] and state['runUuid'] == ready['runUuid']
+                    and state['generation'] == closed['generationId'],
+                    'PROOF_MISMATCH', '現在Readyの形式・world/run/世代/revisionが一致しません')
+            require(state['paths'] == dict(worldRoot=str(world), database=str(data / 'server.sqlite'), shopDirectory=str(shop)),
+                    'PROOF_MISMATCH', '現在Readyの保存先bindingが一致しません')
+            fields(state['payload'], {'type', 'sealSha256', 'admissionSha256'})
+            require(state['payload']['type'] == 'io.github.sushiericworkspace.sushiericdatamodel.database.run.WorldRunPhase.Ready',
+                    'PROOF_MISMATCH', '現在原文はReadyが必要です')
+            for value in (state['originSha256'], state['payload']['sealSha256'], state['payload']['admissionSha256']):
+                _hash(value)
+            if state['previousStateSha256'] is not None:
+                _hash(state['previousStateSha256'])
+            returned = deepcopy(dict(closed, status='OFFLINE_READY_ORIGINAL_MATCHED', stateJson=current_raw.decode('utf-8')))
+            for path, raw, maximum in ((settings_path, settings_raw, 16 * 1024 * 1024),
+                                      (world_path, world_raw, 128), (current_path, current_raw, 16 * 1024 * 1024),
+                                      (state_path, state_raw, 16 * 1024 * 1024)):
+                require(read(path, maximum) == raw, 'PROOF_MISMATCH', 'Ready原文の保持中にfileが変更されました')
+            self.runtime._active_generation(slot['row'])
+            with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
+                self._terminal(connection, token, slot, deadline)
+            require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready原文の返却前に期限を超過しました')
             return returned
 
     def complete(self, token, *, operation_id, deadline):
