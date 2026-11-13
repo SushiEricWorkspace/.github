@@ -39,7 +39,14 @@ public final class WorldRunLifecycle {
     public WorldRunLifecycle(Path world, Path shop, UUID uuid, int timeout) {
         observedWorld=world; observedShop=shop; observedWorldUuid=uuid;
     }
-    public WorldRunStatus readStatus() { return current; }
+    public static int reads;
+    public static boolean failRead, loseParentAfterRead;
+    public WorldRunStatus readStatus() {
+        reads++;
+        if (failRead) throw new IllegalStateException("fixture chain/receipt不一致");
+        if (loseParentAfterRead) WorldProcessIdentities.parentAlive=false;
+        return current;
+    }
     public WorldRunStatus observeExit(WorldRunStatus expected) {
         gameExitCalls++;
         if (expected != current || !(expected.getState().getPayload() instanceof WorldRunPhase.SavedPendingExit saved))

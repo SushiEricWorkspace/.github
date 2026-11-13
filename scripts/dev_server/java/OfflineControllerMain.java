@@ -326,6 +326,58 @@ public final class OfflineControllerMain {
     private static void uuid(String value) { require(UUID.fromString(value).toString().equals(value)); }
     private static void require(boolean value) { if (!value) throw new IllegalArgumentException("限定controller契約に一致しません"); }
 
+    /** ownerを取得しない単発読取。結果はstart許可ではなく、Pの継続照合が必要。 */
+    public static final class Ready {
+        public static void main(String[] arguments) throws Exception {
+            require(arguments.length == 0);
+            new OfflineControllerMain(System.in, System.out).runReady();
+        }
+    }
+
+    void runReady() throws Exception {
+        String id = null;
+        String hash = null;
+        try {
+            JsonObject frame = read(input);
+            fields(frame, "command", "operationId", "requestHash", "sessionId", "nonce", "controller", "owner",
+                    "generation", "worldRoot", "shopDirectory", "worldUuid", "runUuid",
+                    "expectedStateSha256", "expectedRevision");
+            require(string(frame, "command").equals("verify-ready"));
+            id = string(frame, "operationId"); hash = string(frame, "requestHash");
+            identifier(id); sha256(hash);
+            session = string(frame, "sessionId"); nonce = string(frame, "nonce");
+            identifier(session); identifier(nonce);
+            for (String key : List.of("generation", "worldUuid", "runUuid")) uuid(string(frame, key));
+            sha256(string(frame, "expectedStateSha256"));
+            long revision = number(frame, "expectedRevision");
+            self = identity(object(frame, "owner")); parent = identity(object(frame, "controller"));
+            require(!self.equals(parent) && self.getHostHash().equals(parent.getHostHash()) &&
+                    self.getBootId().equals(parent.getBootId()));
+            require(ProcessHandle.current().parent().orElseThrow().pid() == parent.getPid());
+            checkActors();
+            Path world = Path.of(string(frame, "worldRoot"));
+            Path shop = Path.of(string(frame, "shopDirectory"));
+            require(world.isAbsolute() && shop.isAbsolute());
+            lifecycle = new WorldRunLifecycle(world, shop, UUID.fromString(string(frame, "worldUuid")), 5000);
+            WorldRunStatus current = lifecycle.readStatus();
+            WorldRunState state = current.getState();
+            require(current.getSha256().equals(string(frame, "expectedStateSha256")) &&
+                    state.getStateRevision() == revision &&
+                    state.getWorldUuid().equals(string(frame, "worldUuid")) &&
+                    state.getGeneration().equals(string(frame, "generation")) &&
+                    state.getRunUuid().equals(string(frame, "runUuid")) &&
+                    state.getPayload() instanceof WorldRunPhase.Ready);
+            Map<String, JsonElement> response = new LinkedHashMap<>(status("READY_VERIFIED", id, hash, current));
+            response.put("worldUuid", JsonElementKt.JsonPrimitive(state.getWorldUuid()));
+            response.put("generation", JsonElementKt.JsonPrimitive(state.getGeneration()));
+            checkActors();
+            write(new JsonObject(response));
+        } catch (Exception failure) {
+            write(packet("REJECTED", id, hash));
+            throw new IOException("Ready検証未完了。Pの元証拠を保全してください", failure);
+        }
+    }
+
     /** P専用の単発W。候補公開は最終SUCCESSではなく、実終了とC completeはP/Cが別途照合する。 */
     public static final class Worker {
         private final OfflineControllerMain wire;
