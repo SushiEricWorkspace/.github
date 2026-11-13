@@ -392,8 +392,12 @@ close時と呼出時の短い期限を意図・局所記録・最終直列化/SQ
 
 通常startは`RuntimeControl.execute`入口で`timeoutSeconds`からmonotonic期限を一度固定します。instance lockの競合は`LOCK_BUSY`で即時拒否します。事前確認、起動予約、OS生成直前、GRANT/ACKの記録と送信、起動proof、最終結果の記録と返却に同じ期限を適用します。予約前の期限超過は予約作成を拒否し、予約後の失敗では元予約と所有processを保全します。commit直後の期限超過では確定済み結果を保持し、呼出元への正常返却を拒否します。
 
+2026-11-13のユーザー判断により、この期限の保証範囲はP側の受付・予約・OS adapter生成準備後・GRANT送信・BOUND/ACK確認・最終記録/返却です。GRANT後のMod内部のData beginRunは固定Modの既存期限を使用し、Pから見た作用後不明は元原文・予約・識別を保持します。
+
 `RuntimeControl._offline_check_closed_ready(token, open_operation_id=..., ready=..., deadline=...)` は、呼出元が独立に固定した `worldUuid/runUuid/stateSha256/stateRevision` を、保持した元Cのclose応答と照合します。入力は検査前にsnapshotへ固定し、以後はそのsnapshotだけを検査・照合・返却に使います。worldUuidは元C取得要求との一致を要求します。Ready入力の省略や終端応答・旧承認からの自動補完は行いません。
 
 完成済みの退避slotだけを専用照合へ渡します。終端SQL更新の失敗でresult/encoded未作成のslotが残った場合は、元object・原文・元予約を保全してPROOF_REQUIREDで拒否します。前後のread transactionでは、元C/全Wのobject・解放原文・生成binding・全RELEASED進捗、CLOSEDとoffline-open COMPLETEDの正本、予約不在、元lease/世代/run/閉門/停止証拠を再照合します。終了済みC/Wの再観測・再close・旧PENDING callback・局所記録の追加は行いません。失敗は元object・原文・正本を保全します。新しい照合期限を返却まで適用し、完了済みcloseの旧期限は変更しません。
 
 `OFFLINE_CLOSED_READY_VERIFIED` はclose時Readyと終端証拠の一致だけを表します。Dataの現在のReady、chain/receiptの妥当性、Mod startを許可するものではありません。Data原本の確認から起動予約・OS生成直前・ACK・最終記録/返却までの継続照合と公開入力の接続は後続です。この照合に成功しても、第33スライスの既存start遮断を維持します。保持証拠のない新しいRuntimeControlでは、証拠の自動再構築をせず拒否します。
+
+`RuntimeControl._offline_read_ready_original(token, open_operation_id=..., ready=..., deadline=...)` は、独立Readyと元終端へ一致する固定generationの`world-id`・`current.json`・不変state原文を読み返します。戻り値`OFFLINE_READY_ORIGINAL_MATCHED`の`stateJson`は元UTF-8原文です。返却前に原文と元C/W・CLOSED・終端・予約不在を再照合します。chain/receiptの公式検証と新しいstart予約以降の接続は後続であり、この読取結果をcached admissionとして使用しません。
