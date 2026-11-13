@@ -3,13 +3,14 @@ import json
 import os
 from pathlib import Path
 import unittest
+import zipfile
 from unittest.mock import patch
 
-from .build_inputs import canonical
+from .build_inputs import canonical, digest
 from .contracts import ContractError
 from .offline_controller_bundle import (MAIN, SOURCE, DESCRIPTOR, DIRECTORY,
                                         freeze_offline_controller, verify_offline_controller,
-                                        offline_controller_command, offline_worker_command)
+                                        offline_controller_command, offline_worker_command, offline_ready_command)
 from .runtime_bundle import Freezer, verify_bundle
 from . import test_database_proxy_bundle as fixtures
 
@@ -26,7 +27,7 @@ class OfflineControllerBundleTests(unittest.TestCase):
         self.lock = {'sources': [{'root': str(source_root), 'record': {'repo': '.github'},
                                  'inputs': [{'path': SOURCE}]}]}
 
-    def compile(self, *, exit_code=0, extra=False, worker=False):
+    def compile(self, *, exit_code=0, extra=False, worker=False, ready=False):
         def popen(command, *, cwd, stdout, stderr):
             args = [json.loads(line) for line in Path(command[2][1:]).read_text(encoding='utf-8').splitlines()]
             self.assertEqual('--release', args[0])
@@ -42,6 +43,9 @@ class OfflineControllerBundleTests(unittest.TestCase):
                 (target / worker_name).write_bytes(b'\xca\xfe\xba\xbe\0\0\0A' + b'synthetic W')
             if extra:
                 (target / 'Worker.class').write_bytes(b'\xca\xfe\xba\xbe\0\0\0A')
+            if ready:
+                (target / (MAIN.replace('.', '/') + '$Ready.class')).write_bytes(
+                    b'\xca\xfe\xba\xbe\0\0\0A' + b'synthetic Ready')
             class Process:
                 pid = 12346
                 def wait(self):
@@ -73,6 +77,59 @@ class OfflineControllerBundleTests(unittest.TestCase):
         offline_controller_command(self.bundle)
         with self.assertRaises(ContractError):
             offline_worker_command(self.bundle)
+
+    def test_ready_command_uses_fixed_nested_entrypoint_without_request_arguments(self):
+        self.compile(ready=True)
+        self.assertEqual([*offline_controller_command(self.bundle)[:-1], MAIN + '$Ready'],
+                         offline_ready_command(self.bundle))
+
+    def test_old_controller_does_not_substitute_owner_for_ready_reader(self):
+        self.compile(worker=True)
+        with self.assertRaises(ContractError):
+            offline_ready_command(self.bundle)
+
+    def test_ready_command_rejects_changed_fixed_jar(self):
+        self.compile(ready=True)
+        (self.bundle / DIRECTORY / 'offline-controller.jar').write_bytes(b'changed')
+        with self.assertRaises(ContractError):
+            offline_ready_command(self.bundle)
+
+    def test_ready_class_added_after_command_verification_is_rejected(self):
+        self.compile(worker=True)
+        jar = self.bundle / DIRECTORY / 'offline-controller.jar'
+        original_hash = digest(jar.read_bytes())
+        def command(root):
+            arguments = offline_controller_command(root)
+            with zipfile.ZipFile(jar, 'a') as archive:
+                archive.writestr(MAIN.replace('.', '/') + '$Ready.class', b'\xca\xfe\xba\xbe\0\0\0A')
+            self.assertNotEqual(original_hash, digest(jar.read_bytes()))
+            return arguments
+        with patch('dev_server.offline_controller_bundle.offline_controller_command', side_effect=command):
+            with self.assertRaises(ContractError):
+                offline_ready_command(self.bundle)
+        with self.assertRaises(ContractError):
+            verify_bundle(self.bundle)
+
+    def test_ready_class_added_after_final_manifest_verification_is_rejected(self):
+        self.compile(worker=True)
+        jar = self.bundle / DIRECTORY / 'offline-controller.jar'
+        original_hash = digest(jar.read_bytes())
+        calls = 0
+        def verified(root):
+            nonlocal calls
+            manifest = verify_bundle(root)
+            calls += 1
+            if calls == 2:
+                with zipfile.ZipFile(jar, 'a') as archive:
+                    archive.writestr(MAIN.replace('.', '/') + '$Ready.class', b'\xca\xfe\xba\xbe\0\0\0A')
+                self.assertNotEqual(original_hash, digest(jar.read_bytes()))
+            return manifest
+        with patch('dev_server.runtime_bundle.verify_bundle', side_effect=verified):
+            with self.assertRaises(ContractError):
+                offline_ready_command(self.bundle)
+        self.assertEqual(2, calls)
+        with self.assertRaises(ContractError):
+            verify_bundle(self.bundle)
 
     def test_freeze_does_not_need_completed_runtime_manifest(self):
         manifest = self.bundle / 'runtime.json'

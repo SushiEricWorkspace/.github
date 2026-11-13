@@ -10,6 +10,16 @@
 
 CはData121 `observeExit`／`openManagedOfflineWriter`／writer `assignWorker`／writer `complete`／writer `close`を限定して呼びます。game退出の単発入口は第14スライス節、completeは第10スライス節を参照してください。ゲームのbeginRun/finishSaves、119 Editの実行、snapshot操作は受け付けません。元sealと不変chain・Ready・DBcloseの照合はData121へ委ねます。
 
+## 現在Readyの公式読取（第37スライス先行部分）
+
+`offline_ready_command(bundle)`は同じ固定C JARの`OfflineControllerMain$Ready`だけを選びます。既存bundleにこのclassが無ければ拒否し、owner取得mainへ代替しません。新しいsource-lockによるbundle生成が必要です。このスライスではPの`OfflineProcess`・start受付への呼出しをまだ接続していません。
+
+私設frameは上記と同じ上限・形式で、`command=verify-ready, operationId, requestHash, sessionId, nonce, controller, owner, generation, worldRoot, shopDirectory, worldUuid, runUuid, expectedStateSha256, expectedRevision`だけを受け付けます。UUID・hash・識別子の形式はopenと同じ、revisionは非負の64-bit整数です。`controller`は実parent P、`owner`はこの読取helper本人を指します。Registry lease/drainをこの読取から推測しません。
+
+固定Dataの`WorldRunLifecycle.readStatus()`でcurrent・不変state・chain/receiptを公式検証し、独立入力のworld/generation/run/hash/revisionとReady型を照合します。Data owner取得・observeExit・Edit・closeは呼びません。P/native本人を読取前後に照合し、`READY_VERIFIED`と`operationId, requestHash, sessionId, nonce, worldUuid, generation, runUuid, stateSha256, stateRevision`を一回だけ返して終了します。不正入力・公式検証失敗・本人不一致は`REJECTED`と非正常終了です。応答不明時の再送・再起動をこの入口は行いません。
+
+結果は読取時点の一致であり、start許可・Registry CLOSED・資源解放を表しません。後続のP側接続で元終端/予約不在・原文・全binding、同一要求と応答原文、読取helperの正常exit/全child不在と正常解放を継続照合する必要があります。入口で固定した単一期限はPの受付・予約・adapter生成準備後・GRANT送信・BOUND/ACK・最終記録/返却まで使用します。GRANT後のMod内部作用は既存Mod期限に委ね、作用後不明は元原本・予約・識別を保全します（2026-11-13の確定判断）。このスライスでは固定Data/Mod契約を変更していません。
+
 ## P側の前提
 
 このmainはprivate inherited stdin/stdout専用です。ネットワークendpoint・任意SQL・Host許可flag・root常駐daemonを追加しません。Pは同じinstance/world境界でstart排他を取得し、元M/全childの終了、最新game sealと既存receipt、他writer受付遮断・accepted drainを確認した後にだけCを起動します。PがCの固定artifact・実PID/start/host/bootを観測し、C専用OwnedProcessと私設pipeを所有する必要があります。

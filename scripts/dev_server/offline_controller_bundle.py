@@ -1,5 +1,6 @@
 """停止中controller Cを同版Host配布と固定JDKへ封じる。起動・Registry更新は行わない。"""
 
+import io
 import json
 import os
 from pathlib import Path
@@ -84,4 +85,19 @@ def offline_worker_command(root):
     main = MAIN + '$Worker'
     with zipfile.ZipFile(root / DIRECTORY / 'offline-controller.jar') as archive:
         _require(main.replace('.', '/') + '.class' in archive.namelist(), '固定helperにworkerがありません')
+    return [*arguments[:-1], main]
+
+
+def offline_ready_command(root):
+    """P専用の単発readStatus検証。排他・期限・終了/解放とstart許可は呼出元の責務。"""
+    from .runtime_bundle import verify_bundle
+    arguments = offline_controller_command(root)
+    manifest = verify_bundle(root)
+    main = MAIN + '$Ready'
+    name = DIRECTORY + '/offline-controller.jar'
+    expected = next(entry['sha256'] for entry in manifest['files'] if entry['path'] == name)
+    data = regular_bytes(root / name)
+    _require(digest(data) == expected, 'Ready検証のJAR原文が固定manifestと異なります')
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        _require(main.replace('.', '/') + '.class' in archive.namelist(), '固定helperにReady検証がありません')
     return [*arguments[:-1], main]
