@@ -64,6 +64,12 @@ closeは`command=close, operationId, requestHash, sessionId, nonce, openOperatio
 
 `OWNER_CLOSED`はDB側のowner終了だけを表します。PがC/全childの実exitを観測し、Registry writer CLOSEDを確定するまでMod startを許可してはいけません。Data ReadyだけでCLOSEDを推測しません。
 
+## 通常M生成入口の共通化（第42スライス先行部分）
+
+通常`_start`のdescriptor/launch準備・生成時記録・`OwnedProcess.start`を、内部の`_create` context managerへ切り出します。再採番・run記録・ports予約は呼出元に残し、元run_id/nonce/diagnostics/期限を明示して渡します。contextは生成済みsession/processを渡した後もconsole logを開いたまま保持し、通常handshake/proofの終了又は例外時にだけ親logを閉じます。生成失敗時のfinally記録と所有process保持、adapter内部準備後のbefore_create期限検査を維持します。
+
+本部分は通常経路の切出しだけです。第41の固定結果/callbackをrun正本のwrite内照合と新M生成証拠へ結ぶoffline呼出元は未接続です。元予約の再取得・可変slotからの基準再採用を許可する入口は追加しません。新offline runのdescriptor/M生成・GRANT/ACK/最終返却は後続で同じ固定callback/期限へ接続します。
+
 ## 新startのports予約（第41スライス先行部分）
 
 `_offline_reserve_start`は、同じ固定run/nonce/承認・Ready証拠から、start/PENDING・artifact参照と全endpoint予約を一つの短いRegistry transactionで取得します。既存`runtime_ports.reserve`のwildcard/dual-stack/host/protocol/address/port競合規則を使い、部分予約や新startの記録だけを残しません。他runの予約を消したり空きportへ切り替えたりしません。

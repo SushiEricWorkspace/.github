@@ -625,6 +625,30 @@ class RuntimeControl:
             reserve(connection, row["id"], run_id, endpoints)
             connection.execute("UPDATE instances SET run_id=? WHERE id=?", (run_id, row["id"]))
         row["reserved_run_id"] = run_id
+        with self._create(row, run, generation, diagnostics, endpoints, nonce, run_id, expected, deadline) as (session, process):
+            self.managed.handshake({key: payload[key] for key in TOKEN}, run, session, deadline)
+            require(time.monotonic() < deadline, "START_TIMEOUT", "起動ACK後に期限を超過しました")
+            self.managed.listen(row["id"])
+            while True:
+                require(process.poll() is None, "START_FAILED", "起動途中でJVMが終了しました")
+                runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
+                if Path(run["proofPath"]).exists():
+                    phase = read_json(Path(run["proofPath"]))["phase"]
+                    if phase != "INITIALIZING":
+                        proof = self._proof(run, generation)
+                        require_listeners(endpoints, proof["startup"]["listeners"], self.process_adapter.sockets(process.pid))
+                        runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
+                        require(time.monotonic() < deadline, "START_TIMEOUT", "起動proof記録前に期限を超過しました")
+                        write_json(diagnostics / "startup-proof.json", proof)
+                        break
+                require(time.monotonic() < deadline, "START_TIMEOUT", "起動期限を超過しました。自動killしません")
+                time.sleep(0.1)
+        require(time.monotonic() < deadline, "START_TIMEOUT", "起動proof返却前に期限を超過しました")
+        return {"instanceId": row["id"], "generation": row["generation"], "runId": run_id, "running": True, "snapshotClean": False}
+
+    @contextmanager
+    def _create(self, row, run, generation, diagnostics, endpoints, nonce, run_id, expected, deadline):
+        """同じrunのM生成資源を保持する。予約・再採番・handshake・正常終了扱いは行わない。"""
         session = self.managed.prepare(row, run, generation)
         properties = {"instanceId": row["id"], "generationId": row["generation"], "startNonce": nonce,
                       "proofPath": run["proofPath"], "runtimeManifest": str(generation / "runtime/runtime.json")}
@@ -667,25 +691,7 @@ class RuntimeControl:
             finally:
                 run["creation"] = {"pid": process.pid, "stage": process.stage, "ownerGroup": process.group}
                 expected = self._record(run, expected=expected)
-            self.managed.handshake({key: payload[key] for key in TOKEN}, run, session, deadline)
-            require(time.monotonic() < deadline, "START_TIMEOUT", "起動ACK後に期限を超過しました")
-            self.managed.listen(row["id"])
-            while True:
-                require(process.poll() is None, "START_FAILED", "起動途中でJVMが終了しました")
-                runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
-                if Path(run["proofPath"]).exists():
-                    phase = read_json(Path(run["proofPath"]))["phase"]
-                    if phase != "INITIALIZING":
-                        proof = self._proof(run, generation)
-                        require_listeners(endpoints, proof["startup"]["listeners"], self.process_adapter.sockets(process.pid))
-                        runtime_process.require_identity(run["identity"], self.process_adapter.identity(process.pid))
-                        require(time.monotonic() < deadline, "START_TIMEOUT", "起動proof記録前に期限を超過しました")
-                        write_json(diagnostics / "startup-proof.json", proof)
-                        break
-                require(time.monotonic() < deadline, "START_TIMEOUT", "起動期限を超過しました。自動killしません")
-                time.sleep(0.1)
-        require(time.monotonic() < deadline, "START_TIMEOUT", "起動proof返却前に期限を超過しました")
-        return {"instanceId": row["id"], "generation": row["generation"], "runId": run_id, "running": True, "snapshotClean": False}
+            yield session, process
 
     def _rcon_stop(self, run, generation, process, timeout, *, expected):
         def verify():
