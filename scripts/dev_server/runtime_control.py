@@ -121,7 +121,7 @@ class RuntimeControl:
                                           open_operation_id=open_operation_id, ready=ready, deadline=deadline)
 
     def _offline_reserve_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
-        """新startの予約結果と固定照合callbackを組で返す。OS生成やRUNNING確定は行わない。"""
+        """新start/全portsの予約結果と固定照合callbackを組で返す。OS生成やRUNNING確定は行わない。"""
         require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
         return self._offline.reserve_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
             open_operation_id=open_operation_id, ready=ready, deadline=deadline)

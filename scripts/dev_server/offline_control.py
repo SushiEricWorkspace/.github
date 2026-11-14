@@ -15,7 +15,7 @@ from .offline_process import OfflineProcess
 from .registry import fields, identifier, require
 from .runtime_bundle import verify_bundle, require_data_generation
 from .runtime_control import TOKEN
-from .runtime_ports import instance_endpoints
+from .runtime_ports import instance_endpoints, reserve
 
 
 class _OfflineOpen:
@@ -1161,7 +1161,7 @@ class _OfflineOpen:
             return returned, (evidence, proof_memory)
 
     def reserve_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
-        """確定した公式Ready証拠から新startだけを予約する。M生成・GRANT・RUNNINGは後続。
+        """確定した公式Ready証拠から新startと全portsを原子的に予約する。M生成・GRANT・RUNNINGは後続。
 
         予約後は旧停止状態を再要求しない。commit/返却不明でも元意図と読取資源を保持し、
         同ID/別IDで再生成や予約の置換を行わない。公開startの迂回入口にはしない。
@@ -1206,6 +1206,7 @@ class _OfflineOpen:
             declaration = next(v for v in inventory['instances'] if v['instanceId'] == instance)
             declaration_raw = canonical(declaration)
             endpoints = instance_endpoints(declaration)
+            endpoints_raw = canonical(endpoints)
             stop_id = json.loads(row['runtime_proof'])['stopOperationId']
 
             def ledger(connection):
@@ -1250,7 +1251,7 @@ class _OfflineOpen:
                         and held.get('binding') is verify_reserved and held.get('result') == result_raw
                         and self.registry.inventory is inventory
                         and any(item is declaration for item in inventory['instances'])
-                        and canonical(declaration) == declaration_raw,
+                        and canonical(declaration) == declaration_raw and canonical(endpoints) == endpoints_raw,
                         'PROOF_MISMATCH', '新start意図と確定読取証拠の保持先が変更されました')
                 require(self.runtime.managed is managed and managed.approvals.get(instance) is approval
                         and canonical(approval) == approval_raw,
@@ -1283,6 +1284,7 @@ class _OfflineOpen:
                         and not connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND status!='COMPLETED' AND id!=?",
                                                    (instance,operation_id)).fetchone(),
                         'STALE_OPERATION', '新start専有予約と元offline予約不在が一致しません')
+                self.registry.generation._observe_endpoints(connection, current, {'endpoints':endpoints})
                 memory()
 
             def verify_reserved():
@@ -1305,6 +1307,7 @@ class _OfflineOpen:
                     require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
                             'OPERATION_CONFLICT', 'start IDが他の操作で使用されています')
                 memory()
+                reserve(connection, instance, run_id, endpoints)
                 connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
                                    (operation_id,fingerprint,'start',instance,'PENDING',encoded))
                 connection.execute("UPDATE instances SET state='STARTING',pending=1,run_id=?,runtime_proof=NULL,clean_proof=NULL WHERE id=?",
