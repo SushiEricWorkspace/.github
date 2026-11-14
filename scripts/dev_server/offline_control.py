@@ -1288,13 +1288,14 @@ class _OfflineOpen:
                 self.registry.generation._observe_endpoints(connection, current, {'endpoints':endpoints})
                 memory()
 
-            def verify_reserved(connection=None):
+            def verify_reserved(connection=None, *, memory_only=False):
                 if connection is not None:
                     pending(connection)
                     return encoded
-                inputs()
-                with self.runtime._transaction(instance, read_only=True) as connection:
-                    pending(connection)
+                if not memory_only:
+                    inputs()
+                    with self.runtime._transaction(instance, read_only=True) as connection:
+                        pending(connection)
                 memory()
                 require(canonical(returned) == result_raw, 'PROOF_MISMATCH', '新start予約の返却証拠が変更されました')
                 require(time.monotonic() < deadline, 'START_TIMEOUT', '新start予約の返却期限を超過しました')
@@ -1363,6 +1364,7 @@ class _OfflineOpen:
             self.start_records[key] = held
 
         def memory():
+            verify_reserved(memory_only=True)
             require(self.runtime is runtime and self.registry is registry and runtime.registry is registry
                     and self.start_records.get(key) is held and held.get('packet') is packet
                     and packet[0] is reservation and packet[1] is verify_reserved
