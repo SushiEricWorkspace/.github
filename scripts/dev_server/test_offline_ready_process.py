@@ -98,7 +98,10 @@ class ReadyProcessTests(unittest.TestCase):
             raise RegistryError('STALE_OPERATION', 'fixture 元Ready/CLOSED/終端の変更')
 
     def read(self):
-        return self.reader.verify_ready(self.input, 10.0)
+        result, binding = self.reader.verify_ready(self.input, 10.0)
+        self.assertIs(self.reader.ready_check_binding, binding)
+        binding[1]()
+        return result
 
     def effects(self):
         return (sum(getattr(p,'starts',0) for p in self.adapter.processes),len(self.pipes),

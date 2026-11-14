@@ -114,6 +114,12 @@ class RuntimeControl:
         return self._offline.read_ready_original(token, open_operation_id=open_operation_id,
                                                  ready=ready, deadline=deadline)
 
+    def _offline_verify_ready(self, token, *, operation_id, open_operation_id, ready, deadline):
+        """元終端・現在原文と単発公式読取を照合する内部入口。start許可は返さない。"""
+        require(self._offline is not None, "PROOF_REQUIRED", "保持したoffline終端証拠が必要です")
+        return self._offline.verify_ready(token, operation_id=operation_id,
+                                          open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")

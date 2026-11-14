@@ -24,6 +24,7 @@ class _OfflineOpen:
         self.workers = {}
         self.history = {}
         self.retired = {}
+        self.readers = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -970,6 +971,108 @@ class _OfflineOpen:
             with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
                 self._terminal(connection, token, slot, deadline)
             require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready原文の返却前に期限を超過しました')
+            return returned
+
+    def verify_ready(self, token, *, operation_id, open_operation_id, ready, deadline):
+        """元終端と現在Readyを単発helperの公式読取へ結ぶ。startは許可しない。
+
+        同じ期限で元C/W・現在原文・Registry bindingを作用前後に照合する。
+        元readerと原文をoperation別に保持し、同ID再実行と不明な読取の再生成を拒否する。
+        """
+        token, ready = deepcopy((token, ready))
+        fields(token, TOKEN)
+        _canonical_uuid(operation_id)
+        identifier(open_operation_id, 'openOperationId')
+        instance = token['instanceId']
+        key = instance, operation_id
+        fingerprint = digest(canonical(dict(command='offline-ready', token=token,
+            openOperationId=open_operation_id, ready=ready)))
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            original = self.read_ready_original(token, open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+            original_raw = canonical(original)
+            terminal = self.retired[(instance, open_operation_id)]
+            row = deepcopy(terminal['row'])
+            bundle = self.runtime._active_generation(row) / 'runtime'
+            managed, adapter = self.runtime.managed, self.runtime.process_adapter
+            require(managed is not None and terminal['controller'].bundle == bundle,
+                    'ARTIFACT_MISMATCH', '元Cと固定generationのbundleが必要です')
+            manifest = verify_bundle(bundle)
+            require(manifest['artifactId'] == row['artifact'],
+                    'ARTIFACT_MISMATCH', '読取bundleと元artifact正本が一致しません')
+            require_data_generation(manifest, original['generationId'])
+            native = managed.transport.native
+            diagnostics = self.runtime._paths(instance) / 'diagnostics' / ('ready-' + operation_id)
+            frame = dict(operationId=operation_id, requestHash=fingerprint, generation=original['generationId'],
+                worldRoot=terminal['opened']['worldRoot'], shopDirectory=terminal['opened']['shopDirectory'],
+                worldUuid=ready['worldUuid'], runUuid=ready['runUuid'],
+                expectedStateSha256=ready['stateSha256'], expectedRevision=ready['stateRevision'])
+            frame_raw = canonical(frame)
+
+            def checked(connection):
+                self._terminal(connection, token, terminal, deadline)
+                self.runtime._binding(dict(self.registry._instance(connection, instance)), row)
+                require(self.retired.get((instance, open_operation_id)) is terminal,
+                        'STALE_OPERATION', '元終端の退避先が変更されました')
+                for table in ('operations','runtime_operations','reference_operations','writer_operations','snapshot_operations'):
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT', '別操作のIDを読取に再使用しません')
+
+            def verify():
+                current = self.read_ready_original(token, open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+                require(canonical(current) == original_raw,
+                        'PROOF_MISMATCH', '読取前のReady原文と元終端証拠が変更されました')
+                with self.runtime._transaction(instance, read_only=True) as connection:
+                    checked(connection)
+                    require(self.readers.get(key) is held and held['reader'] is reader
+                            and held['original'] == original_raw and held['input'] == frame_raw
+                            and held['deadline'] == deadline and held['terminal'] is terminal
+                            and reader.process is process and reader.bundle == bundle and reader.diagnostics == diagnostics
+                            and reader.verify_owner is verify and reader.native is native and reader.adapter is adapter
+                            and (reader.ready_check_artifact is None or reader.ready_check_artifact['artifactId'] == row['artifact'])
+                            and self.runtime.managed is managed and self.runtime.process_adapter is adapter,
+                            'PROOF_MISMATCH', '元reader・原文・生成bindingの保持先が変更されました')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready公式読取の照合後に期限を超過しました')
+
+            with self.runtime._transaction(instance) as connection:
+                checked(connection)
+                require(not any(k[1] == operation_id for k in self.readers),
+                        'OPERATION_CONFLICT', '同じ読取を再実行しません')
+                require(not any(value['terminal'] is terminal and not value.get('completed') for value in self.readers.values()),
+                        'WRITER_PENDING', '不明又は未完了の元readerを保全します')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready読取枠の取得前に期限を超過しました')
+                reader = OfflineProcess(bundle, diagnostics, native=native, verify=verify, process_adapter=adapter)
+                process = reader.process
+                held = dict(reader=reader, terminal=terminal, original=original_raw, input=frame_raw, deadline=deadline)
+                self.readers[key] = held
+            verify()
+            observed, binding = reader.verify_ready(frame, deadline)
+            held.update(request=reader.request, response=reader.ready_check_response, binding=binding)
+
+            def finished():
+                require(held.get('binding') is binding and reader.ready_check_binding is binding,
+                        'PROOF_MISMATCH', '元readerの完成binding保持先が変更されました')
+                binding[1]()
+                require(observed['artifactId'] == row['artifact']
+                        and reader.ready_check_input == frame_raw and reader.ready_check_result == canonical(observed)
+                        and reader.record.get('readyRead') == observed
+                        and reader.ready_check_release == {'handle':'RELEASED','pipe':'RELEASED'}
+                        and held['request'] == reader.request and digest(held['request']) == observed['requestSha256']
+                        and held['response'] == reader.ready_check_response and digest(held['response']) == observed['responseSha256'],
+                        'PROOF_MISMATCH', '元readerの公式読取・正常解放記録が一致しません')
+
+            verify()
+            finished()
+            result = dict(original, status='OFFLINE_READY_VERIFIED', operationId=operation_id,
+                          requestSha256=fingerprint, reader=observed)
+            encoded = canonical(result)
+            held['result'] = encoded
+            returned = deepcopy(result)
+            verify()
+            finished()
+            require(held.get('result') == encoded,
+                    'PROOF_MISMATCH', '公式読取の最終原文が変更されました')
+            require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready公式読取の返却前に期限を超過しました')
+            held['completed'] = True
             return returned
 
     def complete(self, token, *, operation_id, deadline):
