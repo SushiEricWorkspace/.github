@@ -72,6 +72,8 @@ P内部の`_offline_record_start`は第41の同じ固定結果/callbackとstart/
 
 新run原文・admission・元予約結果は一度固定し、保持objectと最終gateで照合するcallbackを結果と組で返します。記録前拒否では新run/admissionをrollbackし、記録後不明では元slot/読取資源/原文・予約を保持して再生成しません。この結果はM生成やRUNNINGの成功ではありません。descriptor/`_create`・生成後資源の確定binding・GRANT/ACKの接続は後続です。Pの入口期限保証はP側に限定し、GRANT後のMod内部作用は既存期限へ委ねる確定判断を維持します。
 
+第44スライスでは、最終read退出後の純メモリ照合へ元予約callbackの完成条件全体を合成しました。元helperの資源・原文/hash・完成進捗・artifact/期限・承認object/値も同じ固定基準で比較し、退出後に変化した場合はreturnedを立てません。この純比較でファイル再読・native再観測・解放済handleの再pollは行いません。descriptor/M接続は、native準備境界・descriptor正本遷移と準備済み資源の引継ぎを含む後続単位です。
+
 ## 通常M生成入口の共通化（第42スライス先行部分）
 
 通常`_start`のdescriptor/launch準備・生成時記録・`OwnedProcess.start`を、内部の`_create` context managerへ切り出します。再採番・run記録・ports予約は呼出元に残し、元run_id/nonce/diagnostics/期限を明示して渡します。contextは生成済みsession/processを渡した後もconsole logを開いたまま保持し、通常handshake/proofの終了又は例外時にだけ親logを閉じます。生成失敗時のfinally記録と所有process保持、adapter内部準備後のbefore_create期限検査を維持します。
