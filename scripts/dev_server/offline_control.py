@@ -28,6 +28,7 @@ class _OfflineOpen:
         self.retired = {}
         self.readers = {}
         self.starts = {}
+        self.start_records = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -1287,7 +1288,10 @@ class _OfflineOpen:
                 self.registry.generation._observe_endpoints(connection, current, {'endpoints':endpoints})
                 memory()
 
-            def verify_reserved():
+            def verify_reserved(connection=None):
+                if connection is not None:
+                    pending(connection)
+                    return encoded
                 inputs()
                 with self.runtime._transaction(instance, read_only=True) as connection:
                     pending(connection)
@@ -1322,6 +1326,90 @@ class _OfflineOpen:
             verify_reserved()
             held['returned'] = complete = True
             return returned, verify_reserved
+
+    def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """新start/portsの同じ固定結果からrunとCLOSED/0の受付正本を作る。生成・GRANTは後続。"""
+        token = deepcopy(token)
+        packet = self.reserve_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+            open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+        reservation, verify_reserved = packet
+        intent = json.loads(verify_reserved())['offlineStart']
+        runtime, registry = self.runtime, self.registry
+        instance, run_id = intent['instanceId'], intent['runId']
+        key = instance, operation_id
+        with runtime._transaction(instance, read_only=True) as connection:
+            verify_reserved(connection)
+            row = dict(registry._instance(connection, instance))
+        generation = runtime._active_generation(row)
+        manifest = regular_bytes(generation / 'runtime/runtime.json')
+        require(digest(manifest) == intent['runtimeManifestHash'],
+                'PROFILE_MISMATCH', '新runに用いるmanifest原文が固定承認と一致しません')
+        diagnostics = runtime._paths(instance) / 'diagnostics' / run_id
+        run = dict(runId=run_id, instanceId=instance, generationId=intent['generationId'],
+            startOperationId=operation_id, startRequestHash=reservation['requestSha256'],
+            artifactId=intent['artifactId'], nonce=intent['nonce'], identity=None,
+            proofPath=str(diagnostics / 'proof.json'), cwd=str(generation.resolve()),
+            manifestHash=digest(manifest), endpoints=deepcopy(intent['endpoints']),
+            stopRequested=False, jvmAndChildrenExited=False, runtimeSaveCompleted=False)
+        record = json.dumps(run)
+        gate = dict(run=run_id, instance=instance, lease=intent['leaseId'], epoch=intent['epoch'],
+            generation=intent['generationId'], nonce=intent['nonce'], gate='CLOSED', revision=0,
+            descriptor_hash=None, start_operation=operation_id)
+        gate_raw, reservation_raw = canonical(gate), canonical(reservation)
+        recorded = complete = False
+        held = dict(packet=packet, run=run, record=record, deadline=deadline, recorded=False, returned=False)
+        with runtime._control_lock:
+            require(key not in self.start_records, 'OPERATION_CONFLICT', '元run記録を保全し再生成しません')
+            self.start_records[key] = held
+
+        def memory():
+            require(self.runtime is runtime and self.registry is registry and runtime.registry is registry
+                    and self.start_records.get(key) is held and held.get('packet') is packet
+                    and packet[0] is reservation and packet[1] is verify_reserved
+                    and canonical(reservation) == reservation_raw and held.get('run') is run
+                    and json.dumps(run) == record and held.get('record') == record
+                    and held.get('deadline') == deadline and held.get('recorded') is recorded
+                    and held.get('returned') is complete and held.get('binding') is verify_recorded,
+                    'PROOF_MISMATCH', '新runの固定入力と保持先が変更されました')
+            require(time.monotonic() < deadline, 'START_TIMEOUT', '新run記録の固定期限を超過しました')
+
+        def writing(connection, value):
+            verify_reserved(connection)
+            memory()
+            require(value == record, 'PROOF_MISMATCH', '保存する新run原文が変更されました')
+
+        def saved(connection):
+            writing(connection, record)
+            value = connection.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone()
+            admission = connection.execute('SELECT * FROM run_admission WHERE run=?', (run_id,)).fetchone()
+            require(value is not None and dict(value) == dict(id=run_id, instance=instance,
+                    generation=intent['generationId'], record=record)
+                    and admission is not None and canonical(dict(admission)) == gate_raw,
+                    'STALE_RUN', '新run原文と閉門正本が変更されました')
+
+        result = dict(status='OFFLINE_START_RECORDED', instanceId=instance, operationId=operation_id,
+            runId=run_id, recordSha256=digest(record.encode('utf-8')), admissionSha256=digest(gate_raw))
+        result_raw = canonical(result)
+
+        def verify_recorded():
+            verify_reserved()
+            with runtime._transaction(instance, read_only=True) as connection:
+                saved(connection)
+            memory()
+            require(canonical(returned) == result_raw, 'PROOF_MISMATCH', '新run記録の返却結果が変更されました')
+            require(time.monotonic() < deadline, 'START_TIMEOUT', '新run記録の返却期限を超過しました')
+            return record
+
+        held['binding'] = verify_recorded
+        verify_reserved()
+        memory()
+        require(runtime._record(run, verify=writing) == record,
+                'PROOF_MISMATCH', '新run記録の保存結果が一致しません')
+        held['recorded'] = recorded = True
+        returned = deepcopy(result)
+        verify_recorded()
+        held['returned'] = complete = True
+        return returned, verify_recorded
 
     def complete(self, token, *, operation_id, deadline):
         """記録済み元W終了証拠からC本人completeを接続し、応答hashを正本へ記録する。

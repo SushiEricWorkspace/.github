@@ -64,11 +64,19 @@ closeは`command=close, operationId, requestHash, sessionId, nonce, openOperatio
 
 `OWNER_CLOSED`はDB側のowner終了だけを表します。PがC/全childの実exitを観測し、Registry writer CLOSEDを確定するまでMod startを許可してはいけません。Data ReadyだけでCLOSEDを推測しません。
 
+## 新startのrun・閉門正本（第43スライス先行部分）
+
+P内部の`_offline_record_start`は第41の同じ固定結果/callbackとstart/ports予約を使い、新runとCLOSED/revision 0のadmissionを既存`_record`の一つのwriteへ記録します。旧`_start`を呼ばず、run/nonceの再採番やportsの再取得を行いません。元callbackは同じconnection内の純比較にも使い、ファイル/本人確認はwriteの外で行います。正常renewは現在expiresで確認し、同じ入口deadlineを延長しません。
+
+入口全体を既存`resource_use`と`_lock_wait`で囲み、予約から戻った後の原文確認・新run記録・最終返却までGC排他と同じlock待機期限を維持します。
+
+新run原文・admission・元予約結果は一度固定し、保持objectと最終gateで照合するcallbackを結果と組で返します。記録前拒否では新run/admissionをrollbackし、記録後不明では元slot/読取資源/原文・予約を保持して再生成しません。この結果はM生成やRUNNINGの成功ではありません。descriptor/`_create`・生成後資源の確定binding・GRANT/ACKの接続は後続です。Pの入口期限保証はP側に限定し、GRANT後のMod内部作用は既存期限へ委ねる確定判断を維持します。
+
 ## 通常M生成入口の共通化（第42スライス先行部分）
 
 通常`_start`のdescriptor/launch準備・生成時記録・`OwnedProcess.start`を、内部の`_create` context managerへ切り出します。再採番・run記録・ports予約は呼出元に残し、元run_id/nonce/diagnostics/期限を明示して渡します。contextは生成済みsession/processを渡した後もconsole logを開いたまま保持し、通常handshake/proofの終了又は例外時にだけ親logを閉じます。生成失敗時のfinally記録と所有process保持、adapter内部準備後のbefore_create期限検査を維持します。
 
-本部分は通常経路の切出しだけです。第41の固定結果/callbackをrun正本のwrite内照合と新M生成証拠へ結ぶoffline呼出元は未接続です。元予約の再取得・可変slotからの基準再採用を許可する入口は追加しません。新offline runのdescriptor/M生成・GRANT/ACK/最終返却は後続で同じ固定callback/期限へ接続します。
+第42の部分は通常経路の切出しだけです。第43では第41の固定結果/callbackをrun正本のwrite内照合まで接続しました。元予約の再取得・可変slotからの基準再採用を許可する入口は追加しません。新offline runのdescriptor/M生成・GRANT/ACK/最終返却は後続で同じ固定callback/期限へ接続します。
 
 ## 新startのports予約（第41スライス先行部分）
 
