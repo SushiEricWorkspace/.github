@@ -3,6 +3,7 @@
 from copy import deepcopy
 import json
 import time
+import uuid
 
 from .build_inputs import canonical, digest, regular_bytes
 from .mod_control_runtime import _closed_writers
@@ -14,6 +15,7 @@ from .offline_process import OfflineProcess
 from .registry import fields, identifier, require
 from .runtime_bundle import verify_bundle, require_data_generation
 from .runtime_control import TOKEN
+from .runtime_ports import instance_endpoints
 
 
 class _OfflineOpen:
@@ -25,6 +27,7 @@ class _OfflineOpen:
         self.history = {}
         self.retired = {}
         self.readers = {}
+        self.starts = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -740,7 +743,7 @@ class _OfflineOpen:
             actor.process.pid, actor.process.group, actor.pipe.input, actor.pipe.output)
             for actor in (controller,*workers)], [record for _,record in history]))
 
-    def _terminal(self, connection, token, slot, deadline):
+    def _terminal_memory(self, slot):
         controller, workers = slot['controller'], slot['workers']
         require(self.retired.get(slot['key']) is slot and controller.close_binding is slot['closeBinding']
                 and all(worker.controller is controller for worker in workers)
@@ -748,10 +751,18 @@ class _OfflineOpen:
                     for actor,process,pipe,resources in slot['resources'])
                 and self._release_snapshot(controller, workers, slot['history']) == slot['snapshot'],
                 'PROOF_MISMATCH', '退避した元C/全Wの資源object・解放原文・進捗が変更されました')
-        controller._verify_close_binding(deadline)
         require(controller.termination_response == canonical(slot['result'])
                 and controller.record.get('termination') == slot['result'],
                 'PROOF_MISMATCH', '終端原文と局所記録が一致しません')
+
+    def _terminal_resources(self, slot, deadline):
+        self._terminal_memory(slot)
+        slot['controller']._verify_close_binding(deadline)
+    def _terminal(self, connection, token, slot, deadline):
+        self._terminal_resources(slot, deadline)
+        self._terminal_state(connection, token, slot, deadline)
+
+    def _terminal_state(self, connection, token, slot, deadline):
         row, gate, run, proof, writers = self._state(connection, token, reserved=False)
         self.runtime._binding(row, slot['row'])
         expected = slot['saved']['binding']
@@ -904,6 +915,9 @@ class _OfflineOpen:
         world-id/current/不変stateと元C/Wの保持証拠を返却前にも照合する。chain/receiptの
         意味検証と起動予約は呼出元の後続責務であり、この結果だけでstartを受理しない。
         """
+        return self._ready_original(token, open_operation_id=open_operation_id, ready=ready, deadline=deadline)[0]
+
+    def _ready_original(self, token, *, open_operation_id, ready, deadline):
         token, ready = deepcopy((token, ready))
         fields(token, TOKEN)
         identifier(open_operation_id, 'openOperationId')
@@ -963,15 +977,17 @@ class _OfflineOpen:
             if state['previousStateSha256'] is not None:
                 _hash(state['previousStateSha256'])
             returned = deepcopy(dict(closed, status='OFFLINE_READY_ORIGINAL_MATCHED', stateJson=current_raw.decode('utf-8')))
-            for path, raw, maximum in ((settings_path, settings_raw, 16 * 1024 * 1024),
-                                      (world_path, world_raw, 128), (current_path, current_raw, 16 * 1024 * 1024),
-                                      (state_path, state_raw, 16 * 1024 * 1024)):
-                require(read(path, maximum) == raw, 'PROOF_MISMATCH', 'Ready原文の保持中にfileが変更されました')
-            self.runtime._active_generation(slot['row'])
+            def files():
+                for path, raw, maximum in ((settings_path, settings_raw, 16 * 1024 * 1024),
+                                          (world_path, world_raw, 128), (current_path, current_raw, 16 * 1024 * 1024),
+                                          (state_path, state_raw, 16 * 1024 * 1024)):
+                    require(read(path, maximum) == raw, 'PROOF_MISMATCH', 'Ready原文の保持中にfileが変更されました')
+                self.runtime._active_generation(slot['row'])
+            files()
             with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
                 self._terminal(connection, token, slot, deadline)
             require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready原文の返却前に期限を超過しました')
-            return returned
+            return returned, files
 
     def verify_ready(self, token, *, operation_id, open_operation_id, ready, deadline):
         """元終端と現在Readyを単発helperの公式読取へ結ぶ。startは許可しない。
@@ -979,6 +995,10 @@ class _OfflineOpen:
         同じ期限で元C/W・現在原文・Registry bindingを作用前後に照合する。
         元readerと原文をoperation別に保持し、同ID再実行と不明な読取の再生成を拒否する。
         """
+        return self._verify_ready(token, operation_id=operation_id, open_operation_id=open_operation_id,
+                                  ready=ready, deadline=deadline)[0]
+
+    def _verify_ready(self, token, *, operation_id, open_operation_id, ready, deadline):
         token, ready = deepcopy((token, ready))
         fields(token, TOKEN)
         _canonical_uuid(operation_id)
@@ -988,10 +1008,12 @@ class _OfflineOpen:
         fingerprint = digest(canonical(dict(command='offline-ready', token=token,
             openOperationId=open_operation_id, ready=ready)))
         with self.registry.resource_use(), self.runtime._lock_wait(deadline):
-            original = self.read_ready_original(token, open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+            original, files = self._ready_original(token, open_operation_id=open_operation_id, ready=ready, deadline=deadline)
             original_raw = canonical(original)
             terminal = self.retired[(instance, open_operation_id)]
-            row = deepcopy(terminal['row'])
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                self._terminal(connection, token, terminal, deadline)
+                row = dict(self.registry._instance(connection, instance))
             bundle = self.runtime._active_generation(row) / 'runtime'
             managed, adapter = self.runtime.managed, self.runtime.process_adapter
             require(managed is not None and terminal['controller'].bundle == bundle,
@@ -1000,13 +1022,67 @@ class _OfflineOpen:
             require(manifest['artifactId'] == row['artifact'],
                     'ARTIFACT_MISMATCH', '読取bundleと元artifact正本が一致しません')
             require_data_generation(manifest, original['generationId'])
-            native = managed.transport.native
+            transport = managed.transport
+            native = transport.native
+            registry, root = self.registry, self.registry.root
             diagnostics = self.runtime._paths(instance) / 'diagnostics' / ('ready-' + operation_id)
             frame = dict(operationId=operation_id, requestHash=fingerprint, generation=original['generationId'],
                 worldRoot=terminal['opened']['worldRoot'], shopDirectory=terminal['opened']['shopDirectory'],
                 worldUuid=ready['worldUuid'], runUuid=ready['runUuid'],
                 expectedStateSha256=ready['stateSha256'], expectedRevision=ready['stateRevision'])
             frame_raw = canonical(frame)
+            resource_objects = tuple(tuple(item) for item in terminal['resources'])
+            terminal_objects = tuple(terminal[name] for name in ('controller','workers','history','resources','closeBinding'))
+            actor_objects = tuple(tuple(getattr(actor,name,None) for name in ('native','adapter','verify_owner','controller'))
+                                  + (getattr(process,'process',None),)
+                                  for actor,process,_,_ in resource_objects)
+            close_objects = tuple(terminal['closeBinding'].get(name) for name in ('process','pipe'))
+            history_objects = tuple(terminal_objects[2])
+
+            def terminal_values():
+                return deepcopy((tuple(terminal[name] for name in ('key','opened','saved','row','encoded','snapshot','result')),
+                    {k:v for k,v in terminal['closeBinding'].items() if k not in ('process','pipe')},
+                    self._release_snapshot(terminal_objects[0], terminal_objects[1], terminal_objects[2]),
+                    [(getattr(actor,'bundle',None),getattr(actor,'diagnostics',None),process.pid,process.group,
+                      tuple(getattr(process,name,None) for name in ('handle','job','thread')),
+                      tuple(getattr(pipe,name,None) for name in ('input','output','child_input','child_output')))
+                     for actor,process,pipe,_ in resource_objects]))
+
+            terminal_snapshot = terminal_values()
+            row_raw = canonical(row)
+
+            def objects():
+                self._terminal_memory(terminal)
+                require(self.readers.get(key) is held and held['reader'] is reader
+                        and held['original'] == original_raw and held['input'] == frame_raw
+                        and held['deadline'] == deadline and held['terminal'] is terminal
+                        and reader.process is process and reader.bundle == bundle and reader.diagnostics == diagnostics
+                        and reader.verify_owner is verify and reader.native is native and reader.adapter is adapter
+                        and (reader.ready_check_artifact is None or reader.ready_check_artifact['artifactId'] == row['artifact'])
+                        and self.runtime.managed is managed and self.runtime.process_adapter is adapter
+                        and managed.transport is transport and transport.native is native
+                        and self.registry is registry and self.runtime.registry is registry and registry.root == root
+                        and self.runtime._offline is self,
+                        'PROOF_MISMATCH', '元reader・原文・生成bindingの保持先が変更されました')
+                require(self.retired.get(terminal['key']) is terminal
+                        and all(terminal[name] is obj for name,obj in zip(
+                            ('controller','workers','history','resources','closeBinding'), terminal_objects))
+                        and len(terminal['resources']) == len(resource_objects)
+                        and all(len(current) == len(expected) and all(a is b for a,b in zip(current,expected))
+                                for current,expected in zip(terminal['resources'],resource_objects))
+                        and all(actor.process is process and actor.pipe is pipe and actor.creation_resources is resources
+                                for actor,process,pipe,resources in resource_objects)
+                        and all(worker.controller is terminal_objects[0] for worker in terminal_objects[1])
+                        and all(all(getattr(actor,name,None) is obj for name,obj in zip(
+                                    ('native','adapter','verify_owner','controller'), expected[:4]))
+                                and getattr(process,'process',None) is expected[4]
+                                for (actor,process,_,_),expected in zip(resource_objects,actor_objects))
+                        and all(terminal['closeBinding'].get(name) is obj for name,obj in zip(('process','pipe'),close_objects))
+                        and len(terminal_objects[2]) == len(history_objects)
+                        and all(len(current) == len(expected) and all(a is b for a,b in zip(current,expected))
+                                for current,expected in zip(terminal_objects[2],history_objects))
+                        and terminal_values() == terminal_snapshot and canonical(row) == row_raw,
+                        'PROOF_MISMATCH', '確定した元終端bindingが変更されました')
 
             def checked(connection):
                 self._terminal(connection, token, terminal, deadline)
@@ -1023,14 +1099,7 @@ class _OfflineOpen:
                         'PROOF_MISMATCH', '読取前のReady原文と元終端証拠が変更されました')
                 with self.runtime._transaction(instance, read_only=True) as connection:
                     checked(connection)
-                    require(self.readers.get(key) is held and held['reader'] is reader
-                            and held['original'] == original_raw and held['input'] == frame_raw
-                            and held['deadline'] == deadline and held['terminal'] is terminal
-                            and reader.process is process and reader.bundle == bundle and reader.diagnostics == diagnostics
-                            and reader.verify_owner is verify and reader.native is native and reader.adapter is adapter
-                            and (reader.ready_check_artifact is None or reader.ready_check_artifact['artifactId'] == row['artifact'])
-                            and self.runtime.managed is managed and self.runtime.process_adapter is adapter,
-                            'PROOF_MISMATCH', '元reader・原文・生成bindingの保持先が変更されました')
+                    objects()
                 require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready公式読取の照合後に期限を超過しました')
 
             with self.runtime._transaction(instance) as connection:
@@ -1067,13 +1136,189 @@ class _OfflineOpen:
             encoded = canonical(result)
             held['result'] = encoded
             returned = deepcopy(result)
+            complete = False
+
+            def proof_memory():
+                objects()
+                finished()
+                require(held.get('completed', False) is complete and held.get('result') == encoded
+                        and canonical(returned) == encoded,
+                        'PROOF_MISMATCH', '確定した読取証拠と完成状態が変更されました')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', '確定読取証拠の引渡し期限を超過しました')
+
+            def evidence():
+                self._terminal_resources(terminal, deadline)
+                files()
+                proof_memory()
+                return row_raw
+
+            evidence()
             verify()
             finished()
-            require(held.get('result') == encoded,
-                    'PROOF_MISMATCH', '公式読取の最終原文が変更されました')
+            proof_memory()
             require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready公式読取の返却前に期限を超過しました')
-            held['completed'] = True
-            return returned
+            held['completed'] = complete = True
+            return returned, (evidence, proof_memory)
+
+    def reserve_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """確定した公式Ready証拠から新startだけを予約する。M生成・GRANT・RUNNINGは後続。
+
+        予約後は旧停止状態を再要求しない。commit/返却不明でも元意図と読取資源を保持し、
+        同ID/別IDで再生成や予約の置換を行わない。公開startの迂回入口にはしない。
+        """
+        token, ready = deepcopy((token, ready))
+        fields(token, TOKEN)
+        identifier(operation_id, 'operationId')
+        _canonical_uuid(read_operation_id)
+        identifier(open_operation_id, 'openOperationId')
+        require(len({operation_id,read_operation_id,open_operation_id}) == 3,
+                'OPERATION_CONFLICT', 'start・公式読取・元openは別IDが必要です')
+        instance = token['instanceId']
+        key = instance, operation_id
+        request = canonical(dict(command='offline-start', token=token, ready=ready,
+            readOperationId=read_operation_id, openOperationId=open_operation_id))
+        fingerprint = digest(request)
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            require(time.monotonic() < deadline, 'START_TIMEOUT', '新startの受付期限を超過しました')
+            self.check_closed_ready(token, open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                for table in ('operations','runtime_operations','reference_operations','writer_operations','snapshot_operations'):
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT', 'start IDが他の操作で使用されています')
+            with self.runtime._control_lock:
+                require(key not in self.starts and not any(k[0] == instance for k in self.starts),
+                        'OPERATION_CONFLICT', '元start意図を保全し再予約しません')
+                nonce = uuid.uuid4().hex
+                run_id = 'run-' + nonce
+                held = dict(input=request, deadline=deadline, run=run_id, nonce=nonce, reserved=False, returned=False)
+                self.starts[key] = held
+            packet = self._verify_ready(token, operation_id=read_operation_id,
+                open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+            proof, (evidence, proof_memory) = packet
+            held['proof'] = packet
+            row = json.loads(evidence())
+            terminal = self.retired[(instance, open_operation_id)]
+            generation = self.runtime._active_generation(row)
+            managed = self.runtime.managed
+            approval, profile = managed.approved(row, generation)
+            approval_raw = canonical(approval)
+            inventory = self.registry.inventory
+            declaration = next(v for v in inventory['instances'] if v['instanceId'] == instance)
+            declaration_raw = canonical(declaration)
+            endpoints = instance_endpoints(declaration)
+            stop_id = json.loads(row['runtime_proof'])['stopOperationId']
+
+            def ledger(connection):
+                records = [connection.execute(sql, (value,)).fetchone() for sql,value in (
+                    ('SELECT * FROM runs WHERE id=?', row['run_id']),
+                    ('SELECT * FROM run_admission WHERE run=?', row['run_id']),
+                    ('SELECT * FROM runtime_operations WHERE id=?', stop_id),
+                    ('SELECT * FROM runtime_operations WHERE id=?', open_operation_id))]
+                require(all(record is not None for record in records),
+                        'PROOF_REQUIRED', '元停止run・閉門・CLOSED終端の正本を保全します')
+                return canonical(dict(zip(('run','gate','stop','opened'), map(dict, records)),
+                    writers=[dict(v) for v in connection.execute('SELECT * FROM writer_sessions WHERE instance=? ORDER BY id', (instance,))],
+                    calls=[dict(v) for v in connection.execute('SELECT o.* FROM writer_operations o JOIN writer_sessions w ON w.id=o.session WHERE w.instance=? ORDER BY o.id', (instance,))]))
+
+            with self.runtime._transaction(instance, read_only=True) as connection:
+                self._terminal_state(connection, token, terminal, deadline)
+                original_ledger = ledger(connection)
+            state = _json(proof['stateJson'].encode('utf-8'))
+            intent = dict(instanceId=instance, leaseId=row['lease'], epoch=row['epoch'],
+                generationId=row['generation'], artifactId=row['artifact'], runId=run_id, nonce=nonce,
+                openOperationId=open_operation_id, readOperationId=read_operation_id, ready=deepcopy(ready),
+                readyProofSha256=digest(canonical(proof)), previousRunId=row['run_id'],
+                previousLedgerSha256=digest(original_ledger), approvalSha256=digest(approval_raw),
+                profileSha256=digest(profile), runtimeManifestHash=approval['runtimeManifestHash'],
+                worldRoot=state['paths']['worldRoot'], shopDirectory=state['paths']['shopDirectory'],
+                endpoints=endpoints)
+            encoded = json.dumps(dict(offlineStart=intent))
+            held['intent'] = encoded
+            expected_row = dict(row, state='STARTING', pending=1, run_id=run_id, runtime_proof=None, clean_proof=None)
+            result = dict(status='OFFLINE_START_RESERVED', instanceId=instance, operationId=operation_id,
+                requestSha256=fingerprint, runId=run_id, readyProofSha256=intent['readyProofSha256'])
+            result_raw = canonical(result)
+            reserved = complete = False
+            held['result'] = result_raw
+
+            def memory():
+                proof_memory()
+                require(self.starts.get(key) is held and held.get('input') == request and held.get('deadline') == deadline
+                        and held.get('run') == run_id and held.get('nonce') == nonce and held.get('proof') is packet
+                        and held.get('intent') == encoded and canonical(proof) == packet_raw
+                        and held.get('reserved') is reserved and held.get('returned') is complete
+                        and held.get('binding') is verify_reserved and held.get('result') == result_raw
+                        and self.registry.inventory is inventory
+                        and any(item is declaration for item in inventory['instances'])
+                        and canonical(declaration) == declaration_raw,
+                        'PROOF_MISMATCH', '新start意図と確定読取証拠の保持先が変更されました')
+                require(self.runtime.managed is managed and managed.approvals.get(instance) is approval
+                        and canonical(approval) == approval_raw,
+                        'PROFILE_MISMATCH', '独立profile承認の保持object又は値が変更されました')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', '新startの固定期限を超過しました')
+
+            packet_raw = canonical(proof)
+
+            def inputs():
+                require(evidence() == canonical(row), 'PROOF_MISMATCH', '元停止rowの固定証拠が一致しません')
+                current, raw = managed.approved(row, generation)
+                require(self.runtime.managed is managed and current is approval
+                        and canonical(current) == approval_raw and raw == profile,
+                        'PROFILE_MISMATCH', '独立profile承認の保持object又は原文が変更されました')
+                memory()
+
+            def pending(connection):
+                current = self.registry._instance(connection, instance)
+                self.registry._token(current, token)
+                require(all(current[k] == expected_row[k] for k in expected_row if k != 'expires') and ledger(connection) == original_ledger,
+                        'STALE_OPERATION', '新start予約又は元CLOSED/終了正本が変更されました')
+                operation = connection.execute('SELECT * FROM runtime_operations WHERE id=?', (operation_id,)).fetchone()
+                require(operation is not None and operation['instance'] == instance and operation['command'] == 'start'
+                        and operation['status'] == 'PENDING' and operation['fingerprint'] == fingerprint
+                        and operation['response'] == encoded,
+                        'STALE_OPERATION', '新start操作の元指紋・意図が一致しません')
+                refs = [dict(v) for v in connection.execute('SELECT * FROM reservations WHERE instance=?', (instance,))]
+                require(refs == [dict(operation=operation_id, reference='artifact:'+row['artifact'],
+                                     instance=instance, lease=row['lease'], epoch=row['epoch'])]
+                        and not connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND status!='COMPLETED' AND id!=?",
+                                                   (instance,operation_id)).fetchone(),
+                        'STALE_OPERATION', '新start専有予約と元offline予約不在が一致しません')
+                memory()
+
+            def verify_reserved():
+                inputs()
+                with self.runtime._transaction(instance, read_only=True) as connection:
+                    pending(connection)
+                memory()
+                require(canonical(returned) == result_raw, 'PROOF_MISMATCH', '新start予約の返却証拠が変更されました')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', '新start予約の返却期限を超過しました')
+                return encoded
+
+            held['binding'] = verify_reserved
+            inputs()
+            with self.runtime._transaction(instance) as connection:
+                self._terminal_state(connection, token, terminal, deadline)
+                current = self.registry._instance(connection, instance)
+                require(all(current[k] == row[k] for k in row if k != 'expires') and ledger(connection) == original_ledger,
+                        'STALE_OPERATION', '新start予約前の正本が変更されました')
+                for table in ('operations','runtime_operations','reference_operations','writer_operations','snapshot_operations'):
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT', 'start IDが他の操作で使用されています')
+                memory()
+                connection.execute("INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)",
+                                   (operation_id,fingerprint,'start',instance,'PENDING',encoded))
+                connection.execute("UPDATE instances SET state='STARTING',pending=1,run_id=?,runtime_proof=NULL,clean_proof=NULL WHERE id=?",
+                                   (run_id,instance))
+                connection.execute('INSERT INTO reservations VALUES (?,?,?,?,?)',
+                                   (operation_id,'artifact:'+row['artifact'],instance,row['lease'],row['epoch']))
+                connection.execute('INSERT INTO audit(at,operation,command) VALUES (?,?,?)',
+                                   (self.registry.clock(),operation_id,'start'))
+                pending(connection)
+            held['reserved'] = reserved = True
+            returned = deepcopy(result)
+            verify_reserved()
+            held['returned'] = complete = True
+            return returned, verify_reserved
 
     def complete(self, token, *, operation_id, deadline):
         """記録済み元W終了証拠からC本人completeを接続し、応答hashを正本へ記録する。

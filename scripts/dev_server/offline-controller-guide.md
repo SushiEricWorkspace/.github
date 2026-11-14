@@ -64,6 +64,16 @@ closeは`command=close, operationId, requestHash, sessionId, nonce, openOperatio
 
 `OWNER_CLOSED`はDB側のowner終了だけを表します。PがC/全childの実exitを観測し、Registry writer CLOSEDを確定するまでMod startを許可してはいけません。Data ReadyだけでCLOSEDを推測しません。
 
+## 新startの内部予約（第40スライス）
+
+RuntimeControl._offline_reserve_start(token, *, operation_id, read_operation_id, open_operation_id, ready, deadline) は、同じ期限で公式読取を一度行い、新しいstartの耐久予約まで接続します。start・読取・元openは別IDとし、Ready四項目を呼出元が独立に指定します。読取IDはUUID、start/open IDは既存identifier契約です。
+
+Pは新runtime run/nonceを一度生成し、短いRegistry transactionでstart/PENDING、新runのSTARTING/pending=1、専有artifact予約を記録します。元run/受付/stop/offline終端/writer正本と全解放資源を保持し、予約後は旧STOPPED・旧current run・予約不在を要求するcallbackへ戻りません。現在Ready原文、元helperの確定binding、独立profile承認、新startの要求指紋・意図・元正本集合を最終返却まで照合します。
+
+戻り値はOFFLINE_START_RESERVEDの結果dictと、確定時の同じ原本・参照を閉じ込めた照合callbackの組です。Pメモリ上のreadersを耐久予約として流用せず、可変属性から期待基準を採り直しません。commit後や返却不明では元意図・予約・原文・識別を保全し、再生成・再送・予約置換をしません。
+
+この入口はMを生成せず、port予約・GRANT/BOUND/ACK・RUNNING確定・公開Ready入力は後続です。新しいpending意図の正規recoverも後続のため、公開startへ接続しません。既存startの保守的遮断は維持し、旧runの承認だけでは通しません。P側限定の期限保証とGRANT後Mod内部を既存期限へ委ねる判断、実OS/native/実Data受入の未確認範囲は維持します。
+
 ## Assigned登録（第2スライス先行部分）
 
 `assign`はCが開いた同じownerの初回`OfflineIdle`からだけ受け付けます。PはDB未openで待機するWを固定bundleから独立Job/groupとして所有し、私設IPCの認証と実PID/start/host/bootの観測を完了してから送る必要があります。内部起動部品は後述の第4スライス節を参照してください。Registry予約からの内部接続は後述の第5・第6スライス節を参照してください。公開呼出元と実OS受入は後続です。Wのprivate入口とData連携は後述の第3スライスで追加しています。C側の生存照合だけでWのOwnedProcess所属を証明したとは扱いません。
