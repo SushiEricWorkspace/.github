@@ -64,6 +64,14 @@ closeは`command=close, operationId, requestHash, sessionId, nonce, openOperatio
 
 `OWNER_CLOSED`はDB側のowner終了だけを表します。PがC/全childの実exitを観測し、Registry writer CLOSEDを確定するまでMod startを許可してはいけません。Data ReadyだけでCLOSEDを推測しません。
 
+## 新startのports予約（第41スライス先行部分）
+
+`_offline_reserve_start`は、同じ固定run/nonce/承認・Ready証拠から、start/PENDING・artifact参照と全endpoint予約を一つの短いRegistry transactionで取得します。既存`runtime_ports.reserve`のwildcard/dual-stack/host/protocol/address/port競合規則を使い、部分予約や新startの記録だけを残しません。他runの予約を消したり空きportへ切り替えたりしません。
+
+返却する同じ確定callbackは、元の全bindingに加えて、当該instance又はrunのendpoint予約が固定宣言の全service/値と完全一致することを照合します。commit前は全体rollback、commit後の不明・期限超過・改変では元slot/原文/資源と永続予約を保全し、再生成/再送/retryしません。正常renewでは現在expiresを確認し、入口deadlineは延長しません。
+
+本スライスはportsの永続予約までです。既存`_start`の再採番・生成・handshakeを分離して同じrunへ接続するM生成、OS adapter準備後の新予約照合、GRANT/BOUND/ACK・RUNNING確定・公開Ready入力は後続です。既存startの保守的遮断と固定Mod/Data契約は維持します。実socket bind・実OS/native受入は未確認です。
+
 ## 新startの内部予約（第40スライス）
 
 RuntimeControl._offline_reserve_start(token, *, operation_id, read_operation_id, open_operation_id, ready, deadline) は、同じ期限で公式読取を一度行い、新しいstartの耐久予約まで接続します。start・読取・元openは別IDとし、Ready四項目を呼出元が独立に指定します。読取IDはUUID、start/open IDは既存identifier契約です。
