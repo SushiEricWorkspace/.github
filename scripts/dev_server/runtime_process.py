@@ -215,8 +215,12 @@ if os.name == "nt":
                     raise ctypes.WinError(ctypes.get_last_error())
                 size *= 2
 
-        def close(self):
+        def close(self, verify=None):
+            if verify is not None:
+                verify()
             _winapi.CloseHandle(self.handle)
+            if verify is not None:
+                verify()
             _check(kernel.CloseHandle(self.job))
 
 else:
@@ -365,7 +369,9 @@ else:
                     return result
                 size = count
 
-        def close(self):
+        def close(self, verify=None):
+            if verify is not None:
+                verify()
             self.process.wait(timeout=0)
 
 

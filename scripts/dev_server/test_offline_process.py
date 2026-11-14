@@ -61,6 +61,8 @@ class Process:
         self.extra = []
 
     def start(self, arguments, cwd, log, name, created, **stdio):
+        if stdio.get('before_create') is not None:
+            stdio.pop('before_create')()
         self.starts += 1
         self.pid = 100000 + self.adapter.processes.index(self)
         self.group = name

@@ -8,13 +8,14 @@ from pathlib import Path
 import uuid
 
 from . import runtime_process
-from .build_inputs import canonical, digest
+from .build_inputs import canonical, digest, regular_bytes
 from .database_proxy_pipe import ProxyPipe
 from .local_ipc import MAX_MESSAGE, encode, make_private, plain_path
 from .mod_control_runtime import process_identity
 from .mod_control_wire import _hash, _canonical_uuid, _identity
-from .offline_controller_bundle import offline_controller_command, offline_worker_command
-from .registry import RegistryError, require
+from .offline_controller_bundle import offline_controller_command, offline_worker_command, offline_ready_command
+from .registry import RegistryError, require, fields, identifier
+from .runtime_bundle import verify_bundle
 from .runtime_control import write_json
 
 
@@ -62,6 +63,12 @@ class OfflineProcess:
         self.worker_release_response = None
         self.writer_closed_response = None
         self.termination_response = None
+        self.ready_check_started = False
+        self.ready_check_input = self.ready_check_deadline = None
+        self.ready_check_response = self.ready_check_result = None
+        self.ready_check_release = None
+        self.ready_check_artifact = None
+        self.ready_check_handles = self.ready_check_fds = self.ready_check_creation_fds = None
         self.operation_history = {}
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
@@ -332,6 +339,8 @@ class OfflineProcess:
 
     def _launch(self, frame, command, verify):
         require(not self.started, 'WRITER_PENDING', '同じhelperを再生成しません')
+        require(command == 'verify-ready' or not self.ready_check_started,
+                'WRITER_PENDING', '元Ready読取の試行を保全します')
         self.started = True
         require(not set(frame) & {'command', 'controller', 'owner', 'worker', 'sessionId', 'nonce'},
                 'INVALID_INPUT', '起動本人とprivate bindingはPが指定します')
@@ -343,7 +352,8 @@ class OfflineProcess:
         require(not any(os.environ.get(name) for name in
                         ('JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS', 'CLASSPATH')),
                 'UNREPRODUCIBLE_ENVIRONMENT', '暗黙のJVM入力を使用できません')
-        factory = offline_controller_command if self.controller is None else offline_worker_command
+        factory = (offline_ready_command if command == 'verify-ready' else
+                   offline_controller_command if self.controller is None else offline_worker_command)
         arguments = factory(self.bundle)
         self.parent = deepcopy(self.adapter.identity(os.getpid()))
         require(self.parent is not None, 'PROCESS_MISMATCH', 'P本人を取得できません')
@@ -354,13 +364,31 @@ class OfflineProcess:
         role = 'c' if self.controller is None else 'w'
         self.record = {'role': role, 'commandHash': runtime_process.command_hash(arguments),
                        'creation': None, 'identity': None, 'controlIdentity': None}
+        if command == 'verify-ready':
+            verify()
         self._record()
         self.pipe = ProxyPipe()
         self.creation_resources = (self.process, self.pipe)
+        if command == 'verify-ready':
+            resources = self.creation_resources
+            fd_names = 'child_input','child_output','input','output'
+            creation_fds = tuple(getattr(self.pipe, n) for n in fd_names)
+            self.ready_check_creation_fds = creation_fds
+
+            def preparing():
+                verify()
+                require(self.creation_resources is resources and self.process is resources[0]
+                        and self.pipe is resources[1] and self.ready_check_creation_fds == creation_fds
+                        and tuple(getattr(self.pipe, n) for n in fd_names) == creation_fds,
+                        'PROCESS_MISMATCH', '生成準備後の元pipe FDが変更されました')
+
+            preparing()
 
         def created():
             self.record['creation'] = {'pid': self.process.pid, 'stage': self.process.stage,
                                        'ownerGroup': self.process.group}
+            if command == 'verify-ready':
+                verify()
             self._record()
             actual = self.adapter.identity(self.process.pid)
             require(actual is not None and actual['pid'] == self.process.pid
@@ -375,6 +403,8 @@ class OfflineProcess:
                     and all(self.data_identity[k] == self.parent_data[k] for k in ('hostHash', 'bootId')),
                     'PROCESS_MISMATCH', 'helperのnative開始識別/host/bootが一致しません')
             self.record.update(identity=self.identity, controlIdentity=self.data_identity)
+            if command == 'verify-ready':
+                verify()
             self._record()
 
         if command == 'observe-game-exit':
@@ -384,10 +414,17 @@ class OfflineProcess:
             name = 'offline-' + role + '-' + uuid.uuid4().hex
             if command in ('open', 'prepare'):
                 verify()
-            self.process.start(arguments, self.bundle, log, name, created,
-                               input_fd=self.pipe.child_input, output_fd=self.pipe.child_output)
+            if command == 'verify-ready':
+                self.process.start(arguments, self.bundle, log, name, created,
+                                   input_fd=self.pipe.child_input, output_fd=self.pipe.child_output,
+                                   before_create=preparing)
+            else:
+                self.process.start(arguments, self.bundle, log, name, created,
+                                   input_fd=self.pipe.child_input, output_fd=self.pipe.child_output)
         self.pipe.close_child_ends()
         self.record['creation']['stage'] = self.process.stage
+        if command == 'verify-ready':
+            verify()
         self._record()
         self.verify()
         request = deepcopy(frame)
@@ -399,6 +436,179 @@ class OfflineProcess:
         require(len(encode(request)) + 4 <= MAX_MESSAGE, 'MESSAGE_TOO_LARGE', '起動frameが上限外です')
         self.request = canonical(request)
         return request
+
+    def verify_ready(self, frame, deadline):
+        """独立Readyを単発helperへ送り、正常exit/全child不在と正常解放後に観測値を返す。
+
+        呼出元は先にこのobjectを保持し、verifyで現在原文・元CLOSED/終端・予約不在を
+        継続照合する。同じdeadlineを生成準備後、I/O、解放、記録/返却まで使う。
+        不明時は元object/原文/UNKNOWN進捗を保持し、再生成・再送・部分解放retryはしない。
+        Registry更新やstart許可は行わない。
+        """
+        require(self.controller is None and not self.started and not self.ready_check_started,
+                'WRITER_PENDING', '未使用の読取helperだけを一度起動します')
+        self.ready_check_started = True
+        frame = deepcopy(frame)
+        fields(frame, {'operationId','requestHash','generation','worldRoot','shopDirectory','worldUuid',
+                       'runUuid','expectedStateSha256','expectedRevision'})
+        identifier(frame['operationId'], 'operationId')
+        _hash(frame['requestHash']); _hash(frame['expectedStateSha256'])
+        for name in ('generation','worldUuid','runUuid'):
+            _canonical_uuid(frame[name])
+        require(type(frame['expectedRevision']) is int and 0 <= frame['expectedRevision'] <= 2**63 - 1
+                and all(type(frame[k]) is str and Path(frame[k]).is_absolute() for k in ('worldRoot','shopDirectory')),
+                'INVALID_INPUT', 'Readyのrevisionと固定絶対pathが必要です')
+        input_raw = canonical(frame)
+        self.ready_check_input, self.ready_check_deadline = input_raw, deadline
+        process = self.process
+        parent = deepcopy(self.adapter.identity(os.getpid()))
+        parent_data = process_identity(self.native, self.adapter, os.getpid())
+        resources = artifact = None
+
+        def checked():
+            nonlocal resources
+            if resources is None and self.creation_resources is not None:
+                resources = self.creation_resources
+            require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready読取の単一期限を超過しました')
+            self.verify_owner()
+            require(self.process is process and self.controller is None,
+                    'PROCESS_MISMATCH', '元読取object/process bindingが変更されました')
+            if resources is not None:
+                require(self.creation_resources is resources and resources[0] is process and resources[1] is self.pipe,
+                        'PROCESS_MISMATCH', '元読取handle/pipeの保持先が変更されました')
+            require(self.ready_check_input == input_raw and self.ready_check_deadline == deadline,
+                    'PROOF_MISMATCH', '元Ready入力と入口期限が変更されました')
+            runtime_process.require_identity(parent, self.adapter.identity(os.getpid()))
+            require(process_identity(self.native, self.adapter, os.getpid()) == parent_data,
+                    'PROCESS_MISMATCH', '元Pの本人が変更されました')
+            if artifact is not None:
+                require(self.ready_check_artifact is artifact_record and self.ready_check_artifact == artifact
+                        and inventory() == artifact['identities'],
+                        'PROOF_MISMATCH', '固定artifactの原文又は実体が変更されました')
+            self.verify_owner()
+            require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready読取照合後に期限を超過しました')
+
+        checked()
+        manifest = verify_bundle(self.bundle)
+        expected = {entry['path']:(entry['size'], entry['sha256']) for entry in manifest['files']}
+        for name in ('runtime.json','COMPLETE'):
+            raw = regular_bytes(self.bundle / name)
+            require((json.loads(raw) == manifest if name == 'runtime.json' else raw.decode() == manifest['artifactId']),
+                    'PROOF_MISMATCH', '元bundle manifestが変更されました')
+            expected[name] = len(raw), digest(raw)
+
+        def inventory():
+            nodes = [self.bundle, *self.bundle.rglob('*')]
+            require({p.relative_to(self.bundle).as_posix() for p in nodes if p.is_file()} == expected.keys(),
+                    'PROOF_MISMATCH', '固定bundleのfile集合が変更されました')
+            identities = {}
+            for path in nodes:
+                plain_path(path)
+                before = path.lstat()
+                name = path.relative_to(self.bundle).as_posix()
+                if name in expected:
+                    size, sha = expected[name]
+                    raw = regular_bytes(path, maximum=size)
+                    require(len(raw) == size and digest(raw) == sha,
+                            'PROOF_MISMATCH', '固定bundleの実読取原文が変更されました')
+                after = path.lstat()
+                stamp = after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns
+                require((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns) == stamp,
+                        'PROOF_MISMATCH', '固定artifactの読取実体が変更されました')
+                identities[name] = stamp
+            return identities
+
+        artifact = dict(artifactId=manifest['artifactId'], files=expected, identities=inventory())
+        self.ready_check_artifact = deepcopy(artifact)
+        artifact_record = self.ready_check_artifact
+        checked()
+        request = deepcopy(self._launch(frame, 'verify-ready', checked))
+        identity, data_identity = deepcopy((self.identity, self.data_identity))
+        group = process.group
+        handle_names = 'handle','job','thread','process'
+        handles = tuple(getattr(process,n,None) for n in handle_names)
+        pipe = self.pipe
+        fds = pipe.input,pipe.output
+        self.ready_check_handles, self.ready_check_fds = handles,fds
+        progress = dict(handle='NOT_STARTED', pipe='NOT_STARTED')
+        release_state = 'NOT_STARTED','NOT_STARTED'
+        self.ready_check_release = progress
+        request_raw = self.request
+        response_raw = None
+
+        def observing():
+            checked()
+            require(self.identity == identity and self.data_identity == data_identity
+                    and self.parent == parent and self.parent_data == parent_data
+                    and self.session == request['sessionId'] and self.nonce == request['nonce']
+                    and self.record['identity'] == identity and self.record['controlIdentity'] == data_identity
+                    and process.pid == identity['pid'] == data_identity['pid'] and process.group == group
+                    and self.record['creation']['pid'] == process.pid and self.record['creation']['ownerGroup'] == group
+                    and self.request == request_raw and self.ready_check_release is progress
+                    and progress == dict(zip(('handle','pipe'), release_state))
+                    and self.ready_check_handles == handles and self.ready_check_fds == fds
+                    and tuple(getattr(process,n,None) for n in handle_names) == handles
+                    and pipe.child_input is None and pipe.child_output is None
+                    and (all(getattr(pipe,n) == fd for n,fd in zip(('input','output'),fds))
+                         if progress['pipe'] == 'NOT_STARTED' else
+                         all(getattr(pipe,n) in (None,fd) for n,fd in zip(('input','output'),fds)))
+                    and (response_raw is None or self.ready_check_response == response_raw),
+                    'PROCESS_MISMATCH', '元読取の本人・原文・解放進捗が変更されました')
+            if progress['handle'] == 'NOT_STARTED':
+                self._observe_process(process, identity, data_identity)
+            checked()
+
+        self.pipe.send(request, deadline, observing)
+        response = self.pipe.receive(deadline, observing)
+        response_raw = canonical(response)
+        self.ready_check_response = response_raw
+        require(response.keys() == {'status','operationId','requestHash','sessionId','nonce','worldUuid','generation',
+                                    'runUuid','stateSha256','stateRevision'}
+                and response['status'] == 'READY_VERIFIED'
+                and all(response[k] == request[k] for k in ('operationId','requestHash','sessionId','nonce',
+                                                           'worldUuid','generation','runUuid'))
+                and response['stateSha256'] == request['expectedStateSha256']
+                and type(response['stateRevision']) is int and response['stateRevision'] == request['expectedRevision'],
+                'API_PROTOCOL', '独立Readyと同じ公式検証応答が必要です')
+        while True:
+            observing()
+            code, members = process.poll(), process.members()
+            observing()
+            if type(code) is int and code == 0 and members == []:
+                break
+            time.sleep(0.1)
+        observing()
+        progress['handle'] = 'UNKNOWN'
+        release_state = 'UNKNOWN','NOT_STARTED'
+        process.close(verify=observing)
+        progress['handle'] = 'RELEASED'
+        release_state = 'RELEASED','NOT_STARTED'
+        observing()
+        progress['pipe'] = 'UNKNOWN'
+        release_state = 'RELEASED','UNKNOWN'
+        self.pipe.close_after_exit(verify=observing)
+        require(self.pipe.input is None and self.pipe.output is None and self.pipe.child_input is None
+                and self.pipe.child_output is None, 'WRITER_PENDING', '読取pipeの解放が完了していません')
+        progress['pipe'] = 'RELEASED'
+        release_state = 'RELEASED','RELEASED'
+        observing()
+        result = dict(status='READY_READ_RELEASED', operationId=request['operationId'],
+                      requestSha256=digest(request_raw), responseSha256=digest(response_raw),
+                      artifactId=manifest['artifactId'], reader=deepcopy(data_identity), readerGroup=group,
+                      exitCode=0, allChildrenExited=True, handlesReleased=True,
+                      ready={k:response[k] for k in ('worldUuid','generation','runUuid','stateSha256','stateRevision')})
+        observing()
+        self.record['readyRead'] = deepcopy(result)
+        observing()
+        self._record()
+        self.ready_check_result = canonical(result)
+        returned = deepcopy(result)
+        observing()
+        require(progress == {'handle':'RELEASED','pipe':'RELEASED'}
+                and self.record.get('readyRead') == result and self.ready_check_result == canonical(result),
+                'PROOF_MISMATCH', '正常読取の最終記録・原文・進捗が一致しません')
+        checked()
+        return returned
 
     def start(self, frame, deadline):
         """C OPEN又はW PREPAREDを一度照合する。型付き要求本文は変更しない。"""
