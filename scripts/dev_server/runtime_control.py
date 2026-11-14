@@ -126,6 +126,13 @@ class RuntimeControl:
         return self._offline.reserve_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
             open_operation_id=open_operation_id, ready=ready, deadline=deadline)
 
+    def _offline_record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """固定Readyで新start/portsを予約し、同じrunの閉門正本と確定callbackを返す。Mは生成しない。"""
+        require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
+        with self.registry.resource_use(), self._lock_wait(deadline):
+            return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+                open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
@@ -307,11 +314,14 @@ class RuntimeControl:
                 and current["run_id"] == (previous["run_id"] if run_id is None else run_id),
                 "STALE_OPERATION", "予約したlease・世代・runが変更されました")
 
-    def _record(self, run, *, expected=None):
+    def _record(self, run, *, expected=None, verify=None):
+        """verifyを指定した場合、同じwrite内で保存原文を渡して純比較する。"""
         record = json.dumps(run)
         transaction = (self.registry.transaction() if run.get("kind") == "gametest"
                        else self._transaction(run["instanceId"]))
         with transaction as connection:
+            if verify is not None:
+                verify(connection, record)
             if run.get("kind") != "gametest":
                 current = self.registry._instance(connection, run["instanceId"])
                 require(current["generation"] == run["generationId"] and current["artifact"] == run["artifactId"]
@@ -334,6 +344,8 @@ class RuntimeControl:
                 changed = connection.execute("UPDATE runs SET record=? WHERE id=? AND instance=? AND generation=? AND record=?",
                                              (record, run["runId"], run["instanceId"], run["generationId"], expected))
                 require(changed.rowcount == 1, "STALE_OPERATION", "runの読取元が変更されました")
+            if verify is not None:
+                verify(connection, record)
         return record
 
     def _load_run(self, row, *, with_record=False):
