@@ -120,6 +120,12 @@ class RuntimeControl:
         return self._offline.verify_ready(token, operation_id=operation_id,
                                           open_operation_id=open_operation_id, ready=ready, deadline=deadline)
 
+    def _offline_reserve_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """新startの予約結果と固定照合callbackを組で返す。OS生成やRUNNING確定は行わない。"""
+        require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
+        return self._offline.reserve_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+            open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
