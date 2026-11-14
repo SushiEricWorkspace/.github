@@ -20,6 +20,16 @@ CはData121 `observeExit`／`openManagedOfflineWriter`／writer `assignWorker`�
 
 結果は読取時点の一致であり、start許可・Registry CLOSED・資源解放を表しません。後続のP側接続で元終端/予約不在・原文・全binding、同一要求と応答原文、読取helperの正常exit/全child不在と正常解放を継続照合する必要があります。入口で固定した単一期限はPの受付・予約・adapter生成準備後・GRANT送信・BOUND/ACK・最終記録/返却まで使用します。GRANT後のMod内部作用は既存Mod期限に委ね、作用後不明は元原本・予約・識別を保全します（2026-11-13の確定判断）。このスライスでは固定Data/Mod契約を変更していません。
 
+## P所有の単発Ready読取（第38スライス先行部分）
+
+`OfflineProcess.verify_ready(frame, deadline)`は未使用objectで一度だけ呼びます。Pは呼出前にobjectを保持し、constructorの`verify`で独立Ready/現在原文、元CLOSED・終端・予約不在を継続照合してください。frameは`operationId, requestHash, generation, worldRoot, shopDirectory, worldUuid, runUuid, expectedStateSha256, expectedRevision`だけです。本人/session/nonceは既存生成部品が固定します。今回はこの部品までを追加し、実Registry/原文照合からの呼出元とstart受付は後続です。
+
+入口の同じdeadlineを生成準備後の`before_create`、私設送受信、exit0/全child不在、正常handle/pipe解放、最終記録/返却まで使います。固定bundleの実読取bytesへmanifest上限/hashを適用し、file/dir実体識別も各境界で照合します。Windowsではprocessとjobの各handle解放前にも確認します。解放開始後は旧PID/handleを再照合せず、確定終了と保持bindingを使います。
+
+正常結果`READY_READ_RELEASED`は同じ操作の要求/応答hash、artifactId、読取本人/group、正常exit/全child不在/解放と観測Readyを返します。start許可やRegistry更新は行いません。要求/応答・元objectとUNKNOWN/RELEASED進捗を保持し、失敗後の再生成・再送・部分解放retryは拒否します。timeout後にも残る正常記録は、受付成功や再利用可能な承認を意味しません。
+
+この照合は既存adapterの生成直前境界までです。実OSの実行ファイル/遅延classpath openとの原子的固定を追加しておらず、実OS/native本人受入は未確認です。Data/Mod契約・artifactは変更しません。GRANT後Mod内部作用を既存期限へ委ねる保証範囲も維持します。
+
 ## P側の前提
 
 このmainはprivate inherited stdin/stdout専用です。ネットワークendpoint・任意SQL・Host許可flag・root常駐daemonを追加しません。Pは同じinstance/world境界でstart排他を取得し、元M/全childの終了、最新game sealと既存receipt、他writer受付遮断・accepted drainを確認した後にだけCを起動します。PがCの固定artifact・実PID/start/host/bootを観測し、C専用OwnedProcessと私設pipeを所有する必要があります。
