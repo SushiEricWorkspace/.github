@@ -69,6 +69,7 @@ class OfflineProcess:
         self.ready_check_release = None
         self.ready_check_artifact = None
         self.ready_check_handles = self.ready_check_fds = self.ready_check_creation_fds = None
+        self.ready_check_binding = None
         self.operation_history = {}
         self.session = uuid.uuid4().hex if controller is None else controller.session
         self.nonce = uuid.uuid4().hex if controller is None else controller.nonce
@@ -443,7 +444,7 @@ class OfflineProcess:
         呼出元は先にこのobjectを保持し、verifyで現在原文・元CLOSED/終端・予約不在を
         継続照合する。同じdeadlineを生成準備後、I/O、解放、記録/返却まで使う。
         不明時は元object/原文/UNKNOWN進捗を保持し、再生成・再送・部分解放retryはしない。
-        Registry更新やstart許可は行わない。
+        観測結果と確定bindingを組で返す。Registry更新やstart許可は行わない。
         """
         require(self.controller is None and not self.started and not self.ready_check_started,
                 'WRITER_PENDING', '未使用の読取helperだけを一度起動します')
@@ -603,12 +604,39 @@ class OfflineProcess:
         self._record()
         self.ready_check_result = canonical(result)
         returned = deepcopy(result)
+
+        def _ready_binding(expected=None):
+            process, pipe = self.process, self.pipe
+            objects = (process, pipe, self.creation_resources, self.ready_check_artifact,
+                       self.ready_check_release, self.ready_check_handles, getattr(process, 'process', None),
+                       self.native, self.adapter, self.verify_owner, self.controller)
+            if expected is not None:
+                require(all(current is original for current, original in zip(objects, expected[0])),
+                        'PROOF_MISMATCH', '完成した元readerの保持objectが変更されました')
+            names = ('bundle','diagnostics','parent','parent_data','identity','data_identity','session','nonce',
+                     'started','ready','startup_acknowledged','ready_check_started','ready_check_input',
+                     'ready_check_deadline','request','response','ready_check_response','ready_check_result',
+                     'ready_check_fds','ready_check_creation_fds','ready_check_artifact','ready_check_release',
+                     'record','record_number')
+            values = deepcopy((dict((name, getattr(self, name)) for name in names),
+                               (process.pid, process.group, *(getattr(process, name, None)
+                                for name in ('handle','job','thread'))),
+                               (pipe.input, pipe.output, pipe.child_input, pipe.child_output)))
+            if expected is not None:
+                require(values == expected[1], 'PROOF_MISMATCH', '完成した元readerの保持値が変更されました')
+            return objects, values
+
+        binding = _ready_binding()
         observing()
         require(progress == {'handle':'RELEASED','pipe':'RELEASED'}
                 and self.record.get('readyRead') == result and self.ready_check_result == canonical(result),
                 'PROOF_MISMATCH', '正常読取の最終記録・原文・進捗が一致しません')
         checked()
-        return returned
+        _ready_binding(binding)
+        require(time.monotonic() < deadline, 'START_TIMEOUT', 'Ready完成bindingの返却前に期限を超過しました')
+        completed_binding = binding[0], lambda: _ready_binding(binding)
+        self.ready_check_binding = completed_binding
+        return returned, completed_binding
 
     def start(self, frame, deadline):
         """C OPEN又はW PREPAREDを一度照合する。型付き要求本文は変更しない。"""

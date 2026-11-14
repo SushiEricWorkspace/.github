@@ -22,7 +22,11 @@ CはData121 `observeExit`／`openManagedOfflineWriter`／writer `assignWorker`�
 
 ## P所有の単発Ready読取（第38スライス先行部分）
 
-`OfflineProcess.verify_ready(frame, deadline)`は未使用objectで一度だけ呼びます。Pは呼出前にobjectを保持し、constructorの`verify`で独立Ready/現在原文、元CLOSED・終端・予約不在を継続照合してください。frameは`operationId, requestHash, generation, worldRoot, shopDirectory, worldUuid, runUuid, expectedStateSha256, expectedRevision`だけです。本人/session/nonceは既存生成部品が固定します。今回はこの部品までを追加し、実Registry/原文照合からの呼出元とstart受付は後続です。
+`OfflineProcess.verify_ready(frame, deadline)`は未使用objectで一度だけ呼びます。Pは呼出前にobjectを保持し、constructorの`verify`で独立Ready/現在原文、元CLOSED・終端・予約不在を継続照合します。frameは`operationId, requestHash, generation, worldRoot, shopDirectory, worldUuid, runUuid, expectedStateSha256, expectedRevision`だけです。本人/session/nonceは既存生成部品が固定します。
+
+第39スライスの内部入口`RuntimeControl._offline_verify_ready(token, *, operation_id, open_operation_id, ready, deadline)`が、この照合を既存`read_ready_original`と終端専用照合へ接続します。`operation_id`は新しいUUID、`ready`は独立明示の四項目です。呼出時の同じ期限で固定generationの原文と元C/W解放・CLOSED・終端・元予約不在を再照合し、Pの`readers`へoperation別に元reader・入力・現在原文・結果を保持します。同ID再実行と未完了読取がある元終端での別ID再生成を拒否します。読取中はRegistry transactionを保持せず、各作用前後の短い照合だけに使います。
+
+戻り値`OFFLINE_READY_VERIFIED`は元終端証拠・`stateJson`・独立Ready・helper読取結果を結びます。新しいRegistry予約やstart承認は記録せず、既存startの保守的遮断を維持します。この内部読取枠はPのメモリ上の保持で、公開入力の同ID再提示やP再起動後の復旧契約を追加するものではありません。新start予約・GRANT/BOUND/ACKと公開呼出元は後続です。
 
 入口の同じdeadlineを生成準備後の`before_create`、私設送受信、exit0/全child不在、正常handle/pipe解放、最終記録/返却まで使います。固定bundleの実読取bytesへmanifest上限/hashを適用し、file/dir実体識別も各境界で照合します。Windowsではprocessとjobの各handle解放前にも確認します。解放開始後は旧PID/handleを再照合せず、確定終了と保持bindingを使います。
 
