@@ -120,13 +120,7 @@ class _Startup:
                 "CONTROL_BLOCKED", "元の閉門revisionが必要です")
         return row, descriptor, raw, gate
 
-    def start(self, token, *, profile_raw, launch_context, observed, context, revision, deadline,
-              endpoint=None, defer_ready=False):
-        """Pが独立保持するexact入力で2往復する。承認やMの実起動を代行しない。
-
-        ACK原文をcommit後に送信し、同run/revisionでOPENとRUNNINGを同時確定する。
-        送信/保存不明時は門を開けず、完成済み原応答をUNKNOWNへ格下げしない。
-        """
+    def _session(self, token, profile_raw, launch_context, observed, context):
         token, launch_context, observed, context = deepcopy((token, launch_context, observed, context))
         require(token["instanceId"] in self.instances, "NOT_FOUND", "inventory外のinstanceです")
         with self.lock:
@@ -135,39 +129,70 @@ class _Startup:
                        "observed": observed, "request": None, "hello": None, "origin": None,
                        "checkpoint": None, "active": True, "endpoint": None, "connection": None}
             self.sessions[token["instanceId"]] = session
-        try:
-            require(type(profile_raw) is bytes and wire.sha256(profile_raw) == context["expectedEvidence"]["profileSha256"],
-                    "PROFILE_MISMATCH", "明示profile原bytesがP期待値と一致しません")
-            validate_managed_launch(_read_managed_profile(profile_raw), launch_context, observed)
-            bundle = Path(launch_context["bundle"])
-            manifest = verify_bundle(bundle)
-            require(any(item["path"] == "launch/managed-server-candidate.json" and item["sha256"] == wire.sha256(profile_raw)
-                        and item["size"] == len(profile_raw) for item in manifest["files"]),
-                    "PROFILE_MISMATCH", "bundleのcandidate原bytesと明示profileが一致しません")
-            manifest_hash = wire.sha256(regular_bytes(bundle / "runtime.json"))
-            validate_bundle_managed_launch(bundle, launch_context, observed)
-            with self.runtime._transaction(token["instanceId"]) as connection:
-                row, descriptor, raw, gate = self._row(connection, token, context, revision)
+        return session
+
+    def _prepare(self, session, revision, deadline, endpoint, *, bound=None):
+        token, context = session["token"], session["context"]
+        profile_raw, launch_context, observed = (session[key] for key in ("profile_raw", "launch_context", "observed"))
+        if bound is not None:
+            bound()
+        require(type(profile_raw) is bytes and wire.sha256(profile_raw) == context["expectedEvidence"]["profileSha256"],
+                "PROFILE_MISMATCH", "明示profile原bytesがP期待値と一致しません")
+        validate_managed_launch(_read_managed_profile(profile_raw), launch_context, observed)
+        bundle = Path(launch_context["bundle"])
+        manifest = verify_bundle(bundle)
+        require(any(item["path"] == "launch/managed-server-candidate.json" and item["sha256"] == wire.sha256(profile_raw)
+                    and item["size"] == len(profile_raw) for item in manifest["files"]),
+                "PROFILE_MISMATCH", "bundleのcandidate原bytesと明示profileが一致しません")
+        manifest_hash = wire.sha256(regular_bytes(bundle / "runtime.json"))
+        validate_bundle_managed_launch(bundle, launch_context, observed)
+        if bound is not None:
+            bound()
+        with self.runtime._transaction(token["instanceId"]) as connection:
+            row, descriptor, raw, gate = self._row(connection, token, context, revision)
+            if bound is None:
                 require(gate["descriptor_hash"] is None, "CONTROL_BUSY", "一度結束したstartupを再実行しません")
-                generation = self.registry.root / "instances" / row["id"] / "generations" / row["generation"]
-                require(bundle == generation / "runtime" and launch_context["run"] == str(generation)
-                        and manifest["artifactId"] == row["artifact"] and manifest_hash == descriptor["runtimeManifestHash"],
-                        "PROFILE_MISMATCH", "固定generationの検証済みbundleが必要です")
-                require(launch_context["instanceId"] == row["id"] and launch_context["generationId"] == row["generation"]
-                        and launch_context["startNonce"] == descriptor["startNonce"]
-                        and launch_context["controlDescriptor"] == wire.descriptor_path(descriptor)
-                        and launch_context["controlDescriptorSha256"] == wire.sha256(raw),
-                        "PROFILE_MISMATCH", "独立launch入力とdescriptorが一致しません")
-                transport_context = {"managementRoot": str(self.registry.root), "instanceId": row["id"],
-                    "leaseId": row["lease"], "epoch": row["epoch"], "generationId": row["generation"],
-                    "runtimeRunId": row["run_id"], "controller": deepcopy(context["management"]["controller"]),
-                    "descriptorSha256": launch_context["controlDescriptorSha256"]}
-                session["origin"] = (gate["start_operation"], gate["start_fingerprint"])
-                session["checkpoint"] = ({key: row[key] for key in
-                    ("id", "lease", "epoch", "generation", "artifact", "run_id")}, gate["revision"], wire.sha256(raw), gate["nonce"])
+            else:
+                bound(connection)
+                require(revision == 1 and gate["descriptor_hash"] == wire.sha256(raw),
+                        "CONTROL_BLOCKED", "元CLOSED/1と同じdescriptor原文が必要です")
+            generation = self.registry.root / "instances" / row["id"] / "generations" / row["generation"]
+            require(bundle == generation / "runtime" and launch_context["run"] == str(generation)
+                    and manifest["artifactId"] == row["artifact"] and manifest_hash == descriptor["runtimeManifestHash"],
+                    "PROFILE_MISMATCH", "固定generationの検証済みbundleが必要です")
+            require(launch_context["instanceId"] == row["id"] and launch_context["generationId"] == row["generation"]
+                    and launch_context["startNonce"] == descriptor["startNonce"]
+                    and launch_context["controlDescriptor"] == wire.descriptor_path(descriptor)
+                    and launch_context["controlDescriptorSha256"] == wire.sha256(raw),
+                    "PROFILE_MISMATCH", "独立launch入力とdescriptorが一致しません")
+            transport_context = {"managementRoot": str(self.registry.root), "instanceId": row["id"],
+                "leaseId": row["lease"], "epoch": row["epoch"], "generationId": row["generation"],
+                "runtimeRunId": row["run_id"], "controller": deepcopy(context["management"]["controller"]),
+                "descriptorSha256": launch_context["controlDescriptorSha256"]}
+            session["origin"] = (gate["start_operation"], gate["start_fingerprint"])
+            session["checkpoint"] = ({key: row[key] for key in
+                ("id", "lease", "epoch", "generation", "artifact", "run_id")}, gate["revision"], wire.sha256(raw), gate["nonce"])
+            if bound is None:
                 revision = _change(connection, row, revision, "CLOSED")
                 connection.execute("UPDATE run_admission SET descriptor_hash=? WHERE run=?", (wire.sha256(raw), row["run_id"]))
-            session["endpoint"] = endpoint if endpoint is not None else self.transport.create(transport_context, raw)
+            else:
+                bound(connection)
+        session["endpoint"] = endpoint if endpoint is not None else self.transport.create(transport_context, raw)
+        if bound is not None:
+            bound()
+        return revision
+
+    def start(self, token, *, profile_raw, launch_context, observed, context, revision, deadline,
+              endpoint=None, defer_ready=False):
+        """Pが独立保持するexact入力で2往復する。承認やMの実起動を代行しない。
+
+        ACK原文をcommit後に送信し、同run/revisionでOPENとRUNNINGを同時確定する。
+        送信/保存不明時は門を開けず、完成済み原応答をUNKNOWNへ格下げしない。
+        """
+        session = self._session(token, profile_raw, launch_context, observed, context)
+        token, context = session["token"], session["context"]
+        try:
+            revision = self._prepare(session, revision, deadline, endpoint)
             channel = session["endpoint"].accept(context["owner"], deadline)
             session["connection"] = channel
             hello = channel.receive_frame(deadline)
@@ -224,6 +249,50 @@ class _Startup:
         finally:
             with self.lock:
                 session["active"] = False
+
+    def admit(self, token, *, profile_raw, launch_context, observed, context, revision, deadline,
+              endpoint, verify):
+        """元CLOSED/1のstartup枠を保持し、sessionと固定照合callbackを返す。
+
+        verifyは(session, connection=None, memory_only=False)で元生成証拠を照合する。
+        受付後のslot・原文・資源は、接続交換への引継ぎまで保持する。
+        """
+        session = self._session(token, profile_raw, launch_context, observed, context)
+        runtime, registry, transport = self.runtime, self.registry, self.transport
+
+        def source(connection=None, *, memory_only=False):
+            verify(session, connection, memory_only=memory_only)
+            require(self.runtime is runtime and self.registry is registry and self.transport is transport
+                    and self.sessions.get(token['instanceId']) is session,
+                    'PROOF_MISMATCH', '元startup枠の保持先が変更されました')
+
+        try:
+            self._prepare(session, revision, deadline, endpoint, bound=source)
+        finally:
+            session['active'] = False
+        objects = tuple(session[k] for k in ('token','context','launch_context','observed','origin','checkpoint','endpoint'))
+        expected = deepcopy({k:v for k,v in session.items() if k != 'endpoint'})
+
+        def memory():
+            source(memory_only=True)
+            require(all(session[k] is obj for k,obj in zip(
+                        ('token','context','launch_context','observed','origin','checkpoint','endpoint'),objects))
+                    and all(session[k] == value for k,value in expected.items())
+                    and session.keys() == expected.keys() | {'endpoint'},
+                    'PROOF_MISMATCH', 'startup準備の完成証拠が変更されました')
+            require(time.monotonic() < deadline, 'START_TIMEOUT', 'startup準備の最終比較後に期限を超過しました')
+
+        def check(*, memory_only=False):
+            if not memory_only:
+                source()
+                with runtime._transaction(token['instanceId'], read_only=True) as connection:
+                    source(connection)
+                    self._row(connection, session['token'], session['context'], revision)
+                    memory()
+            memory()
+
+        check()
+        return session, check
 
     def _checkpoint(self, connection, session):
         expected, revision, descriptor_hash, nonce = session["checkpoint"]

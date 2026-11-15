@@ -150,6 +150,18 @@ class RuntimeControl:
             return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
                 open_operation_id=open_operation_id, ready=ready, deadline=deadline, prepare=True, create=True)
 
+    def _offline_prepare_handshake(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """独立Readyから同じMのCLOSED/1受入まで進め、結果と固定引継ぎ組を返す。
+
+        組は(session, process, startup_session, callback)。callbackは元保存run原文を返す。
+        deadlineは入口のmonotonic期限。例外時も元資源・start/ports予約・原文を保持する。
+        """
+        require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
+        with self.registry.resource_use(), self._lock_wait(deadline):
+            return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+                open_operation_id=open_operation_id, ready=ready, deadline=deadline,
+                prepare=True, create=True, startup=True)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
