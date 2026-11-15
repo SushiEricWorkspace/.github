@@ -161,8 +161,15 @@ class ManagedRuntime:
                 return True
         return False
 
-    def prepare(self, row, run, generation):
+    def prepare(self, row, run, generation, *, verify=None):
+        """同じrunのdescriptor/endpointを保持する。失敗後の自動再準備は行わない。
+
+        verify指定時は作用前後で元証拠を照合し、sessionと(raw, 純比較callback)を返す。
+        既存の通常経路はsessionだけを返す。callbackは完成時の基準を取り直さない。
+        """
         approval, profile_raw = self.approved(row, generation)
+        if verify is not None:
+            verify()
         shop = generation / "config/SushiEricServerMod/shop_data"
         plain_path(shop)
         if not shop.exists():
@@ -187,13 +194,58 @@ class ManagedRuntime:
         wire.decode_descriptor(raw)
         context = {key: descriptor[key] for key in ("managementRoot", "instanceId", "leaseId", "epoch", "generationId", "runtimeRunId", "controller")}
         context["descriptorSha256"] = wire.sha256(raw)
-        session["endpoint"] = self.transport.create(context, raw)
+        if verify is None:
+            session["endpoint"] = self.transport.create(context, raw)
+        else:
+            verify()
+            session["endpoint"] = self.transport.create(context, raw, verify=verify)
         launch = {"bundle": str(generation / "runtime"), "run": str(generation), "auxiliary": str(leaf / "auxiliary"),
                   "privateTmp": str(leaf / "private-tmp"), "controlDescriptor": wire.descriptor_path(descriptor),
                   "controlDescriptorSha256": wire.sha256(raw), "runtimeManifest": str(generation / "runtime/runtime.json"),
                   "proofPath": run["proofPath"], "instanceId": row["id"], "generationId": row["generation"], "startNonce": run["nonce"]}
         session.update(descriptor=descriptor, raw=raw, approval=approval, profile_raw=profile_raw, launch=launch,
                        observed=_expand_managed_launch(_read_managed_profile(profile_raw), launch))
+        if verify is not None:
+            endpoint = session["endpoint"]
+
+            def snapshot():
+                objects = (self.transport, self.transport.native, session, session.get('endpoint'),
+                    session.get('descriptor'), session.get('approval'), session.get('launch'), session.get('observed'),
+                    endpoint.pin, endpoint.listener, endpoint.controller, endpoint.lock,
+                    session['stop'], session['done'], session['drain_lock'], endpoint.owner,
+                    endpoint.context, endpoint.descriptor, getattr(endpoint.pin, 'nodes', None),
+                    getattr(endpoint.listener, 'stream', None), getattr(endpoint.listener, 'pin', None),
+                    session['close_ids'], getattr(endpoint.pin, 'native', None),
+                    getattr(endpoint.listener, 'native', None), getattr(endpoint.controller, 'native', None))
+                names = ('handle','fd','writer','parent','path','nodes','identity','address','active','close_unknown')
+                values = (canonical({k: session[k] for k in ('run','descriptor','approval','launch')}),
+                    deepcopy(session['observed']),
+                    session.get('raw'), session.get('profile_raw'), session.get('error'), dict(session['close_ids']),
+                    session['stop'].is_set(), session['done'].is_set(), endpoint.raw, canonical(endpoint.context),
+                    canonical(endpoint.descriptor), self.transport.closing, endpoint.closing,
+                    endpoint.close_unknown, endpoint.connection,
+                    endpoint.listener.stream.fileno() if getattr(endpoint.listener, 'stream', None) is not None else None,
+                    deepcopy(tuple(tuple(getattr(obj, name, None) for name in names)
+                                   for obj in (endpoint.pin, endpoint.listener, endpoint.controller))))
+                return objects, values
+
+            fixed = snapshot()
+
+            def check():
+                current = snapshot()
+                require(self.sessions.get(row['id']) is session
+                        and self.transport.endpoints.get(row['id']) is endpoint
+                        and endpoint.raw == raw and canonical(endpoint.descriptor) == raw
+                        and endpoint.context == context
+                        and session.get('prepared_binding') is binding
+                        and all(a is b for a,b in zip(current[0], fixed[0])) and current[1] == fixed[1],
+                        'PROOF_MISMATCH', '準備したdescriptorと元制御資源のbindingが変更されました')
+
+            binding = raw, check
+            session['prepared_binding'] = binding
+            verify()
+            check()
+            return session, binding
         return session
 
     @staticmethod

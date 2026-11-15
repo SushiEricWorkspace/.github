@@ -459,3 +459,17 @@ close時と呼出時の短い期限を意図・局所記録・最終直列化/SQ
 `OFFLINE_CLOSED_READY_VERIFIED` はclose時Readyと終端証拠の一致だけを表します。Dataの現在のReady、chain/receiptの妥当性、Mod startを許可するものではありません。Data原本の確認から起動予約・OS生成直前・ACK・最終記録/返却までの継続照合と公開入力の接続は後続です。この照合に成功しても、第33スライスの既存start遮断を維持します。保持証拠のない新しいRuntimeControlでは、証拠の自動再構築をせず拒否します。
 
 `RuntimeControl._offline_read_ready_original(token, open_operation_id=..., ready=..., deadline=...)` は、独立Readyと元終端へ一致する固定generationの`world-id`・`current.json`・不変state原文を読み返します。戻り値`OFFLINE_READY_ORIGINAL_MATCHED`の`stateJson`は元UTF-8原文です。返却前に原文と元C/W・CLOSED・終端・予約不在を再照合します。chain/receiptの公式検証と新しいstart予約以降の接続は後続であり、この読取結果をcached admissionとして使用しません。
+
+### 第45スライス: 新runのdescriptor準備
+
+`RuntimeControl._offline_prepare_start(token, operation_id=..., read_operation_id=..., open_operation_id=..., ready=..., deadline=...)` は、独立Ready・公式読取・元終端から同じ新run/start/全portsを予約し、run記録に続けて`ManagedRuntime.prepare`を実行する内部入口です。旧`_start`の再採番・ports再取得は行いません。`OFFLINE_START_PREPARED`と`(準備済みsession, 固定callback)`を返します。callbackは元run保存原文を返し、元helper完成条件・承認・予約・descriptor原文/資源を継続照合します。可変slotからsessionや比較基準を読み直しません。
+
+同じ入口期限を承認再読後・P本人確認後・descriptor実体確認後・listener生成前・準備後と最終返却まで適用します。実際に作成したdescriptorのpinで同じ原文を再確認した後、短いRegistry write内の純比較で元CLOSED/0を再照合し、同じdescriptor hashを持つCLOSED/1へ遷移します。正常renewによるexpires変更は許容し、期限を延長しません。helper確定時に原文・session/endpoint/pin/listener/controller・handle/FDと承認を固定し、最終read退出後も保持objectと値を純比較します。
+
+実launch展開結果の`auxiliaryFiles`は補助fileのbytesを含むため、JSON化せず原文bytesを含むsnapshotとして保持・比較します。後から文字列へ変換した値や、補助fileを省略した展開結果を基準にしません。
+
+helperが最初に取得した入力と生成物も、元start意図の固定値へ結びます。純memory判定で元profile hash・承認hash/同一object、descriptorのroot/lease/epoch/generation/artifact/manifest・world/shop・run/nonce、launchの全項目を元run/固定generationと比較し、admission write内から最終read退出後まで同じ判定を再利用します。入力が後から元へ戻っていても、異なる入力から作られた生成物を採用しません。
+
+失敗時は元reader/原文・新run/admission・start/ports予約・準備済み資源を保全し、再生成・再送・自動recoverを行いません。prepare途中のnative資源は既存transportのclose/未解放保持規則に従います。通常`_offline_record_start`はCLOSED/0と元callbackを返すままで、通常startのprepare/GRANT処理も従来の経路です。
+
+この入口はMを生成せず、GRANTも送信しません。後続では返却された同じsession/callbackを`_create`へ引き継ぎ、元run保存原文を指定した更新とOS adapter準備後/生成直前の照合へ接続します。`_Startup.start`のdescriptor未結束前提は、このCLOSED/1証拠を明示的に引き継ぐ経路へ接続する必要があります。準備結果を既存handshakeへそのまま流用したり、既存の未結束前提を緩めたりしません。実OS/nativeでの受入は未確認です。

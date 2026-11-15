@@ -10,7 +10,7 @@ from .mod_control_runtime import _closed_writers
 from .local_ipc import plain_path
 from .snapshot_data import portable_properties, properties
 from .mod_control_startup import _admission, _change
-from .mod_control_wire import _canonical_uuid, _hash, _json
+from .mod_control_wire import _canonical_uuid, _hash, _json, descriptor_path
 from .offline_process import OfflineProcess
 from .registry import fields, identifier, require
 from .runtime_bundle import verify_bundle, require_data_generation
@@ -1328,14 +1328,21 @@ class _OfflineOpen:
             held['returned'] = complete = True
             return returned, verify_reserved
 
-    def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
-        """新start/portsの同じ固定結果からrunとCLOSED/0の受付正本を作る。生成・GRANTは後続。"""
+    def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline, prepare=False):
+        """新start/portsの固定結果からrunと閉門正本を作る。
+
+        prepare指定時はdescriptorとCLOSED/1まで結束し、結果と(session, callback)を返す。
+        未指定時はCLOSED/0までの結果とcallbackを返す。M生成・GRANTは後続。
+        """
         token = deepcopy(token)
         packet = self.reserve_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
             open_operation_id=open_operation_id, ready=ready, deadline=deadline)
         reservation, verify_reserved = packet
         intent = json.loads(verify_reserved())['offlineStart']
         runtime, registry = self.runtime, self.registry
+        if prepare:
+            root = registry.root
+            approval = runtime.managed.approvals.get(intent['instanceId'])
         instance, run_id = intent['instanceId'], intent['runId']
         key = instance, operation_id
         with runtime._transaction(instance, read_only=True) as connection:
@@ -1358,6 +1365,7 @@ class _OfflineOpen:
             descriptor_hash=None, start_operation=operation_id)
         gate_raw, reservation_raw = canonical(gate), canonical(reservation)
         recorded = complete = False
+        preparation = None
         held = dict(packet=packet, run=run, record=record, deadline=deadline, recorded=False, returned=False)
         with runtime._control_lock:
             require(key not in self.start_records, 'OPERATION_CONFLICT', '元run記録を保全し再生成しません')
@@ -1365,6 +1373,28 @@ class _OfflineOpen:
 
         def memory():
             verify_reserved(memory_only=True)
+            if preparation is not None:
+                require(held.get('preparation') is preparation,
+                        'PROOF_MISMATCH', '元descriptor準備結果の保持先が変更されました')
+                preparation[1][1]()
+                session, (raw, _) = preparation
+                descriptor = session['descriptor']
+                require(session['approval'] is approval
+                        and digest(canonical(session['approval'])) == intent['approvalSha256']
+                        and digest(session['profile_raw']) == intent['profileSha256'],
+                        'PROFILE_MISMATCH', '準備したprofile原文と承認objectが元start意図と一致しません')
+                require(raw == canonical(descriptor) and descriptor['managementRoot'] == str(root)
+                        and all(descriptor[name] == intent[name] for name in
+                                ('instanceId','leaseId','epoch','generationId','artifactId','runtimeManifestHash','worldRoot','shopDirectory'))
+                        and descriptor['runtimeRunId'] == run_id and descriptor['startNonce'] == intent['nonce'],
+                        'PROOF_MISMATCH', '元Readyと同じ新runのdescriptor原文が必要です')
+                leaf = root / 'manager/control' / run_id
+                launch = dict(bundle=str(generation/'runtime'), run=str(generation),
+                    auxiliary=str(leaf/'auxiliary'), privateTmp=str(leaf/'private-tmp'),
+                    controlDescriptor=descriptor_path(descriptor), controlDescriptorSha256=digest(raw),
+                    runtimeManifest=str(generation/'runtime/runtime.json'), proofPath=str(diagnostics/'proof.json'),
+                    instanceId=instance, generationId=intent['generationId'], startNonce=intent['nonce'])
+                require(session['launch'] == launch, 'PROOF_MISMATCH', '準備したlaunchが元runと固定generationへ結束されていません')
             require(self.runtime is runtime and self.registry is registry and runtime.registry is registry
                     and self.start_records.get(key) is held and held.get('packet') is packet
                     and packet[0] is reservation and packet[1] is verify_reserved
@@ -1393,10 +1423,11 @@ class _OfflineOpen:
             runId=run_id, recordSha256=digest(record.encode('utf-8')), admissionSha256=digest(gate_raw))
         result_raw = canonical(result)
 
-        def verify_recorded():
-            verify_reserved()
-            with runtime._transaction(instance, read_only=True) as connection:
-                saved(connection)
+        def verify_recorded(*, memory_only=False):
+            if not memory_only:
+                verify_reserved()
+                with runtime._transaction(instance, read_only=True) as connection:
+                    saved(connection)
             memory()
             require(canonical(returned) == result_raw, 'PROOF_MISMATCH', '新run記録の返却結果が変更されました')
             require(time.monotonic() < deadline, 'START_TIMEOUT', '新run記録の返却期限を超過しました')
@@ -1410,7 +1441,29 @@ class _OfflineOpen:
         held['recorded'] = recorded = True
         returned = deepcopy(result)
         verify_recorded()
+        if prepare:
+            preparation = runtime.managed.prepare(row, run, generation, verify=verify_recorded)
+            held['preparation'] = preparation
+            session, (raw, check) = preparation
+            verify_recorded()
+            session['endpoint'].pin.check(raw)
+            verify_recorded()
+            prepared_gate = dict(gate, revision=1, descriptor_hash=digest(raw))
+            with runtime._transaction(instance) as connection:
+                saved(connection)
+                changed = connection.execute("UPDATE run_admission SET revision=1,descriptor_hash=? WHERE run=? AND revision=0 AND gate='CLOSED' AND descriptor_hash IS NULL",
+                    (digest(raw), run_id))
+                require(changed.rowcount == 1, 'STALE_RUN', '元CLOSED/0だけをdescriptorへ結束できます')
+                memory()
+            gate_raw = canonical(prepared_gate)
+            result = dict(result, status='OFFLINE_START_PREPARED', descriptorSha256=digest(raw),
+                          admissionSha256=digest(gate_raw))
+            result_raw = canonical(result)
+            returned = deepcopy(result)
+            verify_recorded()
         held['returned'] = complete = True
+        if prepare:
+            return returned, (preparation[0], verify_recorded)
         return returned, verify_recorded
 
     def complete(self, token, *, operation_id, deadline):
