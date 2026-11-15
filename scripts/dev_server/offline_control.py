@@ -1329,12 +1329,13 @@ class _OfflineOpen:
             return returned, verify_reserved
 
     def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline,
-                     prepare=False, create=False, startup=False):
+                     prepare=False, create=False, startup=False, connect=False):
         """新start/portsの固定結果からrunと閉門正本を作る。
 
         prepare指定時はdescriptorとCLOSED/1まで結束し、結果と(session, callback)を返す。
         create指定時は同じsessionでMを生成し(session, process, callback)を返す。
         startup指定時はCLOSED/1の受入を行い(session, process, startup, callback)を返す。
+        connect指定時は同じ枠でacceptし、認証済み接続の固定証拠まで引き継ぐ。
         未指定時はCLOSED/0までの結果とcallbackを返す。GRANTは行わない。
         """
         token = deepcopy(token)
@@ -1383,7 +1384,7 @@ class _OfflineOpen:
                 require(held.get('preparation') is preparation,
                         'PROOF_MISMATCH', '元descriptor準備結果の保持先が変更されました')
                 preparation[1][1]()
-                session, (raw, _) = preparation
+                session, (raw, _) = preparation[:2]
                 descriptor = session['descriptor']
                 require(session['approval'] is approval
                         and digest(canonical(session['approval'])) == intent['approvalSha256']
@@ -1472,9 +1473,9 @@ class _OfflineOpen:
         returned = deepcopy(result)
         verify_recorded()
         if prepare:
-            preparation = runtime.managed.prepare(row, run, generation, verify=verify_recorded)
+            preparation = runtime.managed.prepare(row, run, generation, verify=verify_recorded, handoff=connect)
             held['preparation'] = preparation
-            session, (raw, check) = preparation
+            session, (raw, check) = preparation[:2]
             leaf = root / 'manager/control' / run_id
             launch = dict(bundle=str(generation/'runtime'), run=str(generation),
                 auxiliary=str(leaf/'auxiliary'), privateTmp=str(leaf/'private-tmp'),
@@ -1561,8 +1562,9 @@ class _OfflineOpen:
 
             prepared_startup = starter.admit(startup_token, profile_raw=session['profile_raw'],
                 launch_context=deepcopy(launch), observed=deepcopy(observed), context=json.loads(context_raw),
-                revision=1, deadline=deadline, endpoint=endpoint, verify=startup_source)
-            candidate, check_startup = prepared_startup
+                revision=1, deadline=deadline, endpoint=endpoint, verify=startup_source,
+                accept=preparation[2] if connect else None)
+            candidate, check_startup = prepared_startup[:2]
             held['startup'] = prepared_startup
             checkpoint = ({key:row[key] for key in ('id','lease','epoch','generation','artifact','run_id')},
                           1, digest(preparation[1][0]), run['nonce'])
@@ -1582,7 +1584,25 @@ class _OfflineOpen:
                 return record
 
             verify_startup()
+            if connect:
+                accepted = prepared_startup[2]()
+                held['accepted'] = accepted
+                result = dict(result, status='OFFLINE_START_ACCEPTED')
+                result_raw = canonical(result)
+                returned = deepcopy(result)
+
+                def verify_accepted(*, memory_only=False):
+                    verify_startup(memory_only=memory_only)
+                    require(held.get('accepted') is accepted and candidate['connection'] is accepted[0],
+                            'PROOF_MISMATCH', '認証済み元接続の確定結果が変更されました')
+                    accepted[1]()
+                    require(time.monotonic() < deadline, 'START_TIMEOUT', 'accept結果の最終比較後に期限を超過しました')
+                    return record
+
+                verify_accepted()
         held['returned'] = complete = True
+        if connect:
+            return returned, (creation[0], creation[1], candidate, verify_accepted)
         if startup:
             return returned, (creation[0], creation[1], candidate, verify_startup)
         if create:

@@ -161,11 +161,12 @@ class ManagedRuntime:
                 return True
         return False
 
-    def prepare(self, row, run, generation, *, verify=None):
+    def prepare(self, row, run, generation, *, verify=None, handoff=False):
         """同じrunのdescriptor/endpointを保持する。失敗後の自動再準備は行わない。
 
         verify指定時は作用前後で元証拠を照合し、sessionと(raw, 純比較callback)を返す。
         callbackは完成時に固定したpin/原文とlaunch出力の組も返す。
+        handoff指定時は同じ固定証拠で一度だけacceptする関数も返す。
         既存の通常経路はsessionだけを返す。callbackは完成時の基準を取り直さない。
         """
         approval, profile_raw = self.approved(row, generation)
@@ -217,7 +218,8 @@ class ManagedRuntime:
                     endpoint.context, endpoint.descriptor, getattr(endpoint.pin, 'nodes', None),
                     getattr(endpoint.listener, 'stream', None), getattr(endpoint.listener, 'pin', None),
                     session['close_ids'], getattr(endpoint.pin, 'native', None),
-                    getattr(endpoint.listener, 'native', None), getattr(endpoint.controller, 'native', None))
+                    getattr(endpoint.listener, 'native', None), getattr(endpoint.controller, 'native', None),
+                    self.transport.clock)
                 names = ('handle','fd','writer','parent','path','nodes','identity','address','active','close_unknown')
                 values = (canonical({k: session[k] for k in ('run','descriptor','approval','launch')}),
                     deepcopy(session['observed']),
@@ -231,12 +233,61 @@ class ManagedRuntime:
                 return objects, values
 
             fixed = snapshot()
+            connection = connection_fixed = None
+            connecting = False
+            accept_operation = operation_origin = io_origin = None
+            released = False
+
+            def connection_snapshot():
+                peer, channel = connection.peer, connection.channel
+                stream = getattr(channel, 'stream', None)
+                objects = (connection.endpoint, connection.expected, connection.lock, peer, channel,
+                    connection.pending, getattr(peer, 'native', None), getattr(channel, 'listener', None), stream)
+                values = (canonical(connection.expected), connection.authenticated, connection.closing,
+                    connection.close_unknown,
+                    deepcopy(tuple(getattr(peer, name, None) for name in
+                                   ('handle','fd','pid','closed','close_unknown','expected','uid'))),
+                    tuple(getattr(channel, name, None) for name in ('handle','closed')),
+                    stream.fileno() if stream is not None else None, getattr(endpoint.listener, 'active', None),
+                    connection.handoff_failed)
+                return objects, values
             observed = fixed[1][1]
             launch_binding = (fixed[0][8], raw, tuple(observed['argv']),
                 tuple(observed['auxiliaryFiles'].items()), tuple(observed['environment'].items()), observed['cwd'])
 
             def check():
                 current = snapshot()
+                if connection is not None:
+                    require(endpoint.connection is connection,
+                            'PROOF_MISMATCH', '元accept接続の保持先が変更されました')
+                    held = connection_snapshot()
+                    require(all(a is b for a,b in zip(held[0], connection_fixed[0]))
+                            and held[1] == connection_fixed[1],
+                            'PROOF_MISMATCH', '元accept資源のbindingが変更されました')
+                    if accept_operation is not None:
+                        require(accept_operation.channel is operation_origin[0]
+                                and getattr(accept_operation, 'native', None) is operation_origin[1]
+                                and getattr(accept_operation, 'overlapped', None) is operation_origin[2]
+                                and accept_operation.kind == 'accept' and accept_operation.value is None,
+                                'PROOF_MISMATCH', '元accept I/Oの保持資源が変更されました')
+                        if io_origin is not None:
+                            require(getattr(operation_origin[2], 'hEvent', None) == (None if released else io_origin[0])
+                                    and getattr(accept_operation, 'buffer', None) is (None if released else io_origin[1]),
+                                    'PROOF_MISMATCH', '元accept I/Oのevent又はbufferが変更されました')
+                        if released:
+                            require(accept_operation.terminal is True
+                                    and not getattr(accept_operation, 'release_unknown', False)
+                                    and getattr(accept_operation, 'released', True) is True
+                                    and getattr(accept_operation, 'error', None) is None
+                                    and not getattr(accept_operation, 'cancel_requested', False)
+                                    and getattr(accept_operation, 'cancel_error', None) is None,
+                                    'PROOF_MISMATCH', '元accept I/Oの正常解放が必要です')
+                    values = list(current[1])
+                    values[14] = fixed[1][14]
+                    resources = [list(value) for value in values[16]]
+                    resources[1][8] = fixed[1][16][1][8]
+                    values[16] = tuple(tuple(value) for value in resources)
+                    current = current[0], tuple(values)
                 require(self.sessions.get(row['id']) is session
                         and self.transport.endpoints.get(row['id']) is endpoint
                         and endpoint.raw == raw and canonical(endpoint.descriptor) == raw
@@ -246,11 +297,86 @@ class ManagedRuntime:
                         'PROOF_MISMATCH', '準備したdescriptorと元制御資源のbindingが変更されました')
                 return launch_binding
 
+            def connect(expected, deadline, source):
+                """元callbackを各取得境界で照合し、認証済み接続と同じ純比較を返す。"""
+                nonlocal connecting, connection, connection_fixed
+                require(handoff and not connecting, 'CONTROL_BUSY', '元acceptの再実行はできません')
+                check()
+                source()
+                expected_raw = canonical(expected)
+                connecting = True
+                phases = iter(('connection','peer','opened','channel','pending','issue','finished','connected','authenticated'))
+
+                def acquired(stage, value):
+                    nonlocal connection, connection_fixed, accept_operation, operation_origin, io_origin, released
+                    if stage != 'verify':
+                        require(next(phases, None) == stage, 'PROOF_MISMATCH', 'accept取得境界の順序が変更されました')
+                        if stage == 'connection':
+                            connection = value
+                            require(connection.endpoint is endpoint and endpoint.connection is connection
+                                    and canonical(connection.expected) == expected_raw
+                                    and connection.peer is connection.channel is connection.pending is None
+                                    and not connection.authenticated and not connection.closing and not connection.close_unknown
+                                    and not connection.handoff_failed,
+                                    'PROOF_MISMATCH', '元acceptの新規接続が一致しません')
+                        current = connection_snapshot()
+                        if connection_fixed is not None:
+                            refs, values = list(current[0]), list(current[1])
+                            changed = {
+                                'peer': ((3,6),(4,)), 'opened': ((),(4,)),
+                                'channel': ((4,7,8),(5,6,7)), 'pending': ((5,),()),
+                                'issue': ((),()),
+                                'finished': ((8,),(6,)), 'connected': ((5,),()),
+                                'authenticated': ((),(1,)),
+                            }[stage]
+                            for index in changed[0]: refs[index] = connection_fixed[0][index]
+                            for index in changed[1]: values[index] = connection_fixed[1][index]
+                            require(all(a is b for a,b in zip(refs, connection_fixed[0]))
+                                    and tuple(values) == connection_fixed[1],
+                                    'PROOF_MISMATCH', 'accept境界で元資源が変更されました')
+                            require((stage not in ('peer','opened') or connection.peer is value)
+                                    and (stage not in ('channel','connected') or connection.channel is value)
+                                    and (stage not in ('pending','finished') or connection.pending is value)
+                                    and (stage != 'connected' or connection.pending is None)
+                                    and (stage != 'authenticated' or connection.authenticated is True),
+                                    'PROOF_MISMATCH', 'accept取得資源が元native返却値と一致しません')
+                            if stage == 'opened':
+                                require(current[1][4][3:5] == connection_fixed[1][4][3:5],
+                                        'PROOF_MISMATCH', 'M本人pinの終了状態が変更されました')
+                            if stage == 'channel':
+                                require(connection.channel.listener is endpoint.listener,
+                                        'PROOF_MISMATCH', '元listener objectを接続へ引き継ぐ必要があります')
+                            if stage == 'channel' and endpoint.descriptor['endpoint']['transport'] == 'windows-pipe':
+                                require(endpoint.listener.active is True and connection.channel.handle == endpoint.listener.handle,
+                                        'PROOF_MISMATCH', '元listener handleを同じ接続へ引き継ぐ必要があります')
+                            elif stage == 'channel':
+                                require(current[1][7] == connection_fixed[1][7],
+                                        'PROOF_MISMATCH', '元listenerの状態が変更されました')
+                            if stage == 'pending':
+                                accept_operation = value
+                                operation_origin = (connection.channel, getattr(value, 'native', None),
+                                                    getattr(value, 'overlapped', None))
+                            elif stage == 'issue':
+                                require(value is accept_operation, 'PROOF_MISMATCH', '元accept I/Oだけを発行できます')
+                                io_origin = (getattr(operation_origin[2], 'hEvent', None), getattr(value, 'buffer', None))
+                            elif stage == 'connected':
+                                released = True
+                        connection_fixed = current
+                    check()
+                    source()
+
+                channel = endpoint.accept(expected, deadline, observe=acquired)
+                require(channel is connection and next(phases, None) is None,
+                        'PROOF_MISMATCH', '認証済み元接続の完成証拠が必要です')
+                check()
+                source()
+                return channel, check
+
             binding = raw, check
             session['prepared_binding'] = binding
             verify()
             check()
-            return session, binding
+            return (session, binding, connect) if handoff else (session, binding)
         return session
 
     @staticmethod

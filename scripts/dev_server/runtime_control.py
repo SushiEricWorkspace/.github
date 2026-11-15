@@ -162,6 +162,17 @@ class RuntimeControl:
                 open_operation_id=open_operation_id, ready=ready, deadline=deadline,
                 prepare=True, create=True, startup=True)
 
+    def _offline_accept_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """同じMとstartup枠でacceptし、結果と(session, process, startup, 固定callback)を返す。
+
+        deadlineは入口のmonotonic期限。不明時は元資源・原文・start/ports予約を保持する。
+        """
+        require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
+        with self.registry.resource_use(), self._lock_wait(deadline):
+            return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+                open_operation_id=open_operation_id, ready=ready, deadline=deadline,
+                prepare=True, create=True, startup=True, connect=True)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
