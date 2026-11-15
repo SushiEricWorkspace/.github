@@ -472,4 +472,16 @@ helperが最初に取得した入力と生成物も、元start意図の固定値
 
 失敗時は元reader/原文・新run/admission・start/ports予約・準備済み資源を保全し、再生成・再送・自動recoverを行いません。prepare途中のnative資源は既存transportのclose/未解放保持規則に従います。通常`_offline_record_start`はCLOSED/0と元callbackを返すままで、通常startのprepare/GRANT処理も従来の経路です。
 
-この入口はMを生成せず、GRANTも送信しません。後続では返却された同じsession/callbackを`_create`へ引き継ぎ、元run保存原文を指定した更新とOS adapter準備後/生成直前の照合へ接続します。`_Startup.start`のdescriptor未結束前提は、このCLOSED/1証拠を明示的に引き継ぐ経路へ接続する必要があります。準備結果を既存handshakeへそのまま流用したり、既存の未結束前提を緩めたりしません。実OS/nativeでの受入は未確認です。
+この入口はMを生成せず、GRANTも送信しません。M生成は次の内部入口で同じsession/callbackを引き継ぎます。`_Startup.start`のdescriptor未結束前提は、このCLOSED/1証拠を明示的に引き継ぐ経路へ接続する必要があります。準備結果を既存handshakeへそのまま流用したり、既存の未結束前提を緩めたりしません。実OS/nativeでの受入は未確認です。
+
+### 準備済みdescriptorからのM生成
+
+`RuntimeControl._offline_create_start(token, operation_id=..., read_operation_id=..., open_operation_id=..., ready=..., deadline=...)` は同じ予約・run記録・descriptor準備に続けて、共通`_create`へ準備済みsessionと固定callbackを渡します。prepareの再実行・再採番・ports再取得は行いません。`OFFLINE_START_CREATED`と`(session, process, 固定callback)`を返し、callbackは現在の生成記録原文を返します。呼出元はこの組を直接引き継ぎ、可変slotから基準を採用し直しません。
+
+元準備runと原文を保持したまま、別に保持する生成中runのcommand・creation・本人識別を、元保存原文をexpectedとする`_record`で更新します。同じ短いwrite内で元Ready/予約/承認の純比較、元又は更新後のrun全列とCLOSED/1を照合します。command構築後からOS adapter準備後/生成直前まで同じ期限とcallbackを使い、同じpinのdescriptor bytes確認後にもRegistryを再照合します。正常renewは許容して期限を延長しません。
+
+commandは構築時、生成資源はcreated時、本人識別はnative観測時から固定します。生成完了時に同じprocess・handle/job・group・識別object/原文とcommandを一度固定し、返却値に純比較callbackを結束します。最終copy・read退出後・context退出後も元helper完成条件/descriptor証拠と合成して比較し、再pollや旧PID再解決は行いません。例外時は元session/process・生成中原文・start/ports予約を保全し、自動kill・解放・再準備・再生成は行いません。
+
+prepareの純比較callbackは、同じ完成snapshotから元pin/descriptor bytes・argv・補助file bytes・環境/cwdを固定した組も返します。生成入口はこの組を直接受け継ぎ、可変sessionから基準を取り直しません。生成commandを固定argvへ照合し、実使用argfileの固定pathから補助fileを各65532byte上限のbounded読取で再照合します。環境は固定項目から作った元dictを渡します。全読取後にもRegistryを再照合し、生成直前の最後のhash/環境比較後と、最終返却前の最後の純比較後にも同じ期限を確認します。
+
+生成結果は起動成功ではなく、instanceはSTARTING/PENDING、admissionはCLOSED/1のままです。GRANT/BOUND/ACK・proof・RUNNING確定と公開呼出元は後続です。Pの期限保証はP側に限定し、GRANT後Mod内部の作用は既存期限へ委ねます。実OS/native受入と実使用時のartifact固定は未確認です。

@@ -165,6 +165,7 @@ class ManagedRuntime:
         """同じrunのdescriptor/endpointを保持する。失敗後の自動再準備は行わない。
 
         verify指定時は作用前後で元証拠を照合し、sessionと(raw, 純比較callback)を返す。
+        callbackは完成時に固定したpin/原文とlaunch出力の組も返す。
         既存の通常経路はsessionだけを返す。callbackは完成時の基準を取り直さない。
         """
         approval, profile_raw = self.approved(row, generation)
@@ -230,6 +231,9 @@ class ManagedRuntime:
                 return objects, values
 
             fixed = snapshot()
+            observed = fixed[1][1]
+            launch_binding = (fixed[0][8], raw, tuple(observed['argv']),
+                tuple(observed['auxiliaryFiles'].items()), tuple(observed['environment'].items()), observed['cwd'])
 
             def check():
                 current = snapshot()
@@ -240,6 +244,7 @@ class ManagedRuntime:
                         and session.get('prepared_binding') is binding
                         and all(a is b for a,b in zip(current[0], fixed[0])) and current[1] == fixed[1],
                         'PROOF_MISMATCH', '準備したdescriptorと元制御資源のbindingが変更されました')
+                return launch_binding
 
             binding = raw, check
             session['prepared_binding'] = binding

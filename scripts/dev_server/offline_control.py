@@ -7,7 +7,7 @@ import uuid
 
 from .build_inputs import canonical, digest, regular_bytes
 from .mod_control_runtime import _closed_writers
-from .local_ipc import plain_path
+from .local_ipc import make_private, plain_path
 from .snapshot_data import portable_properties, properties
 from .mod_control_startup import _admission, _change
 from .mod_control_wire import _canonical_uuid, _hash, _json, descriptor_path
@@ -1328,11 +1328,13 @@ class _OfflineOpen:
             held['returned'] = complete = True
             return returned, verify_reserved
 
-    def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline, prepare=False):
+    def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline,
+                     prepare=False, create=False):
         """新start/portsの固定結果からrunと閉門正本を作る。
 
         prepare指定時はdescriptorとCLOSED/1まで結束し、結果と(session, callback)を返す。
-        未指定時はCLOSED/0までの結果とcallbackを返す。M生成・GRANTは後続。
+        create指定時は同じsessionでMを生成し(session, process, callback)を返す。
+        未指定時はCLOSED/0までの結果とcallbackを返す。GRANTは行わない。
         """
         token = deepcopy(token)
         packet = self.reserve_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
@@ -1360,12 +1362,14 @@ class _OfflineOpen:
             manifestHash=digest(manifest), endpoints=deepcopy(intent['endpoints']),
             stopRequested=False, jvmAndChildrenExited=False, runtimeSaveCompleted=False)
         record = json.dumps(run)
+        original_record = record
         gate = dict(run=run_id, instance=instance, lease=intent['leaseId'], epoch=intent['epoch'],
             generation=intent['generationId'], nonce=intent['nonce'], gate='CLOSED', revision=0,
             descriptor_hash=None, start_operation=operation_id)
         gate_raw, reservation_raw = canonical(gate), canonical(reservation)
         recorded = complete = False
         preparation = None
+        creation_run = creation_raw = creation = None
         held = dict(packet=packet, run=run, record=record, deadline=deadline, recorded=False, returned=False)
         with runtime._control_lock:
             require(key not in self.start_records, 'OPERATION_CONFLICT', '元run記録を保全し再生成しません')
@@ -1395,11 +1399,14 @@ class _OfflineOpen:
                     runtimeManifest=str(generation/'runtime/runtime.json'), proofPath=str(diagnostics/'proof.json'),
                     instanceId=instance, generationId=intent['generationId'], startNonce=intent['nonce'])
                 require(session['launch'] == launch, 'PROOF_MISMATCH', '準備したlaunchが元runと固定generationへ結束されていません')
+            if creation_run is not None:
+                require(held.get('creation_run') is creation_run and json.dumps(creation_run) == creation_raw,
+                        'PROOF_MISMATCH', 'M生成中の元run原文が変更されました')
             require(self.runtime is runtime and self.registry is registry and runtime.registry is registry
                     and self.start_records.get(key) is held and held.get('packet') is packet
                     and packet[0] is reservation and packet[1] is verify_reserved
                     and canonical(reservation) == reservation_raw and held.get('run') is run
-                    and json.dumps(run) == record and held.get('record') == record
+                    and json.dumps(run) == original_record and held.get('record') == original_record
                     and held.get('deadline') == deadline and held.get('recorded') is recorded
                     and held.get('returned') is complete and held.get('binding') is verify_recorded,
                     'PROOF_MISMATCH', '新runの固定入力と保持先が変更されました')
@@ -1418,6 +1425,31 @@ class _OfflineOpen:
                     generation=intent['generationId'], record=record)
                     and admission is not None and canonical(dict(admission)) == gate_raw,
                     'STALE_RUN', '新run原文と閉門正本が変更されました')
+
+        def update(value, *, expected):
+            nonlocal record, creation_raw
+            require(value is creation_run and expected == record
+                    and all(value[k] == v for k, v in run.items() if k != 'identity')
+                    and set(value) <= set(run) | {'commandHash', 'creation'},
+                    'PROOF_MISMATCH', '共通生成入口の元runと更新元原文が一致しません')
+            target = json.dumps(value)
+            creation_raw = target
+
+            def writing_update(connection, encoded):
+                verify_reserved(connection)
+                memory()
+                current = connection.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone()
+                admission = connection.execute('SELECT * FROM run_admission WHERE run=?', (run_id,)).fetchone()
+                require(encoded == target and current is not None
+                        and dict(current) in (dict(id=run_id, instance=instance, generation=intent['generationId'], record=record),
+                                              dict(id=run_id, instance=instance, generation=intent['generationId'], record=target))
+                        and admission is not None and canonical(dict(admission)) == gate_raw,
+                        'STALE_RUN', 'M生成記録の元原文又はCLOSED/1が変更されました')
+
+            require(runtime._record(value, expected=record, verify=writing_update) == target,
+                    'PROOF_MISMATCH', 'M生成記録の保存原文が一致しません')
+            record = target
+            return record
 
         result = dict(status='OFFLINE_START_RECORDED', instanceId=instance, operationId=operation_id,
             runId=run_id, recordSha256=digest(record.encode('utf-8')), admissionSha256=digest(gate_raw))
@@ -1461,7 +1493,36 @@ class _OfflineOpen:
             result_raw = canonical(result)
             returned = deepcopy(result)
             verify_recorded()
+        if create:
+            require(preparation is not None, 'PROOF_REQUIRED', '元descriptor準備結果が必要です')
+            creation_run = deepcopy(run)
+            creation_raw = json.dumps(creation_run)
+            held['creation_run'] = creation_run
+            diagnostics.mkdir(parents=True, exist_ok=True)
+            make_private(diagnostics, directory=True)
+            with runtime._create(row, creation_run, generation, diagnostics, run['endpoints'],
+                    run['nonce'], run_id, record, deadline,
+                    prepared=(preparation[0], verify_recorded, preparation[1][1]()),
+                    record=update) as created:
+                session, process, check = created
+                creation = (session, process, check)
+                held['creation'] = creation
+                result = dict(result, status='OFFLINE_START_CREATED', recordSha256=digest(record.encode('utf-8')))
+                result_raw = canonical(result)
+                returned = deepcopy(result)
+
+                def verify_created(*, memory_only=False):
+                    require(held.get('creation') is creation and creation[0] is preparation[0],
+                            'PROOF_MISMATCH', '元M生成結果の保持先が変更されました')
+                    verify_recorded(memory_only=memory_only)
+                    check()
+                    return record
+
+                verify_created()
+            verify_created()
         held['returned'] = complete = True
+        if create:
+            return returned, (creation[0], creation[1], verify_created)
         if prepare:
             return returned, (preparation[0], verify_recorded)
         return returned, verify_recorded

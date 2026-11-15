@@ -10,7 +10,7 @@ import time
 import threading
 import uuid
 
-from .build_inputs import canonical, digest
+from .build_inputs import canonical, digest, regular_bytes
 from .contracts import LAYOUT_ID
 from .local_ipc import decode, make_private, plain_path, require_private
 from .registry import RegistryError, fields, identifier, require, ttl
@@ -139,6 +139,16 @@ class RuntimeControl:
         with self.registry.resource_use(), self._lock_wait(deadline):
             return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
                 open_operation_id=open_operation_id, ready=ready, deadline=deadline, prepare=True)
+
+    def _offline_create_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """同じ準備済みsessionでMを一度生成し、結果と(session, process, 固定callback)を返す。
+
+        GRANTやRUNNING確定は行わず、不明時も元資源・予約を保持する。
+        """
+        require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
+        with self.registry.resource_use(), self._lock_wait(deadline):
+            return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+                open_operation_id=open_operation_id, ready=ready, deadline=deadline, prepare=True, create=True)
 
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
@@ -666,9 +676,17 @@ class RuntimeControl:
         return {"instanceId": row["id"], "generation": row["generation"], "runId": run_id, "running": True, "snapshotClean": False}
 
     @contextmanager
-    def _create(self, row, run, generation, diagnostics, endpoints, nonce, run_id, expected, deadline):
+    def _create(self, row, run, generation, diagnostics, endpoints, nonce, run_id, expected, deadline,
+                *, prepared=None, record=None):
         """同じrunのM生成資源を保持する。予約・再採番・handshake・正常終了扱いは行わない。"""
-        session = self.managed.prepare(row, run, generation)
+        session = self.managed.prepare(row, run, generation) if prepared is None else prepared[0]
+        record = self._record if record is None else record
+        adapter = self.process_adapter
+        if prepared is not None:
+            prepared[1]()
+            pin, descriptor_raw, expected_command, files, environment_items, cwd = prepared[2]
+            environment = dict(environment_items)
+            require(str(generation) == cwd, 'PROOF_MISMATCH', '固定launchのcwdが一致しません')
         properties = {"instanceId": row["id"], "generationId": row["generation"], "startNonce": nonce,
                       "proofPath": run["proofPath"], "runtimeManifest": str(generation / "runtime/runtime.json")}
         properties.update({key: session["launch"][key] for key in ("controlDescriptor", "controlDescriptorSha256")})
@@ -676,17 +694,26 @@ class RuntimeControl:
                 "UNREPRODUCIBLE_ENVIRONMENT", "暗黙のJVM環境入力を使用できません")
         arguments = launch_command(generation / "runtime", "server", generation,
                                    jvm_properties=properties, managed_context=session["launch"])
+        command = tuple(arguments)
+        if prepared is not None:
+            require(command == expected_command, 'PROOF_MISMATCH', '固定launchのcommandが一致しません')
         run["commandHash"] = runtime_process.command_hash(arguments)
-        expected = self._record(run, expected=expected)
+        expected = record(run, expected=expected)
+        origin = observed_identity = None
 
         def created():
-            nonlocal expected
+            nonlocal expected, origin, observed_identity
+            if prepared is not None:
+                origin = (process.pid, process.group, getattr(process, 'handle', None),
+                          getattr(process, 'job', None), getattr(process, 'process', None))
             run["creation"] = {"pid": process.pid, "stage": process.stage, "ownerGroup": process.group}
             write_json(diagnostics / "creation.json", run["creation"])
-            expected = self._record(run, expected=expected)
+            expected = record(run, expected=expected)
             identity = self.process_adapter.identity(process.pid)
+            if prepared is not None:
+                observed_identity = identity, canonical(identity)
             run["identity"] = identity
-            expected = self._record(run, expected=expected)
+            expected = record(run, expected=expected)
             write_json(diagnostics / "process.json", {"runId": run_id, "nonce": nonce, "identity": identity})
             require(identity is not None and Path(identity["cwd"]).resolve() == generation.resolve()
                     and Path(identity["executable"]).resolve() == Path(arguments[0]).resolve()
@@ -702,15 +729,58 @@ class RuntimeControl:
 
             def before_create():
                 require(time.monotonic() < deadline, "START_TIMEOUT", "OS生成直前に起動期限を超過しました")
+                if prepared is not None:
+                    auxiliary = Path(expected_command[1][1:]).parent
+                    for name, raw in files:
+                        require(regular_bytes(auxiliary / name, maximum=65532) == raw,
+                                'PROOF_MISMATCH', '固定launchの補助file原文が変更されました')
+                    pin.check(descriptor_raw)
+                    prepared[1]()
+                    require(self.process_adapter is adapter and self.processes.get(run_id) is process
+                            and tuple(arguments) == command
+                            and tuple(environment.items()) == environment_items
+                            and runtime_process.command_hash(command) == run['commandHash'],
+                            'PROCESS_MISMATCH', '生成commandが固定記録と一致しません')
+                    require(time.monotonic() < deadline, 'START_TIMEOUT', '生成binding照合後に起動期限を超過しました')
 
             try:
                 before_create()
                 process.start(arguments, generation, log, nonce, created,
-                              environment=session["observed"]["environment"], before_create=before_create)
+                              environment=session["observed"]["environment"] if prepared is None else environment,
+                              before_create=before_create)
             finally:
                 run["creation"] = {"pid": process.pid, "stage": process.stage, "ownerGroup": process.group}
-                expected = self._record(run, expected=expected)
-            yield session, process
+                expected = record(run, expected=expected)
+            if prepared is None:
+                yield session, process
+            else:
+                before_create()
+                names = ('pid', 'stage', 'group', 'handle', 'job', 'thread')
+                values = tuple(getattr(process, name, None) for name in names)
+                child = getattr(process, 'process', None)
+                identity, creation = run['identity'], run['creation']
+                raw = canonical(run)
+                require(values[:3] == (identity['pid'], 'RUNNING', creation['ownerGroup'])
+                        and creation == dict(pid=process.pid, stage=process.stage, ownerGroup=process.group)
+                        and origin == (process.pid, process.group, getattr(process, 'handle', None),
+                                       getattr(process, 'job', None), child)
+                        and identity is observed_identity[0] and canonical(identity) == observed_identity[1]
+                        and runtime_process.command_hash(command) == run['commandHash'],
+                        'PROCESS_MISMATCH', '生成完了の元process識別とrun記録が一致しません')
+
+                def check():
+                    prepared[1](memory_only=True)
+                    require(self.process_adapter is adapter and self.processes.get(run_id) is process
+                            and getattr(process, 'process', None) is child
+                            and tuple(getattr(process, name, None) for name in names) == values
+                            and run['identity'] is identity and run['creation'] is creation
+                            and canonical(run) == raw and tuple(arguments) == command
+                            and tuple(environment.items()) == environment_items,
+                            'PROCESS_MISMATCH', '生成済み元processとcommand/識別の保持bindingが変更されました')
+                    require(time.monotonic() < deadline, 'START_TIMEOUT', '生成結果の最終比較後に期限を超過しました')
+
+                check()
+                yield session, process, check
 
     def _rcon_stop(self, run, generation, process, timeout, *, expected):
         def verify():
