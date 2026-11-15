@@ -56,7 +56,7 @@ class ModControlTransport:
         self.closing = False
         self.lock = threading.Lock()
 
-    def create(self, context: dict, raw_descriptor: bytes):
+    def create(self, context: dict, raw_descriptor: bytes, *, verify=None):
         """caller固定contextへ原descriptorを照合し、新規file/endpointを所有する。
 
         contextはroot/run/lease/世代/P本人/期待hashを持つ。本文から期待値を採用しない。
@@ -75,6 +75,8 @@ class ModControlTransport:
         _require(instance in self.instances, "inventoryにないinstanceです")
         path = absolute_path(context["managementRoot"]) / "manager" / "control" / context["runtimeRunId"] / "mod-control.json"
         _require(str(path) == descriptor_path(descriptor), "固定descriptor位置が一致しません")
+        if verify is not None:
+            verify()
         with self.lock:
             _require(not self.closing, "transportはshutdown中です")
             _require(instance not in self.endpoints, "旧runまたは未回収資源が残っています")
@@ -85,12 +87,16 @@ class ModControlTransport:
                 _require(not self.closing and not endpoint.closing, "run初期化は閉鎖中です")
                 endpoint.controller = self.native.pin_controller(context["controller"])
                 endpoint.controller.open(context["controller"])
+                if verify is not None:
+                    verify()
                 _require(not self.closing and not endpoint.closing, "P確認中に閉鎖されました")
                 _require(descriptor["endpoint"]["transport"] == self.native.transport, "OSとendpointが一致しません")
                 endpoint.pin = self.native.descriptor(path, raw_descriptor)
                 endpoint.pin.create(raw_descriptor)
                 _require(not self.closing and not endpoint.closing, "descriptor作成中に閉鎖されました")
                 endpoint.pin.check(raw_descriptor)
+                if verify is not None:
+                    verify()
                 endpoint.listener = self.native.listen(descriptor["endpoint"], endpoint.pin)
                 endpoint.listener.open()
                 _require(not self.closing and not endpoint.closing, "run初期化中に閉鎖されました")
