@@ -251,11 +251,12 @@ class _Startup:
                 session["active"] = False
 
     def admit(self, token, *, profile_raw, launch_context, observed, context, revision, deadline,
-              endpoint, verify):
+              endpoint, verify, accept=None):
         """元CLOSED/1のstartup枠を保持し、sessionと固定照合callbackを返す。
 
         verifyは(session, connection=None, memory_only=False)で元生成証拠を照合する。
         受付後のslot・原文・資源は、接続交換への引継ぎまで保持する。
+        accept指定時は同じ固定callbackを継続する単発connect関数も返す。
         """
         session = self._session(token, profile_raw, launch_context, observed, context)
         runtime, registry, transport = self.runtime, self.registry, self.transport
@@ -272,12 +273,16 @@ class _Startup:
             session['active'] = False
         objects = tuple(session[k] for k in ('token','context','launch_context','observed','origin','checkpoint','endpoint'))
         expected = deepcopy({k:v for k,v in session.items() if k != 'endpoint'})
+        accepted = None
+        connecting = False
 
         def memory():
             source(memory_only=True)
             require(all(session[k] is obj for k,obj in zip(
                         ('token','context','launch_context','observed','origin','checkpoint','endpoint'),objects))
-                    and all(session[k] == value for k,value in expected.items())
+                    and all(session[k] == value for k,value in expected.items() if k != 'connection')
+                    and session['connection'] is (accepted[0] if accepted is not None else None)
+                    and (accepted is None or session['connection'] is endpoint.connection)
                     and session.keys() == expected.keys() | {'endpoint'},
                     'PROOF_MISMATCH', 'startup準備の完成証拠が変更されました')
             require(time.monotonic() < deadline, 'START_TIMEOUT', 'startup準備の最終比較後に期限を超過しました')
@@ -292,7 +297,18 @@ class _Startup:
             memory()
 
         check()
-        return session, check
+
+        def connect():
+            nonlocal accepted, connecting
+            require(accept is not None and not connecting, 'CONTROL_BUSY', '元startup接続は一度だけ取得します')
+            check()
+            connecting = True
+            accepted = accept(session['context']['owner'], deadline, check)
+            session['connection'] = accepted[0]
+            check()
+            return accepted
+
+        return (session, check, connect) if accept is not None else (session, check)
 
     def _checkpoint(self, connection, session):
         expected, revision, descriptor_hash, nonce = session["checkpoint"]

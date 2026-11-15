@@ -129,43 +129,70 @@ class _Endpoint:
         self.closing = self.close_unknown = False
         self.lock = threading.Lock()
 
-    def accept(self, expected_m_identity: dict, deadline: float):
+    def accept(self, expected_m_identity: dict, deadline: float, *, observe=None):
         """Pが生成・保持したM本人だけを同pipe/socketで認証する。
 
         expectedはdescriptor/HELLO本文から生成しない。接続枠はrunあたり一つ。
         timeout/認証失敗でも未終端native I/Oはownerが保持し、予約や応答を生成しない。
+        observe指定時は元取得値を境界ごとに渡し、各作用の直前に同じ期限を確認する。
+        handoff失敗時は終端済みI/Oの解放までとし、接続・本人pinを保全する。
         """
         _deadline(deadline)
+        def checked(stage='verify', value=None):
+            if observe is not None:
+                observe(stage, value)
+                _require(self.owner.clock() < deadline, 'accept作用前にdeadlineを超えました')
+
+        checked()
         _require(self.lock.acquire(blocking=False), "run初期化または終了処理が実行中です")
         try:
             _require(not self.owner.closing and not self.closing and self.connection is None, "run接続枠が使用中です")
             expected = copy.deepcopy(expected_m_identity)
             _identity(expected)
             self.pin.check(self.raw)
+            checked()
             connection = _Connection(self, expected)
             connection.lock.acquire()  # 非公開の新objectなので競合しない。公開より先にI/O所有を固定する。
             self.connection = connection
         finally:
             self.lock.release()
         try:
-            connection.peer = self.owner.native.pin_process(expected)
-            connection.peer.open(expected)
+            checked('connection', connection)
+            peer = self.owner.native.pin_process(expected)
+            connection.peer = peer
+            checked('peer', peer)
+            peer.open(expected)
+            checked('opened', peer)
             _require(not self.closing and not connection.closing, "accept中に閉鎖されました")
-            connection.channel = self.listener.connection()
-            connection._io("accept", None, deadline)
+            channel = self.listener.connection()
+            connection.channel = channel
+            checked('channel', channel)
+            if observe is None:
+                connection._io("accept", None, deadline)
+            else:
+                connection._io("accept", None, deadline, verify=checked)
+            checked('connected', channel)
             _require(not self.closing and not connection.closing, "accept中に閉鎖されました")
             self.owner.native.authenticate(connection.channel, connection.peer, expected)
+            checked()
             self.pin.check(self.raw)
+            checked()
             _require(not self.owner.closing and not self.closing and not connection.closing, "認証中に閉鎖されました")
             connection.authenticated = True
+            checked('authenticated', connection)
             return connection
         except BaseException:
             connection.closing = True
+            if observe is not None:
+                connection.handoff_failed = True
             raise
         finally:
             connection.lock.release()
             if connection.closing:
-                connection.close(deadline)
+                if observe is None:
+                    connection.close(deadline)
+                else:
+                    connection.reap()
 
     def reap(self):
         if not self.lock.acquire(blocking=False):
@@ -225,6 +252,7 @@ class _Connection:
         self.endpoint, self.expected = endpoint, expected
         self.channel = self.peer = self.pending = None
         self.authenticated = self.closing = self.close_unknown = False
+        self.handoff_failed = False
         self.lock = threading.Lock()
 
     @contextmanager
@@ -235,7 +263,7 @@ class _Connection:
         finally:
             self.lock.release()
 
-    def _io(self, kind, value, deadline, *, transferred=0, idle=None):
+    def _io(self, kind, value, deadline, *, transferred=0, idle=None, verify=None):
         if self.endpoint.owner.clock() >= deadline:
             raise TransportError("I/O発行前にdeadlineを超えました", transferred=transferred)
         _require(self.pending is None, "前I/Oが未終端です")
@@ -243,7 +271,17 @@ class _Connection:
         # native発行前からendpoint→connection→operationを強参照する。
         self.pending = operation
         try:
-            operation.start()
+            if verify is not None:
+                verify('pending', operation)
+            if verify is None:
+                operation.start()
+            else:
+                issued = False
+                def before_issue():
+                    nonlocal issued
+                    verify('verify' if issued else 'issue', operation)
+                    issued = True
+                operation.start(before_issue=before_issue)
             if idle is not None:
                 while not operation.terminal:
                     idle()
@@ -266,6 +304,8 @@ class _Connection:
             raise TransportError("native I/Oが完了していません", transferred=transferred + operation.transferred,
                                  cancel_pending=self.pending is not None) from error
         _require(operation.terminal, "native I/O終端が不明です")
+        if verify is not None:
+            verify('finished', operation)
         try:
             operation.release()
         except BaseException:
@@ -348,7 +388,8 @@ class _Connection:
             if self.close_unknown:
                 return
             if self.pending is not None:
-                self.pending.poll()
+                if not self.handoff_failed:
+                    self.pending.poll()
                 if not self.pending.terminal:
                     return
                 try:
@@ -359,7 +400,7 @@ class _Connection:
                 self.pending = None
         finally:
             self.lock.release()
-        if self.closing:
+        if self.closing and not self.handoff_failed:
             self.close(self.endpoint.owner.clock())
 
     def close(self, deadline):
@@ -368,7 +409,7 @@ class _Connection:
         if not self.lock.acquire(blocking=False):
             return False
         try:
-            if self.close_unknown:
+            if self.close_unknown or self.handoff_failed:
                 return False
             if self.pending is not None:
                 self.pending.cancel()
@@ -572,14 +613,18 @@ class _MacOperation:
     def __init__(self, channel, kind, value):
         self.channel, self.kind, self.value = channel, kind, value
         self.terminal, self.transferred, self.result = False, 0, None
+        self.before_issue = None
 
-    def start(self):
+    def start(self, *, before_issue=None):
+        self.before_issue = before_issue
         self.poll()
 
     def poll(self):
         if self.terminal:
             return
         try:
+            if self.before_issue is not None:
+                self.before_issue()
             if self.kind == 'accept':
                 stream, _ = self.channel.listener.stream.accept()
                 self.channel.stream = stream
@@ -832,17 +877,21 @@ class _WinOperation:
         self.cancel_error = None
         self.release_unknown = False
 
-    def start(self):
+    def start(self, *, before_issue=None):
         kernel = self.native.kernel
         self.overlapped.hEvent = kernel.CreateEventW(None, True, False, None)
         self.native.check(self.overlapped.hEvent)
         if self.kind == 'accept':
+            if before_issue is not None:
+                before_issue()
             self.terminal = False
             success = kernel.ConnectNamedPipe(self.channel.handle, ctypes.byref(self.overlapped))
         else:
             self.buffer = ctypes.create_string_buffer(self.value if self.kind == 'write' else self.value)
             size = len(self.value) if self.kind == 'write' else self.value
             transferred = ctypes.c_uint32()
+            if before_issue is not None:
+                before_issue()
             self.terminal = False
             method = kernel.WriteFile if self.kind == 'write' else kernel.ReadFile
             success = method(self.channel.handle, self.buffer, size, ctypes.byref(transferred), ctypes.byref(self.overlapped))

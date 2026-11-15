@@ -493,3 +493,15 @@ prepareの純比較callbackは、同じ完成snapshotから元pin/descriptor byt
 通常startと共通の準備処理を使い、短いRegistry write内で元CLOSED/1・同じdescriptor hashを明示的に要求します。通常startは初期CLOSED/0から1へ進みます。受入結果はSTARTING/PENDING・CLOSED/1で、元session/endpoint・startup枠・要求応答原文と予約を保持します。正常renewは現在のtoken有効性で確認し、入口期限を継続します。
 
 今回は接続交換に先立つ受入までを独立レビュー単位とします。acceptで変化するconnection/listenerの正当な状態遷移とGRANT/BOUND/ACK、最終RUNNING確定、公開入力は残作業です。実OS/nativeと実Mod/Dataの本人受入は未確認です。
+
+### 同じstartup枠からのaccept
+
+`RuntimeControl._offline_accept_start(token, operation_id=..., read_operation_id=..., open_operation_id=..., ready=..., deadline=...)`は同じ内部生成・受入から、一度だけacceptしてM本人を認証します。`OFFLINE_START_ACCEPTED`と`(session, process, startup_session, 固定callback)`を返します。callbackは元run保存原文を返します。
+
+元準備callbackは、保持したdescriptor・native・listener・M生成証拠を照合し続けます。acceptで新規取得するconnection・peer・channel・I/Oを取得順に固定し、Windows listener.activeのFalse→True、Mac channel.streamの取得、I/O正常解放を明示的な遷移として扱います。完成基準はhelper内部で固定して返却値と一体で渡し、外側は同じ保持object・値を最終read退出後にも比較します。
+
+artifact再読後、peer取得・open後、channel準備後、I/O準備後・発行直前・正常解放前後、認証・最終返却へ同じcallbackと期限を渡します。Windowsはevent準備後、Macは各nonblocking syscall直前にも確認します。正常renewは現在のtoken有効性で確認します。
+
+observe指定のhandoff失敗時はconnection.handoff_failedを保持し、取得済みconnection・peer pin・channelと識別を元endpointに残します。終端済みI/Oのevent等は既存規則で正常解放します。失敗後のreapは未終端I/Oを再pollせず、接続の切断・本人pin解放へ進みません。closeも未完了として返し、元枠・原文・start/ports予約と再accept拒否を継続します。通常startのobserve未指定経路は既存cleanupへ進みます。
+
+今回の完了範囲は認証済み接続の確定までです。instance STARTING/PENDING・admission CLOSED/1を保持し、GRANT/BOUND/ACK・RUNNING確定・公開入力を後続へ渡します。Pの期限保証とGRANT後Mod内部の期限は確定済み判断を継承します。実OS/native・実Mod/Data本人受入は未確認です。
