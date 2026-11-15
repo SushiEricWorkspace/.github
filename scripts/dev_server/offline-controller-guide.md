@@ -485,3 +485,11 @@ commandは構築時、生成資源はcreated時、本人識別はnative観測時
 prepareの純比較callbackは、同じ完成snapshotから元pin/descriptor bytes・argv・補助file bytes・環境/cwdを固定した組も返します。生成入口はこの組を直接受け継ぎ、可変sessionから基準を取り直しません。生成commandを固定argvへ照合し、実使用argfileの固定pathから補助fileを各65532byte上限のbounded読取で再照合します。環境は固定項目から作った元dictを渡します。全読取後にもRegistryを再照合し、生成直前の最後のhash/環境比較後と、最終返却前の最後の純比較後にも同じ期限を確認します。
 
 生成結果は起動成功ではなく、instanceはSTARTING/PENDING、admissionはCLOSED/1のままです。GRANT/BOUND/ACK・proof・RUNNING確定と公開呼出元は後続です。Pの期限保証はP側に限定し、GRANT後Mod内部の作用は既存期限へ委ねます。実OS/native受入と実使用時のartifact固定は未確認です。
+
+### CLOSED/1を継承するstartup受入
+
+`RuntimeControl._offline_prepare_handshake(token, operation_id=..., read_operation_id=..., open_operation_id=..., ready=..., deadline=...)` は同じ内部生成経路から、M本人のcontextとstartup枠の準備まで接続します。`OFFLINE_STARTUP_PREPARED`と`(session, process, startup_session, 固定callback)`を返します。callbackは元保存run原文を返し、入口の同一期限、元helper完成条件、descriptorとM資源、新run/start/ports正本、startupの保持object・原文・checkpointを照合します。
+
+通常startと共通の準備処理を使い、短いRegistry write内で元CLOSED/1・同じdescriptor hashを明示的に要求します。通常startは初期CLOSED/0から1へ進みます。受入結果はSTARTING/PENDING・CLOSED/1で、元session/endpoint・startup枠・要求応答原文と予約を保持します。正常renewは現在のtoken有効性で確認し、入口期限を継続します。
+
+今回は接続交換に先立つ受入までを独立レビュー単位とします。acceptで変化するconnection/listenerの正当な状態遷移とGRANT/BOUND/ACK、最終RUNNING確定、公開入力は残作業です。実OS/nativeと実Mod/Dataの本人受入は未確認です。

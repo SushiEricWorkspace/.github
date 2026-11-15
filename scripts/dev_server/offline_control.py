@@ -1329,11 +1329,12 @@ class _OfflineOpen:
             return returned, verify_reserved
 
     def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline,
-                     prepare=False, create=False):
+                     prepare=False, create=False, startup=False):
         """新start/portsの固定結果からrunと閉門正本を作る。
 
         prepare指定時はdescriptorとCLOSED/1まで結束し、結果と(session, callback)を返す。
         create指定時は同じsessionでMを生成し(session, process, callback)を返す。
+        startup指定時はCLOSED/1の受入を行い(session, process, startup, callback)を返す。
         未指定時はCLOSED/0までの結果とcallbackを返す。GRANTは行わない。
         """
         token = deepcopy(token)
@@ -1369,6 +1370,7 @@ class _OfflineOpen:
         gate_raw, reservation_raw = canonical(gate), canonical(reservation)
         recorded = complete = False
         preparation = None
+        launch = None
         creation_run = creation_raw = creation = None
         held = dict(packet=packet, run=run, record=record, deadline=deadline, recorded=False, returned=False)
         with runtime._control_lock:
@@ -1392,12 +1394,6 @@ class _OfflineOpen:
                                 ('instanceId','leaseId','epoch','generationId','artifactId','runtimeManifestHash','worldRoot','shopDirectory'))
                         and descriptor['runtimeRunId'] == run_id and descriptor['startNonce'] == intent['nonce'],
                         'PROOF_MISMATCH', '元Readyと同じ新runのdescriptor原文が必要です')
-                leaf = root / 'manager/control' / run_id
-                launch = dict(bundle=str(generation/'runtime'), run=str(generation),
-                    auxiliary=str(leaf/'auxiliary'), privateTmp=str(leaf/'private-tmp'),
-                    controlDescriptor=descriptor_path(descriptor), controlDescriptorSha256=digest(raw),
-                    runtimeManifest=str(generation/'runtime/runtime.json'), proofPath=str(diagnostics/'proof.json'),
-                    instanceId=instance, generationId=intent['generationId'], startNonce=intent['nonce'])
                 require(session['launch'] == launch, 'PROOF_MISMATCH', '準備したlaunchが元runと固定generationへ結束されていません')
             if creation_run is not None:
                 require(held.get('creation_run') is creation_run and json.dumps(creation_run) == creation_raw,
@@ -1455,8 +1451,10 @@ class _OfflineOpen:
             runId=run_id, recordSha256=digest(record.encode('utf-8')), admissionSha256=digest(gate_raw))
         result_raw = canonical(result)
 
-        def verify_recorded(*, memory_only=False):
-            if not memory_only:
+        def verify_recorded(connection=None, *, memory_only=False):
+            if connection is not None:
+                saved(connection)
+            elif not memory_only:
                 verify_reserved()
                 with runtime._transaction(instance, read_only=True) as connection:
                     saved(connection)
@@ -1477,6 +1475,12 @@ class _OfflineOpen:
             preparation = runtime.managed.prepare(row, run, generation, verify=verify_recorded)
             held['preparation'] = preparation
             session, (raw, check) = preparation
+            leaf = root / 'manager/control' / run_id
+            launch = dict(bundle=str(generation/'runtime'), run=str(generation),
+                auxiliary=str(leaf/'auxiliary'), privateTmp=str(leaf/'private-tmp'),
+                controlDescriptor=descriptor_path(json.loads(raw)), controlDescriptorSha256=digest(raw),
+                runtimeManifest=str(generation/'runtime/runtime.json'), proofPath=str(diagnostics/'proof.json'),
+                instanceId=instance, generationId=intent['generationId'], startNonce=intent['nonce'])
             verify_recorded()
             session['endpoint'].pin.check(raw)
             verify_recorded()
@@ -1511,16 +1515,76 @@ class _OfflineOpen:
                 result_raw = canonical(result)
                 returned = deepcopy(result)
 
-                def verify_created(*, memory_only=False):
+                def verify_created(connection=None, *, memory_only=False):
                     require(held.get('creation') is creation and creation[0] is preparation[0],
                             'PROOF_MISMATCH', '元M生成結果の保持先が変更されました')
-                    verify_recorded(memory_only=memory_only)
+                    verify_recorded(connection, memory_only=memory_only)
                     check()
                     return record
 
                 verify_created()
             verify_created()
+        if startup:
+            managed = runtime.managed
+            starter = managed.startup
+            session, process, _ = creation
+            endpoint = session['endpoint']
+            context = managed._handshake_context(creation_run, session)
+            verify_created()
+            identity = creation_run['identity']
+            boot = identity['bootId'] if session['descriptor']['endpoint']['transport'] == 'windows-pipe' else str(uuid.UUID(identity['bootId']))
+            require(context['owner'] == dict(hostHash=session['descriptor']['controller']['hostHash'],
+                    bootId=boot, pid=identity['pid'], startId=identity['startId']),
+                    'PROCESS_MISMATCH', '元M生成証拠と同じnative本人が必要です')
+            context_raw = canonical(context)
+            held['startup_context'] = context_raw
+            launch_raw = canonical(launch)
+            proof = preparation[1][1]()
+            observed = dict(argv=list(proof[2]), auxiliaryFiles=dict(proof[3]),
+                            environment=dict(proof[4]), cwd=proof[5])
+            startup_token = dict(instanceId=instance, leaseId=intent['leaseId'], epoch=intent['epoch'],
+                                 expectedGeneration=intent['generationId'])
+            token_raw = canonical(startup_token)
+
+            def startup_source(candidate, connection=None, *, memory_only=False):
+                verify_created(connection, memory_only=memory_only)
+                require(runtime.managed is managed and managed.startup is starter
+                        and held.get('startup_context') == context_raw
+                        and canonical(candidate['token']) == token_raw
+                        and canonical(candidate['context']) == context_raw
+                        and digest(candidate['profile_raw']) == intent['profileSha256']
+                        and canonical(candidate['launch_context']) == launch_raw
+                        and candidate['observed'] == observed
+                        and (candidate['endpoint'] is None or candidate['endpoint'] is endpoint),
+                        'PROOF_MISMATCH', '元生成証拠とstartup入力のbindingが一致しません')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', 'startup入力の最終比較後に期限を超過しました')
+
+            prepared_startup = starter.admit(startup_token, profile_raw=session['profile_raw'],
+                launch_context=deepcopy(launch), observed=deepcopy(observed), context=json.loads(context_raw),
+                revision=1, deadline=deadline, endpoint=endpoint, verify=startup_source)
+            candidate, check_startup = prepared_startup
+            held['startup'] = prepared_startup
+            checkpoint = ({key:row[key] for key in ('id','lease','epoch','generation','artifact','run_id')},
+                          1, digest(preparation[1][0]), run['nonce'])
+            result = dict(result, status='OFFLINE_STARTUP_PREPARED', contextSha256=digest(context_raw))
+            result_raw = canonical(result)
+            returned = deepcopy(result)
+
+            def verify_startup(*, memory_only=False):
+                check_startup(memory_only=memory_only)
+                startup_source(candidate, memory_only=True)
+                require(held.get('startup') is prepared_startup
+                        and candidate['endpoint'] is endpoint
+                        and candidate['origin'] == (operation_id, reservation['requestSha256'])
+                        and candidate['checkpoint'] == checkpoint,
+                        'PROOF_MISMATCH', '元CLOSED/1のstartup完成証拠が変更されました')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', 'startup準備の返却前に期限を超過しました')
+                return record
+
+            verify_startup()
         held['returned'] = complete = True
+        if startup:
+            return returned, (creation[0], creation[1], candidate, verify_startup)
         if create:
             return returned, (creation[0], creation[1], verify_created)
         if prepare:

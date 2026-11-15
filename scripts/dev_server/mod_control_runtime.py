@@ -258,7 +258,7 @@ class ManagedRuntime:
         from .snapshot_data import properties
         return generation / properties((generation / "server.properties").read_bytes())["level-name"]
 
-    def handshake(self, token, run, session, deadline):
+    def _handshake_context(self, run, session):
         descriptor = session["descriptor"]
         owner = process_identity(self.transport.native, self.runtime.process_adapter, run["identity"]["pid"])
         require(owner["startId"] == run["identity"]["startId"],
@@ -268,6 +268,10 @@ class ManagedRuntime:
                       "drainSha256": wire.sha256(canonical({"run": run["runId"], "writers": []}))}
         context = {"descriptorJson": session["raw"].decode("utf-8"), "owner": owner,
                    "management": management, "expectedEvidence": session["approval"]["expectedEvidence"]}
+        return context
+
+    def handshake(self, token, run, session, deadline):
+        context = self._handshake_context(run, session)
         with self.runtime._transaction(token["instanceId"], read_only=True) as connection:
             revision = _admission(connection, self.registry._instance(connection, token["instanceId"]))["revision"]
         self.startup.start(token, profile_raw=session["profile_raw"], launch_context=session["launch"],
