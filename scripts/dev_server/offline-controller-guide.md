@@ -505,3 +505,13 @@ artifact再読後、peer取得・open後、channel準備後、I/O準備後・発
 observe指定のhandoff失敗時はconnection.handoff_failedを保持し、取得済みconnection・peer pin・channelと識別を元endpointに残します。終端済みI/Oのevent等は既存規則で正常解放します。失敗後のreapは未終端I/Oを再pollせず、接続の切断・本人pin解放へ進みません。closeも未完了として返し、元枠・原文・start/ports予約と再accept拒否を継続します。通常startのobserve未指定経路は既存cleanupへ進みます。
 
 今回の完了範囲は認証済み接続の確定までです。instance STARTING/PENDING・admission CLOSED/1を保持し、GRANT/BOUND/ACK・RUNNING確定・公開入力を後続へ渡します。Pの期限保証とGRANT後Mod内部の期限は確定済み判断を継承します。実OS/native・実Mod/Data本人受入は未確認です。
+
+### 同じ認証済み接続でのHELLO/GRANT
+
+`RuntimeControl._offline_grant_start(token, operation_id=..., read_operation_id=..., open_operation_id=..., ready=..., deadline=...)`は同じ内部経路で一度だけacceptし、HELLO受信・公式wire3照合・GRANT原文の保存と送信まで進めます。`OFFLINE_START_GRANTED`、HELLO/GRANT body hashと`(session, process, startup_session, 固定callback)`を返します。callbackは元run保存原文を返します。prepare・M生成・ports予約・acceptを再実行する経路は追加しません。
+
+元acceptの固定callbackに、各read/writeのpending取得と正常解放だけを明示的に合成します。同じnative/channel・OVERLAPPED・event/buffer・要求値・受信原文・正常終端を保持し、実送信bufferも元GRANT bytesへ照合します。原文・I/O資源・完成基準はhelper内で固定して返却packetへ結び、外側の最終gateまで同じ純比較を継承します。可変slotから基準を採用し直しません。
+
+各I/Oの準備後・実発行直前、応答・正常解放前後、短いGRANT保存writeの前後、送信直前・最終read退出後と返却直前へ同じcallbackと入口期限を渡します。保存済みHELLO/GRANT原文は現在正本へ再照合し、正常renewでも期限を延長しません。途中失敗・部分送信・解放不明では自動再送・再accept・接続切断・本人pin解放を行わず、元connection/peer/channel・I/O進捗・原文・start/ports予約を保持します。終端済みI/Oの正常解放は接続の切断と区別します。
+
+結果はSTARTING/PENDING・CLOSED/1のままで、BOUND/ACK・RUNNING確定・公開入力・正規recoverは後続です。GRANT後のMod内部Data beginRunはMod既存期限へ委ね、P側の不明は作用後不明として保全します。固定Mod/Data契約・artifactは変更しません。実OS/native・実Mod/Data本人受入は未確認です。

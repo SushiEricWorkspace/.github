@@ -306,12 +306,16 @@ class _Connection:
         _require(operation.terminal, "native I/O終端が不明です")
         if verify is not None:
             verify('finished', operation)
+            if kind != 'accept':
+                verify('result', (operation, result))
         try:
             operation.release()
         except BaseException:
             self.close_unknown = True
             raise
         self.pending = None
+        if verify is not None and kind != 'accept':
+            verify('released', operation)
         return result
 
     def _ready(self):
@@ -319,7 +323,7 @@ class _Connection:
         self.endpoint.pin.check(self.endpoint.raw)
         self.endpoint.owner.native.authenticate(self.channel, self.peer, self.expected)
 
-    def receive_frame(self, deadline: float, *, idle=None) -> bytes:
+    def receive_frame(self, deadline: float, *, idle=None, observe=None) -> bytes:
         """prefixを先に検査し、選択版の有限frameを返す。idle中も単一I/Oを保持する。"""
         _deadline(deadline)
         with self._exclusive():
@@ -334,12 +338,18 @@ class _Connection:
                     while len(result) < target:
                         chunk = min(65536, target - len(result))
                         waiting = idle if not result else None
-                        data = self._io("read", chunk, deadline, transferred=len(result), idle=waiting)
+                        if observe is None:
+                            data = self._io("read", chunk, deadline, transferred=len(result), idle=waiting)
+                        else:
+                            observe('read', chunk)
+                            data = self._io("read", chunk, deadline, transferred=len(result), verify=observe)
                         if waiting is not None:
                             deadline = self.endpoint.owner.clock() + 30
                         _require(type(data) is bytes and 0 < len(data) <= chunk, "frameが途中で切断されました")
                         result.extend(data)
                 self._ready()
+                if observe is not None:
+                    observe('frame', bytes(result))
                 return bytes(result)
             except BaseException as error:
                 self.closing = True
@@ -347,7 +357,7 @@ class _Connection:
                     error.transferred = max(error.transferred, len(result))
                 raise
 
-    def send_frame(self, raw_frame: bytes, deadline: float):
+    def send_frame(self, raw_frame: bytes, deadline: float, *, observe=None):
         """元frameを送る。部分送信/期限超過を未送信へ読み替えず、自動再送しない。"""
         _deadline(deadline)
         _require(type(raw_frame) is bytes and 4 < len(raw_frame) <= self.endpoint.owner.max_frame
@@ -358,10 +368,16 @@ class _Connection:
             try:
                 while sent < len(raw_frame):
                     chunk = raw_frame[sent:sent + 65536]
-                    size = self._io("write", chunk, deadline, transferred=sent)
+                    if observe is None:
+                        size = self._io("write", chunk, deadline, transferred=sent)
+                    else:
+                        observe('write', chunk)
+                        size = self._io("write", chunk, deadline, transferred=sent, verify=observe)
                     _require(type(size) is int and 0 < size <= len(chunk), "送信byte数が不正です")
                     sent += size
                 self._ready()
+                if observe is not None:
+                    observe('frame', sent)
                 return sent
             except BaseException as error:
                 self.closing = True

@@ -1329,13 +1329,14 @@ class _OfflineOpen:
             return returned, verify_reserved
 
     def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline,
-                     prepare=False, create=False, startup=False, connect=False):
+                     prepare=False, create=False, startup=False, connect=False, grant=False):
         """新start/portsの固定結果からrunと閉門正本を作る。
 
         prepare指定時はdescriptorとCLOSED/1まで結束し、結果と(session, callback)を返す。
         create指定時は同じsessionでMを生成し(session, process, callback)を返す。
         startup指定時はCLOSED/1の受入を行い(session, process, startup, callback)を返す。
         connect指定時は同じ枠でacceptし、認証済み接続の固定証拠まで引き継ぐ。
+        grant指定時は同じ接続でHELLO/GRANTまで交換する。BOUND/ACKは含めない。
         未指定時はCLOSED/0までの結果とcallbackを返す。GRANTは行わない。
         """
         token = deepcopy(token)
@@ -1600,7 +1601,26 @@ class _OfflineOpen:
                     return record
 
                 verify_accepted()
+                if grant:
+                    granted = prepared_startup[3]()
+                    held['granted'] = granted
+                    result = dict(result, status='OFFLINE_START_GRANTED',
+                                  helloBodySha256=digest(granted[0][4:]), grantBodySha256=digest(granted[1][4:]))
+                    result_raw = canonical(result)
+                    returned = deepcopy(result)
+
+                    def verify_granted(*, memory_only=False):
+                        verify_accepted(memory_only=memory_only)
+                        require(held.get('granted') is granted,
+                                'PROOF_MISMATCH', '元GRANT完成結果の保持先が変更されました')
+                        granted[2](memory_only=memory_only)
+                        require(time.monotonic() < deadline, 'START_TIMEOUT', 'GRANT結果の最終返却期限を超過しました')
+                        return record
+
+                    verify_granted()
         held['returned'] = complete = True
+        if grant:
+            return returned, (creation[0], creation[1], candidate, verify_granted)
         if connect:
             return returned, (creation[0], creation[1], candidate, verify_accepted)
         if startup:

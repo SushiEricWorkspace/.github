@@ -275,6 +275,8 @@ class _Startup:
         expected = deepcopy({k:v for k,v in session.items() if k != 'endpoint'})
         accepted = None
         connecting = False
+        granting = grant_saved = False
+        grant_raw = None
 
         def memory():
             source(memory_only=True)
@@ -293,6 +295,9 @@ class _Startup:
                 with runtime._transaction(token['instanceId'], read_only=True) as connection:
                     source(connection)
                     self._row(connection, session['token'], session['context'], revision)
+                    if grant_saved:
+                        require(operations.readback(connection, token['instanceId'], session['hello']) == grant_raw,
+                                'PROOF_MISMATCH', '元HELLO/GRANTの保存原文が変更されました')
                     memory()
             memory()
 
@@ -308,7 +313,46 @@ class _Startup:
             check()
             return accepted
 
-        return (session, check, connect) if accept is not None else (session, check)
+        def grant_start():
+            nonlocal granting, grant_saved, grant_raw
+            require(accepted is not None and not granting, 'CONTROL_BUSY', '元接続のGRANTは一度だけ送信します')
+            granting = True
+            try:
+                check()
+                received = accepted[2](None, deadline, check)
+                hello = received[0]
+                session['request'] = session['hello'] = hello
+                expected['request'] = expected['hello'] = hello
+                grant_raw = _reply(hello, context, 'GRANT')
+                self.grant(hello, grant_raw, context)
+                session['grant'] = expected['grant'] = grant_raw
+
+                def saving(connection):
+                    source(connection)
+                    memory()
+
+                check()
+                self._save(token, context, revision, hello, grant_raw, deadline, verify=saving)
+                grant_saved = True
+                check()
+                sent = accepted[2](grant_raw, deadline, check)
+                require(sent[0] == len(grant_raw), 'CONTROL_UNKNOWN', 'GRANT全bytesの送信が不明です')
+
+                def finished(*, memory_only=False):
+                    check(memory_only=memory_only)
+                    received[1]()
+                    sent[1]()
+                    require(session['hello'] is hello and session['request'] is hello and session['grant'] is grant_raw,
+                            'PROOF_MISMATCH', '元HELLO/GRANTの保持原文が変更されました')
+                    require(time.monotonic() < deadline, 'START_TIMEOUT', 'GRANT完成証拠の返却期限を超過しました')
+
+                finished()
+                return hello, grant_raw, finished
+            except BaseException:
+                accepted[0].closing = accepted[0].handoff_failed = True
+                raise
+
+        return (session, check, connect, grant_start) if accept is not None else (session, check)
 
     def _checkpoint(self, connection, session):
         expected, revision, descriptor_hash, nonce = session["checkpoint"]
@@ -351,13 +395,17 @@ class _Startup:
             if operations.readback(connection, row["id"], request) is not None:
                 operations.unknown(connection, row["id"], request)
 
-    def _save(self, token, context, revision, request, response, deadline):
+    def _save(self, token, context, revision, request, response, deadline, *, verify=None):
         with self.runtime._transaction(token["instanceId"]) as connection:
             row, _, _, _ = self._row(connection, token, context, revision)
+            if verify is not None:
+                verify(connection)
             require(time.monotonic() < deadline, "START_TIMEOUT", "起動応答記録前に期限を超過しました")
             require(operations.reserve(connection, row["id"], request) is None,
                     "CONTROL_PENDING", "保存済み要求へ作用・応答送信を再実行しません")
             operations.complete(connection, row["id"], request, response)
+            if verify is not None:
+                verify(connection)
 
     def readback(self, token, *, deadline):
         with self.lock:

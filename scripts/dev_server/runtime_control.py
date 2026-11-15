@@ -173,6 +173,17 @@ class RuntimeControl:
                 open_operation_id=open_operation_id, ready=ready, deadline=deadline,
                 prepare=True, create=True, startup=True, connect=True)
 
+    def _offline_grant_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """元認証済み接続でHELLO/GRANTを交換し、結果と同じ資源・固定callbackを返す。
+
+        BOUND/ACKやRUNNING確定は行わない。GRANT後の不明も原文・予約・本人pinを保全する。
+        """
+        require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
+        with self.registry.resource_use(), self._lock_wait(deadline):
+            return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+                open_operation_id=open_operation_id, ready=ready, deadline=deadline,
+                prepare=True, create=True, startup=True, connect=True, grant=True)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")

@@ -237,6 +237,7 @@ class ManagedRuntime:
             connecting = False
             accept_operation = operation_origin = io_origin = None
             released = False
+            frame_checks = []
 
             def connection_snapshot():
                 peer, channel = connection.peer, connection.channel
@@ -256,6 +257,8 @@ class ManagedRuntime:
                 tuple(observed['auxiliaryFiles'].items()), tuple(observed['environment'].items()), observed['cwd'])
 
             def check():
+                for frame_check in frame_checks:
+                    frame_check()
                 current = snapshot()
                 if connection is not None:
                     require(endpoint.connection is connection,
@@ -370,7 +373,113 @@ class ManagedRuntime:
                         'PROOF_MISMATCH', '認証済み元接続の完成証拠が必要です')
                 check()
                 source()
-                return channel, check
+                transfers = iter(('read', 'write'))
+
+                def exchange(raw_frame, transfer_deadline, source):
+                    """同じ接続のHELLO/GRANTを一度ずつ進め、原文とI/O完成証拠を返す。"""
+                    nonlocal connection_fixed
+                    kind = 'read' if raw_frame is None else 'write'
+                    require(transfer_deadline == deadline and next(transfers, None) == kind,
+                            'CONTROL_BUSY', '元期限のHELLO/GRANTだけを一度ずつ交換します')
+                    states = []
+                    planned = None
+                    completed = False
+                    frame_value = None
+
+                    def proof():
+                        for state in states:
+                            op, native, overlapped, value = state['origin']
+                            require(op.channel is channel.channel and getattr(op, 'native', None) is native
+                                    and getattr(op, 'overlapped', None) is overlapped
+                                    and op.kind == kind and type(op.value) is type(value) and op.value == value,
+                                    'PROOF_MISMATCH', '元frame I/Oの生成bindingが変更されました')
+                            if 'io' in state:
+                                require(getattr(overlapped, 'hEvent', None) == (None if state['released'] else state['io'][0])
+                                        and getattr(op, 'buffer', None) is (None if state['released'] else state['io'][1])
+                                        and getattr(op, 'before_issue', None) is state['io'][2],
+                                        'PROOF_MISMATCH', '元frame I/Oのevent/bufferが変更されました')
+                                if not state['released'] and state['io'][1] is not None and kind == 'write':
+                                    require(bytes(state['io'][1])[:len(value)] == value,
+                                            'PROOF_MISMATCH', '実送信bufferと元GRANT原文が一致しません')
+                            if 'result' in state:
+                                count = len(state['result']) if kind == 'read' else state['result']
+                                require(op.terminal is True and op.transferred == count
+                                        and type(getattr(op, 'result', state['result'])) is type(state['result'])
+                                        and getattr(op, 'result', state['result']) == state['result']
+                                        and not getattr(op, 'release_unknown', False)
+                                        and not getattr(op, 'cancel_requested', False)
+                                        and getattr(op, 'cancel_error', None) is None
+                                        and getattr(op, 'error', None) is None
+                                        and getattr(op, 'released', state['released']) is state['released'],
+                                        'PROOF_MISMATCH', '元frame I/Oの正常終端/解放が変更されました')
+                                if kind == 'read' and not state['released'] and state['io'][1] is not None:
+                                    require(bytes(state['io'][1])[:count] == state['result'],
+                                            'PROOF_MISMATCH', '実受信bufferと保持原文が一致しません')
+
+                    frame_checks.append(proof)
+
+                    def observed(stage, value):
+                        nonlocal connection_fixed, planned, frame_value
+                        if stage == kind:
+                            require(planned is None and channel.pending is None,
+                                    'CONTROL_PENDING', '元frameの未終端I/Oを保全します')
+                            planned = value
+                        elif stage == 'pending':
+                            require(planned is not None and channel.pending is value,
+                                    'PROOF_MISMATCH', '元frame I/Oの取得順序が一致しません')
+                            states.append(dict(origin=(value, getattr(value, 'native', None),
+                                getattr(value, 'overlapped', None), planned), released=False))
+                            refs = list(connection_fixed[0]); refs[5] = value
+                            connection_fixed = tuple(refs), connection_fixed[1]
+                        elif stage == 'issue':
+                            require(states and states[-1]['origin'][0] is value and 'io' not in states[-1],
+                                    'PROOF_MISMATCH', '元frame I/Oだけを発行できます')
+                            states[-1]['io'] = (getattr(states[-1]['origin'][2], 'hEvent', None),
+                                               getattr(value, 'buffer', None), getattr(value, 'before_issue', None))
+                        elif stage == 'result':
+                            op, result = value
+                            require(states[-1]['origin'][0] is op and 'result' not in states[-1]
+                                    and (type(result) is bytes and 0 < len(result) <= planned if kind == 'read'
+                                         else type(result) is int and 0 < result <= len(planned)),
+                                    'PROOF_MISMATCH', '元frame I/Oの返却原文が不正です')
+                            states[-1]['result'] = result
+                        elif stage == 'released':
+                            require(states[-1]['origin'][0] is value and 'result' in states[-1]
+                                    and channel.pending is None and not states[-1]['released'],
+                                    'PROOF_MISMATCH', '元frame I/Oの正常解放が必要です')
+                            states[-1]['released'] = True
+                            refs = list(connection_fixed[0]); refs[5] = None
+                            connection_fixed = tuple(refs), connection_fixed[1]
+                            planned = None
+                        elif stage == 'frame':
+                            require(states and planned is None and all(s['released'] for s in states)
+                                    and value == (b''.join(s['result'] for s in states) if kind == 'read' else len(raw_frame)),
+                                    'PROOF_MISMATCH', '元frame全体の正常交換が必要です')
+                            frame_value = value
+                        else:
+                            require(stage in ('verify','finished'), 'PROOF_MISMATCH', 'frame境界が不正です')
+                        check()
+                        source()
+                        require(self.transport.clock() < deadline, 'START_TIMEOUT', 'frame作用前に起動期限を超過しました')
+
+                    try:
+                        check()
+                        source()
+                        value = (channel.receive_frame(deadline, observe=observed) if raw_frame is None
+                                 else channel.send_frame(raw_frame, deadline, observe=observed))
+                        require(value == frame_value, 'PROOF_MISMATCH', '元frameの返却証拠が一致しません')
+                        completed = True
+                        def finished():
+                            check()
+                            require(completed and frame_value == value and all(s['released'] for s in states),
+                                    'PROOF_MISMATCH', '元frameの完成証拠が変更されました')
+                        finished()
+                        return value, finished
+                    except BaseException:
+                        channel.closing = channel.handoff_failed = True
+                        raise
+
+                return channel, check, exchange
 
             binding = raw, check
             session['prepared_binding'] = binding
