@@ -373,14 +373,14 @@ class ManagedRuntime:
                         'PROOF_MISMATCH', '認証済み元接続の完成証拠が必要です')
                 check()
                 source()
-                transfers = iter(('read', 'write'))
+                transfers = iter(('read', 'write', 'read', 'write'))
 
-                def exchange(raw_frame, transfer_deadline, source):
-                    """同じ接続のHELLO/GRANTを一度ずつ進め、原文とI/O完成証拠を返す。"""
+                def exchange(raw_frame, transfer_deadline, source, *, issued=None):
+                    """同じ接続のstartup二往復を順に進め、原文とI/O完成証拠を返す。"""
                     nonlocal connection_fixed
                     kind = 'read' if raw_frame is None else 'write'
                     require(transfer_deadline == deadline and next(transfers, None) == kind,
-                            'CONTROL_BUSY', '元期限のHELLO/GRANTだけを一度ずつ交換します')
+                            'CONTROL_BUSY', '元期限のstartup二往復を順に交換します')
                     states = []
                     planned = None
                     completed = False
@@ -400,7 +400,7 @@ class ManagedRuntime:
                                         'PROOF_MISMATCH', '元frame I/Oのevent/bufferが変更されました')
                                 if not state['released'] and state['io'][1] is not None and kind == 'write':
                                     require(bytes(state['io'][1])[:len(value)] == value,
-                                            'PROOF_MISMATCH', '実送信bufferと元GRANT原文が一致しません')
+                                            'PROOF_MISMATCH', '実送信bufferと元応答原文が一致しません')
                             if 'result' in state:
                                 count = len(state['result']) if kind == 'read' else state['result']
                                 require(op.terminal is True and op.transferred == count
@@ -461,6 +461,8 @@ class ManagedRuntime:
                         check()
                         source()
                         require(self.transport.clock() < deadline, 'START_TIMEOUT', 'frame作用前に起動期限を超過しました')
+                        if stage == 'issue' and issued is not None:
+                            issued()
 
                     try:
                         check()

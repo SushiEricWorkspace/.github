@@ -978,11 +978,15 @@ class _OfflineOpen:
             if state['previousStateSha256'] is not None:
                 _hash(state['previousStateSha256'])
             returned = deepcopy(dict(closed, status='OFFLINE_READY_ORIGINAL_MATCHED', stateJson=current_raw.decode('utf-8')))
-            def files():
+            def files(current=None):
                 for path, raw, maximum in ((settings_path, settings_raw, 16 * 1024 * 1024),
-                                          (world_path, world_raw, 128), (current_path, current_raw, 16 * 1024 * 1024),
+                                          (world_path, world_raw, 128),
                                           (state_path, state_raw, 16 * 1024 * 1024)):
                     require(read(path, maximum) == raw, 'PROOF_MISMATCH', 'Ready原文の保持中にfileが変更されました')
+                if current is None:
+                    require(read(current_path) == current_raw, 'PROOF_MISMATCH', 'Ready原文の保持中にfileが変更されました')
+                else:
+                    current(read, current_path, current_raw, state)
                 self.runtime._active_generation(slot['row'])
             files()
             with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
@@ -1147,9 +1151,9 @@ class _OfflineOpen:
                         'PROOF_MISMATCH', '確定した読取証拠と完成状態が変更されました')
                 require(time.monotonic() < deadline, 'START_TIMEOUT', '確定読取証拠の引渡し期限を超過しました')
 
-            def evidence():
+            def evidence(current=None):
                 self._terminal_resources(terminal, deadline)
-                files()
+                files(current)
                 proof_memory()
                 return row_raw
 
@@ -1161,7 +1165,7 @@ class _OfflineOpen:
             held['completed'] = complete = True
             return returned, (evidence, proof_memory)
 
-    def reserve_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+    def reserve_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline, current_check=None):
         """確定した公式Ready証拠から新startと全portsを原子的に予約する。M生成・GRANT・RUNNINGは後続。
 
         予約後は旧停止状態を再要求しない。commit/返却不明でも元意図と読取資源を保持し、
@@ -1262,7 +1266,7 @@ class _OfflineOpen:
             packet_raw = canonical(proof)
 
             def inputs():
-                require(evidence() == canonical(row), 'PROOF_MISMATCH', '元停止rowの固定証拠が一致しません')
+                require(evidence(current_check) == canonical(row), 'PROOF_MISMATCH', '元停止rowの固定証拠が一致しません')
                 current, raw = managed.approved(row, generation)
                 require(self.runtime.managed is managed and current is approval
                         and canonical(current) == approval_raw and raw == profile,
@@ -1329,7 +1333,7 @@ class _OfflineOpen:
             return returned, verify_reserved
 
     def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline,
-                     prepare=False, create=False, startup=False, connect=False, grant=False):
+                     prepare=False, create=False, startup=False, connect=False, grant=False, acknowledge=False):
         """新start/portsの固定結果からrunと閉門正本を作る。
 
         prepare指定時はdescriptorとCLOSED/1まで結束し、結果と(session, callback)を返す。
@@ -1337,11 +1341,61 @@ class _OfflineOpen:
         startup指定時はCLOSED/1の受入を行い(session, process, startup, callback)を返す。
         connect指定時は同じ枠でacceptし、認証済み接続の固定証拠まで引き継ぐ。
         grant指定時は同じ接続でHELLO/GRANTまで交換する。BOUND/ACKは含めない。
+        acknowledge指定時は元GRANTからBOUND/ACKを交換し、同じ組と完成callbackを返す。
         未指定時はCLOSED/0までの結果とcallbackを返す。GRANTは行わない。
         """
         token = deepcopy(token)
+        grant_phase = running = current_candidate = None
+
+        def current(read, path, ready_raw, state):
+            nonlocal current_candidate
+            raw = read(path)
+            if grant_phase is None:
+                require(raw == ready_raw, 'PROOF_MISMATCH', 'GRANT直前まで現在Ready原文の一致が必要です')
+            else:
+                if current_candidate is None and raw != ready_raw:
+                    current_candidate = raw, digest(raw)
+                status = _json(running) if running is not None else None
+                if current_candidate is None and status is not None:
+                    observed = read(path.parent / 'states' / (status['sha256'] + '.json'))
+                    current_candidate = observed, digest(observed)
+                if current_candidate is None:
+                    return
+                observed, fingerprint = current_candidate
+                target = _json(observed)
+                require(type(target) is dict and target.keys() == state.keys() and type(target['format']) is int
+                        and type(target['stateRevision']) is int
+                        and state['stateRevision'] < 2**63 - 1
+                        and target['stateRevision'] == state['stateRevision'] + 1
+                        and target['previousStateSha256'] == digest(ready_raw)
+                        and target['runUuid'] != state['runUuid']
+                        and target['payload'] == dict(
+                            type='io.github.sushiericworkspace.sushiericdatamodel.database.run.WorldRunPhase.Running',
+                            owner=context['owner'], management=context['management'])
+                        and all(target[name] == state[name] for name in
+                                ('format','worldUuid','generation','paths','originSha256')),
+                        'PROOF_MISMATCH', 'BOUNDのRunningが元Readyの正当な遷移と一致しません')
+                _canonical_uuid(target['runUuid'])
+                require(read(path.parent / 'states' / (fingerprint + '.json')) == observed
+                        and raw in (ready_raw, observed),
+                        'PROOF_MISMATCH', '現在Runningと認証済みBOUND/不変原文が一致しません')
+                if status is not None:
+                    require(fingerprint == status['sha256'] and target == status['state'],
+                            'PROOF_MISMATCH', '保持したRunning候補と認証済みBOUNDが一致しません')
+
+        def advance(phase, packet):
+            nonlocal grant_phase, running
+            if phase == 'grant':
+                require(grant_phase is None, 'CONTROL_BUSY', '元GRANTの段階を再採用しません')
+                grant_phase = packet
+            else:
+                require(phase == 'bound' and grant_phase is not None and running is None,
+                        'CONTROL_BUSY', '認証済みBOUNDを一度だけ継承します')
+                running = packet['payload']['statusJson'].encode('utf-8')
+
         packet = self.reserve_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
-            open_operation_id=open_operation_id, ready=ready, deadline=deadline)
+            open_operation_id=open_operation_id, ready=ready, deadline=deadline,
+            current_check=current if acknowledge else None)
         reservation, verify_reserved = packet
         intent = json.loads(verify_reserved())['offlineStart']
         runtime, registry = self.runtime, self.registry
@@ -1564,7 +1618,7 @@ class _OfflineOpen:
             prepared_startup = starter.admit(startup_token, profile_raw=session['profile_raw'],
                 launch_context=deepcopy(launch), observed=deepcopy(observed), context=json.loads(context_raw),
                 revision=1, deadline=deadline, endpoint=endpoint, verify=startup_source,
-                accept=preparation[2] if connect else None)
+                accept=preparation[2] if connect else None, advance=advance if acknowledge else None)
             candidate, check_startup = prepared_startup[:2]
             held['startup'] = prepared_startup
             checkpoint = ({key:row[key] for key in ('id','lease','epoch','generation','artifact','run_id')},
@@ -1613,12 +1667,35 @@ class _OfflineOpen:
                         verify_accepted(memory_only=memory_only)
                         require(held.get('granted') is granted,
                                 'PROOF_MISMATCH', '元GRANT完成結果の保持先が変更されました')
+                        if acknowledge:
+                            require(granted[4] is grant_phase and grant_phase == (granted[0], granted[1]),
+                                    'PROOF_MISMATCH', 'GRANTと一体の固定段階が変更されました')
                         granted[2](memory_only=memory_only)
                         require(time.monotonic() < deadline, 'START_TIMEOUT', 'GRANT結果の最終返却期限を超過しました')
                         return record
 
                     verify_granted()
+                    if acknowledge:
+                        acknowledged = granted[3]()
+                        held['acknowledged'] = acknowledged
+                        result = dict(result, status='OFFLINE_START_ACKNOWLEDGED',
+                                      boundBodySha256=digest(acknowledged[0][4:]),
+                                      ackBodySha256=digest(acknowledged[1][4:]))
+                        result_raw = canonical(result)
+                        returned = deepcopy(result)
+
+                        def verify_acknowledged(*, memory_only=False):
+                            verify_granted(memory_only=memory_only)
+                            require(held.get('acknowledged') is acknowledged,
+                                    'PROOF_MISMATCH', '元ACK完成結果の保持先が変更されました')
+                            acknowledged[2](memory_only=memory_only)
+                            require(time.monotonic() < deadline, 'START_TIMEOUT', 'ACK結果の最終返却期限を超過しました')
+                            return record
+
+                        verify_acknowledged()
         held['returned'] = complete = True
+        if acknowledge:
+            return returned, (creation[0], creation[1], candidate, verify_acknowledged)
         if grant:
             return returned, (creation[0], creation[1], candidate, verify_granted)
         if connect:

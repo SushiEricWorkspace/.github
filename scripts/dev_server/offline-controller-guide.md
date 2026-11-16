@@ -515,3 +515,13 @@ observe指定のhandoff失敗時はconnection.handoff_failedを保持し、取�
 各I/Oの準備後・実発行直前、応答・正常解放前後、短いGRANT保存writeの前後、送信直前・最終read退出後と返却直前へ同じcallbackと入口期限を渡します。保存済みHELLO/GRANT原文は現在正本へ再照合し、正常renewでも期限を延長しません。途中失敗・部分送信・解放不明では自動再送・再accept・接続切断・本人pin解放を行わず、元connection/peer/channel・I/O進捗・原文・start/ports予約を保持します。終端済みI/Oの正常解放は接続の切断と区別します。
 
 結果はSTARTING/PENDING・CLOSED/1のままで、BOUND/ACK・RUNNING確定・公開入力・正規recoverは後続です。GRANT後のMod内部Data beginRunはMod既存期限へ委ね、P側の不明は作用後不明として保全します。固定Mod/Data契約・artifactは変更しません。実OS/native・実Mod/Data本人受入は未確認です。
+
+### 認証済みBOUNDとACK
+
+`RuntimeControl._offline_acknowledge_start(token, operation_id=..., read_operation_id=..., open_operation_id=..., ready=..., deadline=...)`は同じ内部経路をBOUND受信・ACK原文保存/送信まで進めます。`OFFLINE_START_ACKNOWLEDGED`、元HELLO/GRANTとBOUND/ACKのbody hash、および`(session, process, startup_session, 固定callback)`を返します。callbackは元run保存原文を返し、元資源・原文・I/O完成証拠と今回のstart/ports・run/admissionを継続照合します。
+
+GRANT送信直前までcurrentは元Ready原文との完全一致を要求します。GRANTの発行段階を元packetと一体の固定値へ結び、BOUND取得中も元Ready immutable・公式読取・終端正本と同一期限を照合します。GRANT後に初めて読んだ非Ready原文はbytes/hashと一緒に一度保持し、前Ready hash、revisionの+1、新Data run UUID、world/generation/path、M本人/managementと不変state原文を直ちに検査します。不正な候補は保持したまま停止し、currentを修復しても別の候補へ採用し直しません。認証済みMの公式Data statusを含むBOUNDを公式wire3で照合し、保持候補とそのstatusのhash・内容を結びます。currentは元Ready原文または保持したRunning原文へ限定し、同じ候補とBOUNDが一致してからACKを保存・送信します。
+
+この段階別照合は2026-11-16の判断によります。Issue #64のM本人によるbeginRun/finishSavesと、固定DataModel deb13317のRunning耐久公開を前提とします。GRANT後のMod内部作用はMod既存期限へ委ね、P側は受付・I/O準備後/発行直前・応答・正常解放・短い保存write・最終返却を入口の単一期限で確認します。
+
+BOUND・ACKのpending/event/bufferと正常終端/解放を元接続証拠へ順に合成します。失敗・部分送信・読取不能・相関不一致は元connection/peer/channel・pending進捗・原文・識別・予約を保持します。結果はSTARTING/PENDING・CLOSED/1で、ACK/proofと正本の最終RUNNING記録・公開入力・正規recoverは後続です。実Mod/Dataと実OS/nativeの本人受入は未確認です。
