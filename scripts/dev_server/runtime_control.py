@@ -195,6 +195,14 @@ class RuntimeControl:
                 open_operation_id=open_operation_id, ready=ready, deadline=deadline,
                 prepare=True, create=True, startup=True, connect=True, grant=True, acknowledge=True)
 
+    def _offline_record_start_proof(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """元ACKと起動proofをrun正本へ記録し、同じ組と固定callbackを返す。門・予約は保持する。"""
+        require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
+        with self.registry.resource_use(), self._lock_wait(deadline):
+            return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+                open_operation_id=open_operation_id, ready=ready, deadline=deadline,
+                prepare=True, create=True, startup=True, connect=True, grant=True, acknowledge=True, record_proof=True)
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
@@ -629,8 +637,8 @@ class RuntimeControl:
                     raise
                 raise RegistryError(code, "runtime操作に失敗しました。保全し、自動kill/再送しません") from None
 
-    def _proof(self, run, generation, *, stopped=False, stopping=False):
-        proof = read_json(Path(run["proofPath"]))
+    def _proof(self, run, generation, *, stopped=False, stopping=False, proof=None):
+        proof = read_json(Path(run["proofPath"])) if proof is None else proof
         require(proof.get("saveScope", "run") == "run", "PROOF_MISMATCH", "GameTestの終了証跡を永続データの正常保存へ流用できません")
         require(proof.get("schemaVersion") == 1 and proof.get("instanceId") == run["instanceId"]
                 and proof.get("generationId") == run["generationId"] and proof.get("startNonce") == run["nonce"],

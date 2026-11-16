@@ -525,3 +525,16 @@ GRANT送信直前までcurrentは元Ready原文との完全一致を要求しま
 この段階別照合は2026-11-16の判断によります。Issue #64のM本人によるbeginRun/finishSavesと、固定DataModel deb13317のRunning耐久公開を前提とします。GRANT後のMod内部作用はMod既存期限へ委ね、P側は受付・I/O準備後/発行直前・応答・正常解放・短い保存write・最終返却を入口の単一期限で確認します。
 
 BOUND・ACKのpending/event/bufferと正常終端/解放を元接続証拠へ順に合成します。失敗・部分送信・読取不能・相関不一致は元connection/peer/channel・pending進捗・原文・識別・予約を保持します。結果はSTARTING/PENDING・CLOSED/1で、ACK/proofと正本の最終RUNNING記録・公開入力・正規recoverは後続です。実Mod/Dataと実OS/nativeの本人受入は未確認です。
+
+
+## ACKと起動proofの正本記録
+
+内部入口`RuntimeControl._offline_record_start_proof`は、同じ起動経路のACK完成packetからMod起動proofを上限付きで一度読み、既存の起動proof検証と元M本人・実listener集合の照合を行う。検証には読んだ同じbytesを渡し、保存後も同じ原文を照合する。元Readyと認証済みBOUNDへ結んだRunning候補、全frame原文・I/O完成証拠、生成済みsession/processと単一期限を継承する。
+
+元生成runを保持したまま、元保存原文をexpectedとするCASでACK body hash・BOUND status原文/hash・起動proof原文/hashをrun正本へ記録する。write内では元run/admission・start/ports予約・元ledgerと保持object/値の純比較だけを行う。結果`OFFLINE_START_PROOF_RECORDED`と同じ組の固定callbackを一体で返す。正常renewは入口期限を延長せず許容する。
+
+最終返却では継承callbackの承認・ファイル・native観測、proof原文・M生存・本人・listener観測、短いread transactionによる元run/admission・予約・ledger・GRANT/ACK原文の照合を先行する。退出後、元Readyで固定したserver.properties・world-id・Ready不変原文、段階別currentと固定Running不変原文、proof原文を再読し、M生存・本人を確認する。以後は継承memoryを含む保持値の純比較と同一期限の確認だけを行い、returnedを立てる。
+
+この最終確認はP側の各観測時点を保証する。複数ファイルとprocessの観測は逐次であり、観測済み対象の以後の変更と、最終確認後から返却までの変更が残余窓として残る。最後の実読まとまりの後にはファイル・native・Registryの作用を置かない。失効を検出した場合はreturnedを立てず、元原文・資源・予約を保持する。
+
+成功時もSTARTING/PENDING・CLOSED/1と全予約を保持する。OPEN/RUNNINGと予約終端・公開後監督接続は次の独立段階とする。保存前後の不明、期限超過、証拠変更、commit応答喪失では元資源・原文・識別・予約を保全し、自動解放・再生成・再送を行わない。
