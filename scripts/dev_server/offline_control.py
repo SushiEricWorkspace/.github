@@ -15,7 +15,8 @@ from .offline_process import OfflineProcess
 from .registry import fields, identifier, require
 from .runtime_bundle import verify_bundle, require_data_generation
 from .runtime_control import TOKEN
-from .runtime_ports import instance_endpoints, reserve
+from . import mod_control_operations as operations, runtime_process
+from .runtime_ports import instance_endpoints, require_listeners, reserve
 
 
 class _OfflineOpen:
@@ -978,15 +979,16 @@ class _OfflineOpen:
             if state['previousStateSha256'] is not None:
                 _hash(state['previousStateSha256'])
             returned = deepcopy(dict(closed, status='OFFLINE_READY_ORIGINAL_MATCHED', stateJson=current_raw.decode('utf-8')))
+            originals = ((settings_path, settings_raw, 16 * 1024 * 1024),
+                         (world_path, world_raw, 128), (state_path, state_raw, 16 * 1024 * 1024))
+
             def files(current=None):
-                for path, raw, maximum in ((settings_path, settings_raw, 16 * 1024 * 1024),
-                                          (world_path, world_raw, 128),
-                                          (state_path, state_raw, 16 * 1024 * 1024)):
+                for path, raw, maximum in originals:
                     require(read(path, maximum) == raw, 'PROOF_MISMATCH', 'Ready原文の保持中にfileが変更されました')
                 if current is None:
                     require(read(current_path) == current_raw, 'PROOF_MISMATCH', 'Ready原文の保持中にfileが変更されました')
                 else:
-                    current(read, current_path, current_raw, state)
+                    current(read, current_path, current_raw, state, originals)
                 self.runtime._active_generation(slot['row'])
             files()
             with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
@@ -1333,7 +1335,8 @@ class _OfflineOpen:
             return returned, verify_reserved
 
     def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline,
-                     prepare=False, create=False, startup=False, connect=False, grant=False, acknowledge=False):
+                     prepare=False, create=False, startup=False, connect=False, grant=False, acknowledge=False,
+                     record_proof=False):
         """新start/portsの固定結果からrunと閉門正本を作る。
 
         prepare指定時はdescriptorとCLOSED/1まで結束し、結果と(session, callback)を返す。
@@ -1342,13 +1345,16 @@ class _OfflineOpen:
         connect指定時は同じ枠でacceptし、認証済み接続の固定証拠まで引き継ぐ。
         grant指定時は同じ接続でHELLO/GRANTまで交換する。BOUND/ACKは含めない。
         acknowledge指定時は元GRANTからBOUND/ACKを交換し、同じ組と完成callbackを返す。
+        record_proof指定時は同じACKと起動proofをrunへCAS記録する。門・予約の終端は行わない。
         未指定時はCLOSED/0までの結果とcallbackを返す。GRANTは行わない。
         """
         token = deepcopy(token)
-        grant_phase = running = current_candidate = None
+        grant_phase = running = current_candidate = current_files = None
 
-        def current(read, path, ready_raw, state):
-            nonlocal current_candidate
+        def current(read, path, ready_raw, state, originals):
+            nonlocal current_candidate, current_files
+            if current_files is None:
+                current_files = read, path, ready_raw, state, originals
             raw = read(path)
             if grant_phase is None:
                 require(raw == ready_raw, 'PROOF_MISMATCH', 'GRANT直前まで現在Ready原文の一致が必要です')
@@ -1693,7 +1699,87 @@ class _OfflineOpen:
                             return record
 
                         verify_acknowledged()
+        if record_proof:
+            verify_acknowledged()
+            proof_path = diagnostics / 'proof.json'
+            proof_raw = regular_bytes(proof_path, maximum=16 * 1024 * 1024)
+            verify_acknowledged()
+            proof = runtime._proof(creation_run, generation, proof=_json(proof_raw))
+            require(proof['startup']['roots']['world'] == intent['worldRoot'],
+                    'ROOT_MISMATCH', '起動proofと元Readyのworld rootが一致しません')
+            proof_run = json.loads(record)
+            proof_run.update(startupProofJson=proof_raw.decode('utf-8'), startupProofSha256=digest(proof_raw),
+                startupAcknowledgement=dict(
+                    helloBodySha256=result['helloBodySha256'], grantBodySha256=result['grantBodySha256'],
+                    boundBodySha256=result['boundBodySha256'], ackBodySha256=result['ackBodySha256'],
+                    statusJson=running.decode('utf-8'), statusJsonSha256=digest(running)))
+            proof_record = json.dumps(proof_run)
+            proof_packet = proof_raw, proof_run, proof_record, acknowledged, verify_acknowledged, proof, canonical(proof)
+            held['proof'] = proof_packet
+
+            def proof_memory():
+                verify_acknowledged(memory_only=True)
+                require(held.get('proof') is proof_packet and proof_packet[3] is acknowledged
+                        and proof_packet[4] is verify_acknowledged and json.dumps(proof_run) == proof_record
+                        and proof_packet[5] is proof and canonical(proof) == proof_packet[6],
+                        'PROOF_MISMATCH', '元ACKと起動proofの固定記録が変更されました')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', '起動proofの純比較後に期限を超過しました')
+
+            def proof_files(*, final=False):
+                if final:
+                    read, path, ready_raw, state, originals = current_files
+                    for original_path, raw, maximum in originals:
+                        require(read(original_path, maximum) == raw,
+                                'PROOF_MISMATCH', '最終Ready不変原文が変更されました')
+                    current(read, path, ready_raw, state, originals)
+                require(regular_bytes(proof_path, maximum=16 * 1024 * 1024) == proof_raw,
+                        'PROOF_MISMATCH', '保持した起動proofの実原文が変更されました')
+                require(process.poll() is None, 'START_FAILED', '起動proof確定前に元Mが終了しました')
+                runtime_process.require_identity(creation_run['identity'], runtime.process_adapter.identity(process.pid))
+                if not final:
+                    require_listeners(run['endpoints'], proof['startup']['listeners'], runtime.process_adapter.sockets(process.pid))
+                proof_memory()
+
+            def writing_proof(connection, encoded):
+                verify_reserved(connection)
+                proof_memory()
+                value = connection.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone()
+                admission = connection.execute('SELECT * FROM run_admission WHERE run=?', (run_id,)).fetchone()
+                require(encoded == proof_record and value is not None
+                        and dict(value) in (dict(id=run_id, instance=instance, generation=intent['generationId'], record=record),
+                                            dict(id=run_id, instance=instance, generation=intent['generationId'], record=proof_record))
+                        and admission is not None and canonical(dict(admission)) == gate_raw,
+                        'STALE_RUN', 'ACK/proof記録の元run原文又はCLOSED/1が変更されました')
+
+            verify_acknowledged()
+            proof_files()
+            proof_memory()
+            require(runtime._record(proof_run, expected=record, verify=writing_proof) == proof_record,
+                    'PROOF_MISMATCH', 'ACK/proof正本の保存結果が一致しません')
+            record = proof_record
+            result = dict(result, status='OFFLINE_START_PROOF_RECORDED', startupProofSha256=digest(proof_raw),
+                          recordSha256=digest(record.encode('utf-8')))
+            result_raw = canonical(result)
+            returned = deepcopy(result)
+
+            def verify_start_proof(*, memory_only=False):
+                verify_acknowledged(memory_only=memory_only)
+                if not memory_only:
+                    proof_files()
+                    with runtime._transaction(instance, read_only=True) as connection:
+                        saved(connection)
+                        require(operations.readback(connection, instance, granted[0]) == granted[1]
+                                and operations.readback(connection, instance, acknowledged[0]) == acknowledged[1],
+                                'PROOF_MISMATCH', '起動proof観測後に元GRANT/ACK正本が変更されました')
+                        proof_memory()
+                    proof_files(final=True)
+                proof_memory()
+                return record
+
+            verify_start_proof()
         held['returned'] = complete = True
+        if record_proof:
+            return returned, (creation[0], creation[1], candidate, verify_start_proof)
         if acknowledge:
             return returned, (creation[0], creation[1], candidate, verify_acknowledged)
         if grant:
