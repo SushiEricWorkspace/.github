@@ -251,12 +251,12 @@ class _Startup:
                 session["active"] = False
 
     def admit(self, token, *, profile_raw, launch_context, observed, context, revision, deadline,
-              endpoint, verify, accept=None):
+              endpoint, verify, accept=None, advance=None):
         """元CLOSED/1のstartup枠を保持し、sessionと固定照合callbackを返す。
 
         verifyは(session, connection=None, memory_only=False)で元生成証拠を照合する。
         受付後のslot・原文・資源は、接続交換への引継ぎまで保持する。
-        accept指定時は同じ固定callbackを継続する単発connect関数も返す。
+        accept指定時は単発connectとGRANT交換関数を返す。GRANT完成packetはACK交換関数も保持する。
         """
         session = self._session(token, profile_raw, launch_context, observed, context)
         runtime, registry, transport = self.runtime, self.registry, self.transport
@@ -277,6 +277,9 @@ class _Startup:
         connecting = False
         granting = grant_saved = False
         grant_raw = None
+        granted = bound = None
+        acknowledging = ack_saved = False
+        ack_raw = None
 
         def memory():
             source(memory_only=True)
@@ -298,6 +301,9 @@ class _Startup:
                     if grant_saved:
                         require(operations.readback(connection, token['instanceId'], session['hello']) == grant_raw,
                                 'PROOF_MISMATCH', '元HELLO/GRANTの保存原文が変更されました')
+                    if ack_saved:
+                        require(operations.readback(connection, token['instanceId'], bound[0]) == ack_raw,
+                                'PROOF_MISMATCH', '元BOUND/ACKの保存原文が変更されました')
                     memory()
             memory()
 
@@ -313,8 +319,14 @@ class _Startup:
             check()
             return accepted
 
+        def saving(connection):
+            source(connection)
+            memory()
+            if granted is not None:
+                granted[2](memory_only=True)
+
         def grant_start():
-            nonlocal granting, grant_saved, grant_raw
+            nonlocal granting, grant_saved, grant_raw, granted
             require(accepted is not None and not granting, 'CONTROL_BUSY', '元接続のGRANTは一度だけ送信します')
             granting = True
             try:
@@ -327,27 +339,80 @@ class _Startup:
                 self.grant(hello, grant_raw, context)
                 session['grant'] = expected['grant'] = grant_raw
 
-                def saving(connection):
-                    source(connection)
-                    memory()
-
                 check()
                 self._save(token, context, revision, hello, grant_raw, deadline, verify=saving)
                 grant_saved = True
                 check()
-                sent = accepted[2](grant_raw, deadline, check)
+                phase = hello, grant_raw
+                issuing = False
+
+                def issued():
+                    nonlocal issuing
+                    if not issuing:
+                        if advance is not None:
+                            advance('grant', phase)
+                        issuing = True
+
+                sent = accepted[2](grant_raw, deadline, check, issued=issued)
                 require(sent[0] == len(grant_raw), 'CONTROL_UNKNOWN', 'GRANT全bytesの送信が不明です')
 
                 def finished(*, memory_only=False):
                     check(memory_only=memory_only)
                     received[1]()
                     sent[1]()
-                    require(session['hello'] is hello and session['request'] is hello and session['grant'] is grant_raw,
+                    require(session['hello'] is hello and session['request'] is (bound[0] if bound is not None else hello)
+                            and session['grant'] is grant_raw,
                             'PROOF_MISMATCH', '元HELLO/GRANTの保持原文が変更されました')
                     require(time.monotonic() < deadline, 'START_TIMEOUT', 'GRANT完成証拠の返却期限を超過しました')
 
                 finished()
-                return hello, grant_raw, finished
+                granted = hello, grant_raw, finished, acknowledge_start, phase
+                return granted
+            except BaseException:
+                accepted[0].closing = accepted[0].handoff_failed = True
+                raise
+
+        def acknowledge_start():
+            nonlocal acknowledging, bound, ack_saved, ack_raw
+            require(granted is not None and not acknowledging,
+                    'CONTROL_BUSY', '元GRANTのBOUND/ACKを一度だけ交換します')
+            acknowledging = True
+            try:
+                granted[2]()
+                bound = accepted[2](None, deadline, granted[2])
+                request = bound[0]
+                session['request'] = expected['request'] = request
+                message = self.binding(request, context,
+                    pre_evidence_json=self.decode(granted[0])['payload']['profileEvidenceJson'])
+                require(message['type'] == 'request' and message['phase'] == 'BOUND',
+                        'INVALID_INPUT', '元GRANTに対応するBOUNDが必要です')
+                if advance is not None:
+                    advance('bound', message)
+                granted[2]()
+                ack_raw = _reply(request, context, 'ACK')
+                ack = self.response(request, ack_raw)
+                require(ack['type'] == 'response' and ack['phase'] == 'ACK',
+                        'INVALID_INPUT', '成功ACKの原文が必要です')
+                session['ack'] = expected['ack'] = ack_raw
+                granted[2]()
+                self._save(token, context, revision, request, ack_raw, deadline, verify=saving)
+                ack_saved = True
+                granted[2]()
+                sent = accepted[2](ack_raw, deadline, granted[2])
+                require(sent[0] == len(ack_raw), 'CONTROL_UNKNOWN', 'ACK全bytesの送信が不明です')
+                session['acknowledged'] = expected['acknowledged'] = True
+                session['revision'] = expected['revision'] = revision
+
+                def finished(*, memory_only=False):
+                    granted[2](memory_only=memory_only)
+                    bound[1]()
+                    sent[1]()
+                    require(session['request'] is request and bound[0] is request and session['ack'] is ack_raw,
+                            'PROOF_MISMATCH', '元BOUND/ACKの保持原文が変更されました')
+                    require(time.monotonic() < deadline, 'START_TIMEOUT', 'ACK完成証拠の返却期限を超過しました')
+
+                finished()
+                return request, ack_raw, finished
             except BaseException:
                 accepted[0].closing = accepted[0].handoff_failed = True
                 raise
