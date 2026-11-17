@@ -196,7 +196,7 @@ class RuntimeControl:
                 prepare=True, create=True, startup=True, connect=True, grant=True, acknowledge=True)
 
     def _offline_record_start_proof(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
-        """元ACKと起動proofをrun正本へ記録し、同じ組と固定callbackを返す。門・予約は保持する。"""
+        """元ACKから同一期限でSTARTED proofを待ち、run正本と同じ組・固定callbackを返す。"""
         require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
         with self.registry.resource_use(), self._lock_wait(deadline):
             return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
@@ -637,8 +637,13 @@ class RuntimeControl:
                     raise
                 raise RegistryError(code, "runtime操作に失敗しました。保全し、自動kill/再送しません") from None
 
-    def _proof(self, run, generation, *, stopped=False, stopping=False, proof=None):
-        proof = read_json(Path(run["proofPath"])) if proof is None else proof
+    def _proof(self, run, generation, *, stopped=False, stopping=False, proof=None, initializing=False, deadline=None):
+        def checked(action, *args):
+            require(deadline is None or time.monotonic() < deadline,
+                    "START_TIMEOUT", "起動proofの次の実体確認前に期限を超過しました")
+            return action(*args)
+
+        proof = checked(read_json, Path(run["proofPath"])) if proof is None else proof
         require(proof.get("saveScope", "run") == "run", "PROOF_MISMATCH", "GameTestの終了証跡を永続データの正常保存へ流用できません")
         require(proof.get("schemaVersion") == 1 and proof.get("instanceId") == run["instanceId"]
                 and proof.get("generationId") == run["generationId"] and proof.get("startNonce") == run["nonce"],
@@ -646,24 +651,28 @@ class RuntimeControl:
         require(proof.get("requiresSupervisorProcessExit") is True and proof.get("requiresExternalWriterDrain") is True,
                 "PROOF_MISMATCH", "Mod証跡の責務境界が一致しません")
         identity = proof["identity"]
-        plain_path(Path(identity["cwd"]))
-        plain_path(Path(identity["runtimeManifest"]))
+        checked(plain_path, Path(identity["cwd"]))
+        checked(plain_path, Path(identity["runtimeManifest"]))
         require(identity["pid"] == run["identity"]["pid"]
                 and runtime_process.proof_start_millis(identity["processStartedAt"]) == run["identity"]["startMillis"]
-                and Path(identity["cwd"]).resolve() == generation.resolve()
+                and checked(Path(identity["cwd"]).resolve) == checked(generation.resolve)
                 and identity["artifactId"] == run["artifactId"]
                 and identity["runtimeManifestSha256"] == run["manifestHash"]
-                and Path(identity["runtimeManifest"]).resolve() == (generation / "runtime/runtime.json").resolve(),
+                and checked(Path(identity["runtimeManifest"]).resolve) == checked((generation / "runtime/runtime.json").resolve),
                 "PROOF_MISMATCH", "Mod証跡のプロセス・runtime識別が一致しません")
+        if initializing:
+            require(proof.get('phase') == 'INITIALIZING' and proof.get('startup') == {},
+                    'PROOF_MISMATCH', '初期proofのphase又は空startupが一致しません')
+            return proof
         from .snapshot_data import properties
-        world = properties((generation / "server.properties").read_bytes())["level-name"]
+        world = properties(checked((generation / "server.properties").read_bytes))["level-name"]
         expected_roots = {"world": generation / world, "config": generation / "config",
                           "modConfig": generation / "config/SushiEricServerMod"}
         roots = proof["startup"]["roots"]
         require(roots.keys() == expected_roots.keys(), "ROOT_MISMATCH", "保存root集合が一致しません")
         for key, path in expected_roots.items():
-            plain_path(Path(roots[key]))
-            require(Path(roots[key]).resolve() == path.resolve(), "ROOT_MISMATCH", "実保存rootが一致しません")
+            checked(plain_path, Path(roots[key]))
+            require(checked(Path(roots[key]).resolve) == checked(path.resolve), "ROOT_MISMATCH", "実保存rootが一致しません")
         startup = proof["startup"]
         require(startup["ready"] is True and startup["managementEnabled"] is True
                 and startup["managementStarted"] is True and startup["unknownWriters"] == [],
