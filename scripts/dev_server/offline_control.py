@@ -19,6 +19,15 @@ from . import mod_control_operations as operations, runtime_process
 from .runtime_ports import instance_endpoints, require_listeners, reserve
 
 
+def _check_ready(ready):
+    fields(ready, {'worldUuid', 'runUuid', 'stateSha256', 'stateRevision'})
+    for name in ('worldUuid', 'runUuid'):
+        _canonical_uuid(ready[name])
+    _hash(ready['stateSha256'])
+    require(type(ready['stateRevision']) is int and 0 <= ready['stateRevision'] <= 9223372036854775807,
+            'INVALID_INPUT', 'Ready revisionが範囲外です')
+
+
 class _OfflineOpen:
     def __init__(self, runtime):
         self.runtime = runtime
@@ -885,12 +894,7 @@ class _OfflineOpen:
         token, ready = deepcopy((token, ready))
         fields(token, TOKEN)
         identifier(open_operation_id, 'openOperationId')
-        fields(ready, {'worldUuid', 'runUuid', 'stateSha256', 'stateRevision'})
-        for name in ('worldUuid', 'runUuid'):
-            _canonical_uuid(ready[name])
-        _hash(ready['stateSha256'])
-        require(type(ready['stateRevision']) is int and 0 <= ready['stateRevision'] <= 9223372036854775807,
-                'INVALID_INPUT', 'Ready revisionが範囲外です')
+        _check_ready(ready)
         with self.registry.resource_use(), self.runtime._lock_wait(deadline):
             slot = self.retired.get((token['instanceId'], open_operation_id))
             require(slot is not None and 'encoded' in slot,
@@ -1929,7 +1933,8 @@ class _OfflineOpen:
                     final_memory()
                 held['committed'] = committed = True
 
-                def verify_running(*, memory_only=False):
+                def verify_running(*, memory_only=False, result=returned):
+                    require(result is returned, 'PROOF_MISMATCH', '起動完成時の元返却objectが必要です')
                     final_memory()
                     require(committed, 'STALE_OPERATION', '起動確定のcommit応答がありません')
                     verify_start_proof(memory_only=memory_only, published=published)

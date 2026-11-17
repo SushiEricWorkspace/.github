@@ -1,5 +1,5 @@
 """宣言inventoryと貸出の正本を分ける。DB transaction中にOS lockを待たない。"""
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import hashlib
 import json
 import os
@@ -298,7 +298,11 @@ class Registry:
 
     def execute(self, command: str, payload: dict, *, operation_id: str, dry_run: bool = False) -> dict:
         """CLI契約を検査し、変更と冪等応答を同じtransactionへ記録する。"""
-        with self.resource_use(exclusive=command in {"gc", "shutdown-idle"}, allow_stopping=command == "shutdown-idle"):
+        admission = self.runtime._offline_start_input(payload, operation_id, dry_run) if command == 'offline-start' else None
+        with ExitStack() as completion, self.resource_use(exclusive=command in {"gc", "shutdown-idle"}, allow_stopping=command == "shutdown-idle"):
+            if admission is not None:
+                from . import runtime_control
+                require(runtime_control.time.monotonic() < admission[1], 'START_TIMEOUT', '資源調停の入場中に起動期限を超過しました')
             if command == "gc":
                 from .supervisor import private_lock
                 with private_lock(self.root / "manager/locks/deployment.lock"):
@@ -307,7 +311,10 @@ class Registry:
                 with self.transaction(read_only=True) as connection:
                     require(not connection.execute("SELECT 1 FROM runtime_operations WHERE command='gc-apply' AND status!='COMPLETED'").fetchone(),
                             "RECOVERY_REQUIRED", "GCの途中証跡を照合するまで新しい参照操作を開始できません")
-            result = self._execute(command, payload, operation_id=operation_id, dry_run=dry_run)
+            if command == 'offline-start':
+                result = completion.enter_context(self.runtime._offline_start(admission, operation_id=operation_id, dry_run=dry_run))
+            else:
+                result = self._execute(command, payload, operation_id=operation_id, dry_run=dry_run)
             if command == "shutdown-idle" and result.get("shutdown") and not dry_run:
                 self.stopping = True
             return result

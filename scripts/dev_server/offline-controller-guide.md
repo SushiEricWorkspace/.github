@@ -555,3 +555,21 @@ pollから本人観測へ移る直前、proofのJSON解析から共通検証へ�
 同じ入口deadlineを延長せず、確定結果の直列化/copy後・各更新前・commit後と最終返却へ継承します。失敗・commit応答喪失・作用後不明では元M・connection/peer/channel・reader・原文・識別と残る予約/終端正本を保全し、自動解放・再生成・再送・再確定しません。commit後の不明をPENDINGへ戻したりartifact予約を再取得したりしません。
 
 最終gateは継承する外部/native観測・承認読取・Registry照合の後、最後に同じcurrent/proof・不変原文の実読とM生存/本人確認をまとめ、以後は保持値の純比較と期限確認だけで返却します。保証はP側の観測時点に限り、最後の実読まとまり後の外部変更は検出できない残余窓です。以後の不変は保証しません。GRANT後のMod内部作用の期限は既存Mod契約へ委ねます。固定Mod/Data契約・artifactと通常startの0→1は変更しません。
+
+### 第54スライス: 独立Readyからの公開offline-start
+
+`Registry.execute('offline-start', payload, operation_id=..., dry_run=False)`と既存JSON CLIの`offline-start`を接続します。同じPが保持する元offline終端・C/W/readerの原文と資源が前提です。P再起動で保持証拠を失った状態を再構成したり、新Cへ引き継いだりしません。通常`start`は従来のpayloadとoffline終端後の遮断を維持し、旧run承認だけでは通しません。
+
+payloadの必須項目は`instanceId/leaseId/epoch/expectedGeneration/timeoutSeconds/openOperationId/readOperationId/ready`です。`ready`は運用者が独立して指定する`worldUuid/runUuid/stateSha256/stateRevision`の四項目だけを受け付けます。終端応答・CLOSED記録・旧run承認から期待Readyを作りません。二つのUUIDとSHA-256の形式、revisionの整数型（bool/float不可）と0以上のsigned 64bit範囲、必須・未知項目を検査します。元open、新読取、今回startの三operation IDは別にしてください。任意path、実行command、allowflagは受け付けません。
+
+CLIでは`--operation-id`を必須とし、本文は`--payload-stdin`又は`--payload-file`で渡せます。ファイル・標準入力は実際のstreamからIPC上限+1 bytesまでだけ読み、実読bytesの上限を検査します。例えば`dev-server.py offline-start --root <絶対root> --operation-id <新start ID> --payload-stdin --timeout-seconds 35`です。公開RPCとSSHの既存CLI転送も同じpayloadを使用します。固定Mod/Dataと他repoのManager契約は変更しません。
+
+`timeoutSeconds`はPの公開Registry受付で採ったmonotonic起点から一度だけ作る起動期限です。入力snapshotの固定・検証、resource_use/GC照合、起動予約、OS adapter準備後/生成直前、GRANT/BOUND/ACK、proof、確定writeと公開返却まで同じ期限を渡します。CLIの`--timeout-seconds`は既存のIPC応答待機であり、起動期限を延長したり、応答喪失後に自動再送/killしたりしません。GRANT後Mod内部作用はModの既存期限へ委ねます。
+
+公式読取自体がhelper生成を必要とするため、この明示操作の`dryRun=True`は作用前に拒否します。構造検査だけで起動可能とは返しません。通常`start`のdry-runと再提示は従来どおりです。`offline-start`は内部の一度限りの受付に合わせ、同じoperationの再実行も拒否します。新IDによる自動再送・元枠の破棄・再予約をしないでください。Pメモリ上の公開要求枠は原入力/完成packet/返却進捗の保全用で、start/portsの永続予約を代用しません。
+
+内部返却と一体の固定callback・元result objectを公開最終gateで再照合します。受信開始通知はこのgateまで公開側が保持し、正常完了/例外のfinallyで引き継ぎます。これにより、同じ認証済みconnectionの受信が起動完成基準を途中で変更しません。最後の実読まとまり後は公開入力・packetの純比較と期限確認だけを行い、返却進捗を立てます。保証はPの観測時点だけであり、以後の変更を保証しません。
+
+公開起動contextはRegistry.execute外側のresource_useより後に退出します。資源調停の入場後、GC読取前にも同じ入口deadlineを確認します。起動contextは元結果を一度yieldし、counter解放とdb_lock待機を含む資源調停の退出完了後、元完成callbackのmemory_only・公開入力/packet・同一期限を純比較してから公開returned=Trueを確定します。入場中の期限到達はGC/起動作用を開始せず、退出中の期限到達はSTART_TIMEOUTで公開成功を拒否します。commit済みのRUNNING/COMPLETED・全ports・元M/接続は保全し、finallyの通知で既存受信へ引き継ぎます。db_lock待機を強制中断したり、期限を再設定したりはしません。
+
+失敗・作用後不明では元入力canonical・元M/connection/peer/channel・reader・原文・残る予約/終端正本を保全します。内部完成と公開返却を別の進捗として記録し、内部RUNNING確定後に公開gateで失効しても成功応答へ進みません。commit済みのMには第53と同じ監督/受信を引き継ぎ、再生成・再handshake・GRANT/ACK再送・自動解放・再確定はしません。既存の公開status/stop/STOPPING監督は同じsessionと受信進行を消費します。正規recoverと同一P/instanceの保持枠の再利用は後続とし、保全規則を緩めて再受付しません。

@@ -1,5 +1,6 @@
 """固定bundleの起動/停止。世代構築はGenerationControlで行う。"""
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 import errno
 import json
 import os
@@ -49,6 +50,7 @@ class RuntimeControl:
         self.managed = None
         self._control = None
         self._offline = None
+        self._offline_requests = {}
         self._control_lock = threading.Lock()
         self._lock_deadline = threading.local()
 
@@ -203,10 +205,77 @@ class RuntimeControl:
                 open_operation_id=open_operation_id, ready=ready, deadline=deadline,
                 prepare=True, create=True, startup=True, connect=True, grant=True, acknowledge=True, record_proof=True)
 
-    def _offline_finish_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+    @staticmethod
+    def _offline_start_input(payload, operation_id, dry_run):
+        """公開受付で入力を固定し、GC照合前から使う単一期限とcanonicalを返す。"""
+        started = time.monotonic()
+        try:
+            payload = deepcopy(payload)
+            fields(payload, TOKEN | {'timeoutSeconds', 'openOperationId', 'readOperationId', 'ready'})
+            ttl(payload['timeoutSeconds'])
+            deadline = started + payload['timeoutSeconds']
+            require(type(dry_run) is bool and not dry_run, 'INVALID_INPUT', 'offline-startはdry-runを受け付けません')
+            for value, name in ((operation_id, 'operationId'), (payload['instanceId'], 'instanceId'),
+                                (payload['openOperationId'], 'openOperationId'), (payload['readOperationId'], 'readOperationId')):
+                identifier(value, name)
+            require(len({operation_id, payload['openOperationId'], payload['readOperationId']}) == 3,
+                    'OPERATION_CONFLICT', 'start・公式読取・元openは別IDが必要です')
+            require(type(payload['epoch']) is int and type(payload['leaseId']) is str
+                    and type(payload['expectedGeneration']) is str, 'INVALID_INPUT', 'tokenの型が不正です')
+            from .offline_control import _check_ready
+            _check_ready(payload['ready'])
+            encoded = canonical(dict(operationId=operation_id, dryRun=dry_run, payload=payload))
+        except (ValueError, TypeError):
+            raise RegistryError('INVALID_INPUT', 'offline-startの入力形式が不正です') from None
+        require(time.monotonic() < deadline, 'START_TIMEOUT', '公開入力の固定中に起動期限を超過しました')
+        return payload, deadline, encoded
+
+    @contextmanager
+    def _offline_start(self, admission, *, operation_id, dry_run):
+        """公開offline-startを同じ完成packetへ接続する。再提示・自動再送は行わない。"""
+        payload, deadline, encoded = admission
+        key = payload['instanceId'], operation_id
+        complete = False
+        with self._control_lock:
+            require(key not in self._offline_requests, 'OPERATION_CONFLICT', '元公開起動要求を保全し再実行しません')
+            held = dict(input=admission, deadline=deadline, returned=False)
+            self._offline_requests[key] = held
+        packet = None
+
+        def memory():
+            require(self._offline_requests.get(key) is held and held.get('input') is admission
+                    and held.get('deadline') == deadline and held.get('returned') is complete
+                    and held.get('packet') is packet
+                    and canonical(dict(operationId=operation_id, dryRun=dry_run, payload=payload)) == encoded,
+                    'PROOF_MISMATCH', '公開起動要求の固定入力が変更されました')
+            require(time.monotonic() < deadline, 'START_TIMEOUT', '公開起動要求の期限を超過しました')
+
+        memory()
+        release = threading.Event()
+        try:
+            result, finished = self._offline_finish_start({key: payload[key] for key in TOKEN},
+                operation_id=operation_id, read_operation_id=payload['readOperationId'],
+                open_operation_id=payload['openOperationId'], ready=payload['ready'], deadline=deadline,
+                release=release)
+            memory()
+            packet = result, finished
+            held['packet'] = packet
+            memory()
+            finished[3](result=result)
+            memory()
+            yield result
+            finished[3](memory_only=True, result=result)
+            memory()
+            held['returned'] = complete = True
+        finally:
+            release.set()
+
+    def _offline_finish_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline, release=None):
         """同じACK/proof完成証拠からOPEN/RUNNINGとstart終端を原子的に確定する。"""
         require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
-        release = threading.Event()
+        owned = release is None
+        if owned:
+            release = threading.Event()
         try:
             with self.registry.resource_use(), self._lock_wait(deadline):
                 return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
@@ -214,7 +283,8 @@ class RuntimeControl:
                     prepare=True, create=True, startup=True, connect=True, grant=True, acknowledge=True,
                     record_proof=True, finish=True, finish_release=release)
         finally:
-            release.set()
+            if owned:
+                release.set()
 
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""

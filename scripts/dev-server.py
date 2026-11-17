@@ -23,7 +23,7 @@ class JsonArgumentParser(argparse.ArgumentParser):
 def main() -> int:
     parser = JsonArgumentParser(description="分離テスト環境の管理（macOS/Windows、Python 3.12）")
     parser.add_argument("command", choices=("init", "supervise", "ssh-broker", "doctor", "list", "status", "lease-check", "acquire", "renew", "release", "shutdown", "shutdown-idle",
-                                           "prepare", "template-init", "import", "start", "stop", "snapshot", "restore", "reset", "recover", "gc",
+                                           "prepare", "template-init", "import", "start", "offline-start", "stop", "snapshot", "restore", "reset", "recover", "gc",
                                            "writer-open", "writer-io", "writer-check", "writer-close", "gametest"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--inventory", type=Path)
@@ -60,7 +60,7 @@ def main() -> int:
             supervise(args.root, approval_file=args.payload_file, approval_sha256=args.supervise_input_sha256)
             return 0
         else:
-            if args.command in {"prepare", "template-init", "import", "restore", "reset", "recover", "start", "stop", "snapshot", "writer-open", "writer-io", "writer-check", "writer-close", "gametest", "gc"} and operation_id is None:
+            if args.command in {"prepare", "template-init", "import", "restore", "reset", "recover", "start", "offline-start", "stop", "snapshot", "writer-open", "writer-io", "writer-check", "writer-close", "gametest", "gc"} and operation_id is None:
                 raise RegistryError("INVALID_INPUT", "runtime操作には再送用の--operation-idを明示してください")
             if args.inventory is not None:
                 raise RegistryError("INVALID_INPUT", "--inventoryはinitだけで指定してください")
@@ -70,8 +70,13 @@ def main() -> int:
                 raise RegistryError("INVALID_INPUT", "標準入力と他のpayload入力は併用できません")
             try:
                 from dev_server.local_ipc import MAX_MESSAGE
-                body = (sys.stdin.buffer.read(MAX_MESSAGE + 1) if args.payload_stdin else
-                        args.payload_file.read_bytes() if args.payload_file is not None else args.payload.encode())
+                if args.payload_stdin:
+                    body = sys.stdin.buffer.read(MAX_MESSAGE + 1)
+                elif args.payload_file is not None:
+                    with args.payload_file.open('rb') as source:
+                        body = source.read(MAX_MESSAGE + 1)
+                else:
+                    body = args.payload.encode()
                 if len(body) > MAX_MESSAGE:
                     raise ValueError("IPC上限超過")
                 payload = decode(body)
