@@ -542,3 +542,16 @@ pollから本人観測へ移る直前、proofのJSON解析から共通検証へ�
 この最終確認はP側の各観測時点を保証する。複数ファイルとprocessの観測は逐次であり、観測済み対象の以後の変更と、最終確認後から返却までの変更が残余窓として残る。最後の実読まとまりの後にはファイル・native・Registryの作用を置かない。失効を検出した場合はreturnedを立てず、元原文・資源・予約を保持する。
 
 成功時もSTARTING/PENDING・CLOSED/1と全予約を保持する。OPEN/RUNNINGと予約終端・公開後監督接続は次の独立段階とする。保存前後の不明、期限超過、証拠変更、commit応答喪失では元資源・原文・識別・予約を保全し、自動解放・再生成・再送を行わない。
+
+
+### 第53スライス: 同じproofからOPEN/RUNNINGを原子的に確定
+
+内部入口`RuntimeControl._offline_finish_start`は、第52までの同じ準備・生成・HELLO/GRANT/BOUND/ACK・proof待機/保存経路を一度だけ通り、固定proof完成packetから新runのOPEN/revision 2・RUNNING/pending 0・start操作COMPLETED/結果原文と元artifact予約の解放を一つの短いRegistry writeで確定します。ports予約は通常startと同じく同じrunへ保持します。結果`OFFLINE_START_RUNNING`と同じ`(session, process, startup_session, 固定callback)`を返します。公開Ready入力・公開呼出元は後続です。
+
+確定writeの前に通常handshakeと共通の処理で元sessionへcontext/tokenと元Mを登録し、既存listen/_serveを同じ認証済みconnection/peer/channelへ接続します。受信threadは入口終了通知を待つため、最終照合中に新しい受信I/Oで元完成証拠を変更しません。入口終了後は同じ起動確定正本を確認して受信を進めます。write失敗で元PENDING/CLOSEDなら受信せず保全し、commit応答喪失でも同じ確定が耐久保存済みなら既存監督を進めます。いずれも起動成功へ読み替えたり接続資源を自動解放したりしません。公開stop/status/refreshとSTOPPING proof監督は通常経路のsession・受信進行・doneを使用します。受信引継ぎ後の正当なpending/停止進行へ、起動完成時のcallbackを継続適用しません。
+
+元runのACK/proof保存原文、生成資源・descriptor・本人・接続・全I/O原文、公式読取と段階別currentの固定基準を取り直しません。確定結果原文とOPEN正本bytesを元proofと一体で固定し、reserve_start・record_start・startupの三層へ渡して確定後の正本を照合します。旧STARTING/PENDING/CLOSED/1を確定後に再要求しません。write内ではファイル・native観測を行わず保持object/値と元正本を比較します。正常renewのexpiresを固定列から分け、現在のtoken有効性を確認します。
+
+同じ入口deadlineを延長せず、確定結果の直列化/copy後・各更新前・commit後と最終返却へ継承します。失敗・commit応答喪失・作用後不明では元M・connection/peer/channel・reader・原文・識別と残る予約/終端正本を保全し、自動解放・再生成・再送・再確定しません。commit後の不明をPENDINGへ戻したりartifact予約を再取得したりしません。
+
+最終gateは継承する外部/native観測・承認読取・Registry照合の後、最後に同じcurrent/proof・不変原文の実読とM生存/本人確認をまとめ、以後は保持値の純比較と期限確認だけで返却します。保証はP側の観測時点に限り、最後の実読まとまり後の外部変更は検出できない残余窓です。以後の不変は保証しません。GRANT後のMod内部作用の期限は既存Mod契約へ委ねます。固定Mod/Data契約・artifactと通常startの0→1は変更しません。

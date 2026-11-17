@@ -514,8 +514,12 @@ class ManagedRuntime:
         self.startup.start(token, profile_raw=session["profile_raw"], launch_context=session["launch"],
             observed=session["observed"], context=context, revision=revision, deadline=deadline,
             endpoint=session["endpoint"], defer_ready=True)
+        self._bind_session(token, run, session, context)
+
+    def _bind_session(self, token, run, session, context):
         session.update(context=context, token=deepcopy(token))
-        self.runtime._remember_game_process(run, session)
+        process = self.runtime._remember_game_process(run, session)
+        return session, context, session["token"], process
 
     def ready(self, row, connection):
         session = self.startup.sessions[row["id"]]
@@ -525,16 +529,23 @@ class ManagedRuntime:
                 and gate["descriptor_hash"] == wire.sha256(session["context"]["descriptorJson"].encode()),
                 "STALE_OPERATION", "readyまでに受付予約が変更されました")
 
-    def listen(self, instance):
+    def listen(self, instance, *, start=None, channel=None):
         session = self.sessions[instance]
-        thread = threading.Thread(target=self._serve, args=(instance, session), name="mod-control-" + instance, daemon=True)
+        options = {} if start is None else dict(start=start, channel=channel)
+        thread = threading.Thread(target=self._serve, args=(instance, session), kwargs=options,
+                                  name="mod-control-" + instance, daemon=True)
         session["thread"] = thread
         thread.start()
+        if start is not None:
+            return thread
 
-    def _serve(self, instance, session):
-        channel = self.startup.sessions[instance]["connection"]
+    def _serve(self, instance, session, *, start=None, channel=None):
+        if channel is None:
+            channel = self.startup.sessions[instance]["connection"]
         request = None
         try:
+            if start is not None and not start():
+                return
             # 受信slotはrunに固定し、共有workerや停止drainのlockを保持しない。
             def idle():
                 process = self.runtime.processes.get(session["run"])
