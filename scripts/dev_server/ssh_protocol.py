@@ -7,7 +7,7 @@ from .local_ipc import MAX_MESSAGE, decode, encode, require_private
 from .registry import identifier, require
 from . import storage
 
-CLI_COMMANDS = {"status", "acquire", "renew", "lease-check", "release", "prepare", "restore", "reset", "start", "stop", "snapshot", "recover"}
+CLI_COMMANDS = {"status", "acquire", "renew", "lease-check", "release", "prepare", "restore", "reset", "start", "offline-start", "stop", "snapshot", "recover"}
 COMMANDS = CLI_COMMANDS | {"human", "open", "io", "monitor-open", "monitor-read", "monitor-close", "close"}
 
 
