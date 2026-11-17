@@ -1345,7 +1345,7 @@ class _OfflineOpen:
         connect指定時は同じ枠でacceptし、認証済み接続の固定証拠まで引き継ぐ。
         grant指定時は同じ接続でHELLO/GRANTまで交換する。BOUND/ACKは含めない。
         acknowledge指定時は元GRANTからBOUND/ACKを交換し、同じ組と完成callbackを返す。
-        record_proof指定時は同じACKと起動proofをrunへCAS記録する。門・予約の終端は行わない。
+        record_proof指定時は同一期限でSTARTED proofを待ち、元ACKとrunへCAS記録する。
         未指定時はCLOSED/0までの結果とcallbackを返す。GRANTは行わない。
         """
         token = deepcopy(token)
@@ -1691,6 +1691,7 @@ class _OfflineOpen:
                         returned = deepcopy(result)
 
                         def verify_acknowledged(*, memory_only=False):
+                            require(time.monotonic() < deadline, 'START_TIMEOUT', 'ACK継承照合の開始前に元起動期限を超過しました')
                             verify_granted(memory_only=memory_only)
                             require(held.get('acknowledged') is acknowledged,
                                     'PROOF_MISMATCH', '元ACK完成結果の保持先が変更されました')
@@ -1700,11 +1701,52 @@ class _OfflineOpen:
 
                         verify_acknowledged()
         if record_proof:
-            verify_acknowledged()
             proof_path = diagnostics / 'proof.json'
-            proof_raw = regular_bytes(proof_path, maximum=16 * 1024 * 1024)
-            verify_acknowledged()
-            proof = runtime._proof(creation_run, generation, proof=_json(proof_raw))
+            initializing = None
+
+            def owner():
+                verify_acknowledged(memory_only=True)
+                require(held.get('proof_initializing') is initializing,
+                        'PROOF_MISMATCH', '元INITIALIZING原文の保持先が変更されました')
+                require(process.poll() is None, 'START_FAILED', '起動proof確定前に元Mが終了しました')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', 'M poll後に元起動期限を超過しました')
+                runtime_process.require_identity(creation_run['identity'], runtime.process_adapter.identity(process.pid))
+                require(time.monotonic() < deadline, 'START_TIMEOUT', 'proof観測後に元起動期限を超過しました')
+
+            while True:
+                owner()
+                verify_acknowledged()
+                owner()
+                try:
+                    proof_path.lstat()
+                except FileNotFoundError:
+                    proof_raw = None
+                else:
+                    require(time.monotonic() < deadline, 'START_TIMEOUT', 'proof実読直前に元起動期限を超過しました')
+                    proof_raw = regular_bytes(proof_path, maximum=16 * 1024 * 1024)
+                owner()
+                verify_acknowledged()
+                owner()
+                if proof_raw is not None:
+                    value = _json(proof_raw)
+                    require(time.monotonic() < deadline, 'START_TIMEOUT', 'proof解析後に元起動期限を超過しました')
+                    if value.get('phase') != 'INITIALIZING':
+                        proof = runtime._proof(creation_run, generation, proof=value, deadline=deadline)
+                        owner()
+                        break
+                    runtime._proof(creation_run, generation, proof=value, initializing=True, deadline=deadline)
+                    owner()
+                    verify_acknowledged()
+                    owner()
+                    if initializing is None:
+                        initializing = proof_raw, digest(proof_raw)
+                        held['proof_initializing'] = initializing
+                    else:
+                        require(proof_raw == initializing[0], 'PROOF_MISMATCH', '元INITIALIZING原文が変更されました')
+                else:
+                    require(initializing is None, 'PROOF_MISMATCH', '公開済みINITIALIZING原文が失われました')
+                require(time.monotonic() < deadline, 'START_TIMEOUT', 'proof待機前に元起動期限を超過しました')
+                time.sleep(0.1)
             require(proof['startup']['roots']['world'] == intent['worldRoot'],
                     'ROOT_MISMATCH', '起動proofと元Readyのworld rootが一致しません')
             proof_run = json.loads(record)
@@ -1714,14 +1756,15 @@ class _OfflineOpen:
                     boundBodySha256=result['boundBodySha256'], ackBodySha256=result['ackBodySha256'],
                     statusJson=running.decode('utf-8'), statusJsonSha256=digest(running)))
             proof_record = json.dumps(proof_run)
-            proof_packet = proof_raw, proof_run, proof_record, acknowledged, verify_acknowledged, proof, canonical(proof)
+            proof_packet = proof_raw, proof_run, proof_record, acknowledged, verify_acknowledged, proof, canonical(proof), initializing
             held['proof'] = proof_packet
 
             def proof_memory():
                 verify_acknowledged(memory_only=True)
                 require(held.get('proof') is proof_packet and proof_packet[3] is acknowledged
                         and proof_packet[4] is verify_acknowledged and json.dumps(proof_run) == proof_record
-                        and proof_packet[5] is proof and canonical(proof) == proof_packet[6],
+                        and proof_packet[5] is proof and canonical(proof) == proof_packet[6]
+                        and proof_packet[7] is initializing and held.get('proof_initializing') is initializing,
                         'PROOF_MISMATCH', '元ACKと起動proofの固定記録が変更されました')
                 require(time.monotonic() < deadline, 'START_TIMEOUT', '起動proofの純比較後に期限を超過しました')
 
@@ -1732,10 +1775,10 @@ class _OfflineOpen:
                         require(read(original_path, maximum) == raw,
                                 'PROOF_MISMATCH', '最終Ready不変原文が変更されました')
                     current(read, path, ready_raw, state, originals)
+                require(time.monotonic() < deadline, 'START_TIMEOUT', 'proof再読直前に元起動期限を超過しました')
                 require(regular_bytes(proof_path, maximum=16 * 1024 * 1024) == proof_raw,
                         'PROOF_MISMATCH', '保持した起動proofの実原文が変更されました')
-                require(process.poll() is None, 'START_FAILED', '起動proof確定前に元Mが終了しました')
-                runtime_process.require_identity(creation_run['identity'], runtime.process_adapter.identity(process.pid))
+                owner()
                 if not final:
                     require_listeners(run['endpoints'], proof['startup']['listeners'], runtime.process_adapter.sockets(process.pid))
                 proof_memory()
