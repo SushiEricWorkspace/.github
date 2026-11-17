@@ -203,6 +203,19 @@ class RuntimeControl:
                 open_operation_id=open_operation_id, ready=ready, deadline=deadline,
                 prepare=True, create=True, startup=True, connect=True, grant=True, acknowledge=True, record_proof=True)
 
+    def _offline_finish_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline):
+        """同じACK/proof完成証拠からOPEN/RUNNINGとstart終端を原子的に確定する。"""
+        require(self._offline is not None, 'PROOF_REQUIRED', '元offline終端の保持が必要です')
+        release = threading.Event()
+        try:
+            with self.registry.resource_use(), self._lock_wait(deadline):
+                return self._offline.record_start(token, operation_id=operation_id, read_operation_id=read_operation_id,
+                    open_operation_id=open_operation_id, ready=ready, deadline=deadline,
+                    prepare=True, create=True, startup=True, connect=True, grant=True, acknowledge=True,
+                    record_proof=True, finish=True, finish_release=release)
+        finally:
+            release.set()
+
     def _offline_complete(self, token, *, operation_id, deadline):
         """元W/全child終了の正本証拠からC本人確定を記録する。writer終了とは別。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
@@ -880,7 +893,9 @@ class RuntimeControl:
                               "descriptorSha256": digest(session["raw"])})
         with self._control_lock:
             require(run["runId"] not in self.game_processes, "STALE_RUN", "元Mの保持資源を差し替えません")
-            self.game_processes[run["runId"]] = (process, snapshot)
+            held = process, snapshot
+            self.game_processes[run["runId"]] = held
+            return held
 
     def _game_process(self, run):
         """元runの保持Mと生成snapshotのcopyを返す。台帳/候補/Readyの認証は呼出元で行う。"""

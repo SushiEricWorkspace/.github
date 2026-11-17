@@ -1275,33 +1275,34 @@ class _OfflineOpen:
                         'PROFILE_MISMATCH', '独立profile承認の保持object又は原文が変更されました')
                 memory()
 
-            def pending(connection):
+            def pending(connection, published=None):
                 current = self.registry._instance(connection, instance)
                 self.registry._token(current, token)
-                require(all(current[k] == expected_row[k] for k in expected_row if k != 'expires') and ledger(connection) == original_ledger,
+                expected = expected_row if published is None else dict(expected_row, state='RUNNING', pending=0, runtime_proof=published[0])
+                require(all(current[k] == expected[k] for k in expected if k != 'expires') and ledger(connection) == original_ledger,
                         'STALE_OPERATION', '新start予約又は元CLOSED/終了正本が変更されました')
                 operation = connection.execute('SELECT * FROM runtime_operations WHERE id=?', (operation_id,)).fetchone()
                 require(operation is not None and operation['instance'] == instance and operation['command'] == 'start'
-                        and operation['status'] == 'PENDING' and operation['fingerprint'] == fingerprint
-                        and operation['response'] == encoded,
+                        and operation['status'] == ('PENDING' if published is None else 'COMPLETED') and operation['fingerprint'] == fingerprint
+                        and operation['response'] == (encoded if published is None else published[0]),
                         'STALE_OPERATION', '新start操作の元指紋・意図が一致しません')
                 refs = [dict(v) for v in connection.execute('SELECT * FROM reservations WHERE instance=?', (instance,))]
-                require(refs == [dict(operation=operation_id, reference='artifact:'+row['artifact'],
-                                     instance=instance, lease=row['lease'], epoch=row['epoch'])]
+                require(refs == ([dict(operation=operation_id, reference='artifact:'+row['artifact'],
+                                     instance=instance, lease=row['lease'], epoch=row['epoch'])] if published is None else [])
                         and not connection.execute("SELECT 1 FROM runtime_operations WHERE instance=? AND status!='COMPLETED' AND id!=?",
                                                    (instance,operation_id)).fetchone(),
                         'STALE_OPERATION', '新start専有予約と元offline予約不在が一致しません')
                 self.registry.generation._observe_endpoints(connection, current, {'endpoints':endpoints})
                 memory()
 
-            def verify_reserved(connection=None, *, memory_only=False):
+            def verify_reserved(connection=None, *, memory_only=False, published=None):
                 if connection is not None:
-                    pending(connection)
+                    pending(connection, published)
                     return encoded
                 if not memory_only:
                     inputs()
                     with self.runtime._transaction(instance, read_only=True) as connection:
-                        pending(connection)
+                        pending(connection, published)
                 memory()
                 require(canonical(returned) == result_raw, 'PROOF_MISMATCH', '新start予約の返却証拠が変更されました')
                 require(time.monotonic() < deadline, 'START_TIMEOUT', '新start予約の返却期限を超過しました')
@@ -1336,7 +1337,7 @@ class _OfflineOpen:
 
     def record_start(self, token, *, operation_id, read_operation_id, open_operation_id, ready, deadline,
                      prepare=False, create=False, startup=False, connect=False, grant=False, acknowledge=False,
-                     record_proof=False):
+                     record_proof=False, finish=False, finish_release=None):
         """新start/portsの固定結果からrunと閉門正本を作る。
 
         prepare指定時はdescriptorとCLOSED/1まで結束し、結果と(session, callback)を返す。
@@ -1346,8 +1347,10 @@ class _OfflineOpen:
         grant指定時は同じ接続でHELLO/GRANTまで交換する。BOUND/ACKは含めない。
         acknowledge指定時は元GRANTからBOUND/ACKを交換し、同じ組と完成callbackを返す。
         record_proof指定時は同一期限でSTARTED proofを待ち、元ACKとrunへCAS記録する。
+        finish指定時は同じ完成証拠でOPEN/RUNNINGとstart終端を原子的に確定する。
         未指定時はCLOSED/0までの結果とcallbackを返す。GRANTは行わない。
         """
+        require(not finish or record_proof, 'INVALID_INPUT', '起動確定には元proofの記録が必要です')
         token = deepcopy(token)
         grant_phase = running = current_candidate = current_files = None
 
@@ -1470,18 +1473,18 @@ class _OfflineOpen:
                     'PROOF_MISMATCH', '新runの固定入力と保持先が変更されました')
             require(time.monotonic() < deadline, 'START_TIMEOUT', '新run記録の固定期限を超過しました')
 
-        def writing(connection, value):
-            verify_reserved(connection)
+        def writing(connection, value, published=None):
+            verify_reserved(connection, published=published)
             memory()
             require(value == record, 'PROOF_MISMATCH', '保存する新run原文が変更されました')
 
-        def saved(connection):
-            writing(connection, record)
+        def saved(connection, published=None):
+            writing(connection, record, published)
             value = connection.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone()
             admission = connection.execute('SELECT * FROM run_admission WHERE run=?', (run_id,)).fetchone()
             require(value is not None and dict(value) == dict(id=run_id, instance=instance,
                     generation=intent['generationId'], record=record)
-                    and admission is not None and canonical(dict(admission)) == gate_raw,
+                    and admission is not None and canonical(dict(admission)) == (gate_raw if published is None else published[1]),
                     'STALE_RUN', '新run原文と閉門正本が変更されました')
 
         def update(value, *, expected):
@@ -1513,13 +1516,13 @@ class _OfflineOpen:
             runId=run_id, recordSha256=digest(record.encode('utf-8')), admissionSha256=digest(gate_raw))
         result_raw = canonical(result)
 
-        def verify_recorded(connection=None, *, memory_only=False):
+        def verify_recorded(connection=None, *, memory_only=False, published=None):
             if connection is not None:
-                saved(connection)
+                saved(connection, published)
             elif not memory_only:
-                verify_reserved()
+                verify_reserved(published=published)
                 with runtime._transaction(instance, read_only=True) as connection:
-                    saved(connection)
+                    saved(connection, published)
             memory()
             require(canonical(returned) == result_raw, 'PROOF_MISMATCH', '新run記録の返却結果が変更されました')
             require(time.monotonic() < deadline, 'START_TIMEOUT', '新run記録の返却期限を超過しました')
@@ -1577,10 +1580,10 @@ class _OfflineOpen:
                 result_raw = canonical(result)
                 returned = deepcopy(result)
 
-                def verify_created(connection=None, *, memory_only=False):
+                def verify_created(connection=None, *, memory_only=False, published=None):
                     require(held.get('creation') is creation and creation[0] is preparation[0],
                             'PROOF_MISMATCH', '元M生成結果の保持先が変更されました')
-                    verify_recorded(connection, memory_only=memory_only)
+                    verify_recorded(connection, memory_only=memory_only, published=published)
                     check()
                     return record
 
@@ -1608,8 +1611,8 @@ class _OfflineOpen:
                                  expectedGeneration=intent['generationId'])
             token_raw = canonical(startup_token)
 
-            def startup_source(candidate, connection=None, *, memory_only=False):
-                verify_created(connection, memory_only=memory_only)
+            def startup_source(candidate, connection=None, *, memory_only=False, published=None):
+                verify_created(connection, memory_only=memory_only, published=published)
                 require(runtime.managed is managed and managed.startup is starter
                         and held.get('startup_context') == context_raw
                         and canonical(candidate['token']) == token_raw
@@ -1633,8 +1636,8 @@ class _OfflineOpen:
             result_raw = canonical(result)
             returned = deepcopy(result)
 
-            def verify_startup(*, memory_only=False):
-                check_startup(memory_only=memory_only)
+            def verify_startup(*, memory_only=False, published=None):
+                check_startup(memory_only=memory_only, published=published)
                 startup_source(candidate, memory_only=True)
                 require(held.get('startup') is prepared_startup
                         and candidate['endpoint'] is endpoint
@@ -1652,8 +1655,8 @@ class _OfflineOpen:
                 result_raw = canonical(result)
                 returned = deepcopy(result)
 
-                def verify_accepted(*, memory_only=False):
-                    verify_startup(memory_only=memory_only)
+                def verify_accepted(*, memory_only=False, published=None):
+                    verify_startup(memory_only=memory_only, published=published)
                     require(held.get('accepted') is accepted and candidate['connection'] is accepted[0],
                             'PROOF_MISMATCH', '認証済み元接続の確定結果が変更されました')
                     accepted[1]()
@@ -1669,14 +1672,14 @@ class _OfflineOpen:
                     result_raw = canonical(result)
                     returned = deepcopy(result)
 
-                    def verify_granted(*, memory_only=False):
-                        verify_accepted(memory_only=memory_only)
+                    def verify_granted(*, memory_only=False, published=None):
+                        verify_accepted(memory_only=memory_only, published=published)
                         require(held.get('granted') is granted,
                                 'PROOF_MISMATCH', '元GRANT完成結果の保持先が変更されました')
                         if acknowledge:
                             require(granted[4] is grant_phase and grant_phase == (granted[0], granted[1]),
                                     'PROOF_MISMATCH', 'GRANTと一体の固定段階が変更されました')
-                        granted[2](memory_only=memory_only)
+                        granted[2](memory_only=memory_only, published=published)
                         require(time.monotonic() < deadline, 'START_TIMEOUT', 'GRANT結果の最終返却期限を超過しました')
                         return record
 
@@ -1690,12 +1693,12 @@ class _OfflineOpen:
                         result_raw = canonical(result)
                         returned = deepcopy(result)
 
-                        def verify_acknowledged(*, memory_only=False):
+                        def verify_acknowledged(*, memory_only=False, published=None):
                             require(time.monotonic() < deadline, 'START_TIMEOUT', 'ACK継承照合の開始前に元起動期限を超過しました')
-                            verify_granted(memory_only=memory_only)
+                            verify_granted(memory_only=memory_only, published=published)
                             require(held.get('acknowledged') is acknowledged,
                                     'PROOF_MISMATCH', '元ACK完成結果の保持先が変更されました')
-                            acknowledged[2](memory_only=memory_only)
+                            acknowledged[2](memory_only=memory_only, published=published)
                             require(time.monotonic() < deadline, 'START_TIMEOUT', 'ACK結果の最終返却期限を超過しました')
                             return record
 
@@ -1805,12 +1808,16 @@ class _OfflineOpen:
             result_raw = canonical(result)
             returned = deepcopy(result)
 
-            def verify_start_proof(*, memory_only=False):
-                verify_acknowledged(memory_only=memory_only)
+            def verify_start_proof(*, memory_only=False, published=None):
+                verify_acknowledged(memory_only=memory_only, published=published)
                 if not memory_only:
+                    if finish and 'receiver' in held:
+                        require(time.monotonic() < deadline, 'START_TIMEOUT', '受信thread観測前に起動期限を超過しました')
+                        require(receiver.is_alive(), 'CONTROL_UNKNOWN', '元接続の受信threadが起動していません')
+                        require(time.monotonic() < deadline, 'START_TIMEOUT', '受信thread観測後に起動期限を超過しました')
                     proof_files()
                     with runtime._transaction(instance, read_only=True) as connection:
-                        saved(connection)
+                        saved(connection, published)
                         require(operations.readback(connection, instance, granted[0]) == granted[1]
                                 and operations.readback(connection, instance, acknowledged[0]) == acknowledged[1],
                                 'PROOF_MISMATCH', '起動proof観測後に元GRANT/ACK正本が変更されました')
@@ -1820,7 +1827,119 @@ class _OfflineOpen:
                 return record
 
             verify_start_proof()
+            if finish:
+                result = dict(result, status='OFFLINE_START_RUNNING', generationId=intent['generationId'],
+                              running=True, snapshotClean=False)
+                open_gate = dict(json.loads(gate_raw), gate='OPEN', revision=2)
+                open_raw = canonical(open_gate)
+                result['admissionSha256'] = digest(open_raw)
+                result_raw = canonical(result)
+                published = (json.dumps(result), open_raw)
+                completion = (published, proof_packet, verify_start_proof, result_raw)
+                held['completion'] = completion
+                committed = False
+                held['committed'] = False
+                returned = deepcopy(result)
+
+                verify_start_proof()
+                control = managed._bind_session(startup_token, creation_run, session, context)
+                control_raw = canonical(context), canonical(control[2])
+                connection_refs = accepted[0].peer, accepted[0].channel, accepted[0].endpoint
+                held['control'] = control
+
+                def control_memory():
+                    require(held.get('control') is control and control[0] is session
+                            and managed.sessions.get(instance) is session
+                            and session.get('context') is control[1] is context
+                            and session.get('token') is control[2]
+                            and (canonical(context), canonical(control[2])) == control_raw
+                            and control_raw == (context_raw, token_raw)
+                            and runtime.game_processes.get(run_id) is control[3]
+                            and control[3][0] is process and runtime.processes.get(run_id) is process
+                            and starter.sessions.get(instance) is candidate
+                            and candidate.get('connection') is accepted[0]
+                            and endpoint.connection is accepted[0]
+                            and accepted[0].peer is connection_refs[0]
+                            and accepted[0].channel is connection_refs[1]
+                            and accepted[0].endpoint is connection_refs[2],
+                            'PROOF_MISMATCH', '監督sessionと元M・認証済み接続の保持bindingが変更されました')
+
+                def receive():
+                    finish_release.wait()
+                    control_memory()
+                    with runtime._lock_wait(time.monotonic() + 30), runtime._transaction(instance, read_only=True) as connection:
+                        current_row, gate, operation = starter._checkpoint(connection, candidate)
+                        if operation['status'] == 'PENDING':
+                            require(current_row['state'] == 'STARTING' and current_row['pending']
+                                    and gate['gate'] == 'CLOSED' and gate['revision'] == 1,
+                                    'STALE_RUN', '未確定起動の元閉門予約が変更されました')
+                            return False
+                        require(operation['status'] == 'COMPLETED' and operation['response'] == published[0]
+                                and ((current_row['state'] == 'RUNNING' and not current_row['pending']
+                                      and current_row['runtime_proof'] == published[0]
+                                      and gate['gate'] == 'OPEN' and gate['revision'] == 2)
+                                     or (current_row['state'] == 'STOPPING' and current_row['pending']
+                                         and gate['gate'] == 'BLOCKED' and gate['revision'] >= 3)),
+                                'STALE_RUN', '同じ起動確定又は正当な停止予約だけを監督します')
+                    control_memory()
+                    return True
+
+                control_memory()
+                require(time.monotonic() < deadline, 'START_TIMEOUT', '受信開始前に起動期限を超過しました')
+                receiver = managed.listen(instance, start=receive, channel=accepted[0])
+                held['receiver'] = receiver
+
+                def final_memory():
+                    proof_memory()
+                    control_memory()
+                    require(held.get('receiver') is receiver and session.get('thread') is receiver,
+                            'PROOF_MISMATCH', '元接続の受信thread保持先が変更されました')
+                    require(held.get('completion') is completion and completion[0] is published
+                            and completion[1] is proof_packet and completion[2] is verify_start_proof
+                            and completion[3] == result_raw and canonical(returned) == result_raw
+                            and held.get('committed') is committed,
+                            'PROOF_MISMATCH', '起動確定結果と元proof完成証拠の保持先が変更されました')
+                    require(time.monotonic() < deadline, 'START_TIMEOUT', '起動確定の固定期限を超過しました')
+
+                verify_start_proof()
+                final_memory()
+                with runtime._transaction(instance) as connection:
+                    final_memory()
+                    saved(connection)
+                    final_memory()
+                    require(operations.readback(connection, instance, granted[0]) == granted[1],
+                            'PROOF_MISMATCH', '起動確定前の元HELLO/GRANT正本が変更されました')
+                    final_memory()
+                    require(operations.readback(connection, instance, acknowledged[0]) == acknowledged[1],
+                            'PROOF_MISMATCH', '起動確定前の元GRANT/ACK正本が変更されました')
+                    final_memory()
+                    _change(connection, row, 1, 'OPEN')
+                    final_memory()
+                    connection.execute("UPDATE instances SET state='RUNNING',pending=0,runtime_proof=? WHERE id=?",
+                                       (published[0], instance))
+                    final_memory()
+                    connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?",
+                                       (published[0], operation_id))
+                    final_memory()
+                    require(connection.execute('DELETE FROM reservations WHERE operation=? AND reference=?',
+                            (operation_id, 'artifact:'+row['artifact'])).rowcount == 1,
+                            'STALE_OPERATION', '元startのartifact予約が一致しません')
+                    final_memory()
+                    saved(connection, published)
+                    final_memory()
+                held['committed'] = committed = True
+
+                def verify_running(*, memory_only=False):
+                    final_memory()
+                    require(committed, 'STALE_OPERATION', '起動確定のcommit応答がありません')
+                    verify_start_proof(memory_only=memory_only, published=published)
+                    final_memory()
+                    return record
+
+                verify_running()
         held['returned'] = complete = True
+        if finish:
+            return returned, (creation[0], creation[1], candidate, verify_running)
         if record_proof:
             return returned, (creation[0], creation[1], candidate, verify_start_proof)
         if acknowledge:

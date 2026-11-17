@@ -8,7 +8,7 @@ import time
 
 from . import mod_control_operations as operations
 from . import mod_control_wire as wire
-from .build_inputs import regular_bytes
+from .build_inputs import canonical, regular_bytes
 from .registry import require
 from .runtime_bundle import _read_managed_profile, validate_bundle_managed_launch, validate_managed_launch, verify_bundle
 
@@ -88,14 +88,16 @@ class _Startup:
         self.sessions = {}
         self.lock = threading.Lock()
 
-    def _row(self, connection, token, context, revision):
+    def _row(self, connection, token, context, revision, published=None):
         row = dict(self.registry._instance(connection, token["instanceId"]))
         self.registry._token(row, token)
         descriptor, raw = wire._profile_context(context)
         record = connection.execute("SELECT record FROM runs WHERE id=?", (row["run_id"],)).fetchone()
         require(record is not None, "PROOF_REQUIRED", "Pのrun正本がありません")
         run = json.loads(record[0])
-        require(row["state"] == "STARTING" and row["pending"]
+        require(row["state"] == ("STARTING" if published is None else "RUNNING")
+                and row["pending"] == (1 if published is None else 0)
+                and (published is None or row["runtime_proof"] == published[0])
                 and descriptor["runtimeRunId"] == row["run_id"] and descriptor["startNonce"] == run["nonce"]
                 and descriptor["artifactId"] == row["artifact"]
                 and descriptor["runtimeManifestHash"] == run["manifestHash"]
@@ -109,14 +111,18 @@ class _Startup:
                 "WRITER_PENDING", "GRANT前のwriter drainが未完了です")
         gate = _admission(connection, row)
         operation = connection.execute("SELECT * FROM runtime_operations WHERE id=?", (gate["start_operation"],)).fetchone()
-        require(operation is not None and operation["command"] == "start" and operation["status"] == "PENDING"
+        require(operation is not None and operation["command"] == "start" and operation["status"] == ("PENDING" if published is None else "COMPLETED")
+                and (published is None or operation["response"] == published[0])
                 and operation["instance"] == row["id"] and operation["fingerprint"] == run["startRequestHash"],
                 "STALE_OPERATION", "元起動予約の所有・状態・指紋が一致しません")
-        require(connection.execute("SELECT 1 FROM reservations WHERE operation=? AND reference=? AND instance=? AND lease=? AND epoch=?",
-                    (operation["id"], "artifact:" + row["artifact"], row["id"], row["lease"], row["epoch"])).fetchone(),
+        reservation = connection.execute("SELECT 1 FROM reservations WHERE operation=? AND reference=? AND instance=? AND lease=? AND epoch=?",
+                    (operation["id"], "artifact:" + row["artifact"], row["id"], row["lease"], row["epoch"])).fetchone()
+        require(bool(reservation) == (published is None),
                 "STALE_OPERATION", "元artifact予約のbindingが一致しません")
         gate["start_fingerprint"] = operation["fingerprint"]
-        require(type(revision) is int and gate["revision"] == revision and gate["gate"] == "CLOSED",
+        require(type(revision) is int and gate["revision"] == revision + (published is not None)
+                and gate["gate"] == ("CLOSED" if published is None else "OPEN")
+                and (published is None or canonical({k:v for k,v in gate.items() if k != "start_fingerprint"}) == published[1]),
                 "CONTROL_BLOCKED", "元の閉門revisionが必要です")
         return row, descriptor, raw, gate
 
@@ -261,8 +267,11 @@ class _Startup:
         session = self._session(token, profile_raw, launch_context, observed, context)
         runtime, registry, transport = self.runtime, self.registry, self.transport
 
-        def source(connection=None, *, memory_only=False):
-            verify(session, connection, memory_only=memory_only)
+        def source(connection=None, *, memory_only=False, published=None):
+            if published is None:
+                verify(session, connection, memory_only=memory_only)
+            else:
+                verify(session, connection, memory_only=memory_only, published=published)
             require(self.runtime is runtime and self.registry is registry and self.transport is transport
                     and self.sessions.get(token['instanceId']) is session,
                     'PROOF_MISMATCH', '元startup枠の保持先が変更されました')
@@ -292,12 +301,12 @@ class _Startup:
                     'PROOF_MISMATCH', 'startup準備の完成証拠が変更されました')
             require(time.monotonic() < deadline, 'START_TIMEOUT', 'startup準備の最終比較後に期限を超過しました')
 
-        def check(*, memory_only=False):
+        def check(*, memory_only=False, published=None):
             if not memory_only:
-                source()
+                source(published=published)
                 with runtime._transaction(token['instanceId'], read_only=True) as connection:
-                    source(connection)
-                    self._row(connection, session['token'], session['context'], revision)
+                    source(connection, published=published)
+                    self._row(connection, session['token'], session['context'], revision, published)
                     if grant_saved:
                         require(operations.readback(connection, token['instanceId'], session['hello']) == grant_raw,
                                 'PROOF_MISMATCH', '元HELLO/GRANTの保存原文が変更されました')
@@ -356,8 +365,8 @@ class _Startup:
                 sent = accepted[2](grant_raw, deadline, check, issued=issued)
                 require(sent[0] == len(grant_raw), 'CONTROL_UNKNOWN', 'GRANT全bytesの送信が不明です')
 
-                def finished(*, memory_only=False):
-                    check(memory_only=memory_only)
+                def finished(*, memory_only=False, published=None):
+                    check(memory_only=memory_only, published=published)
                     received[1]()
                     sent[1]()
                     require(session['hello'] is hello and session['request'] is (bound[0] if bound is not None else hello)
@@ -403,8 +412,8 @@ class _Startup:
                 session['acknowledged'] = expected['acknowledged'] = True
                 session['revision'] = expected['revision'] = revision
 
-                def finished(*, memory_only=False):
-                    granted[2](memory_only=memory_only)
+                def finished(*, memory_only=False, published=None):
+                    granted[2](memory_only=memory_only, published=published)
                     bound[1]()
                     sent[1]()
                     require(session['request'] is request and bound[0] is request and session['ack'] is ack_raw,
