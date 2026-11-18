@@ -764,7 +764,9 @@ class OfflineProcess:
     def _verify_close_binding(self, deadline):
         binding = self.close_binding
         request, response = binding['request'], binding['response']
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C終了bindingの本人観測前に期限を超過しました')
         runtime_process.require_identity(binding['parent'], self.adapter.identity(os.getpid()))
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'C終了bindingのhost/boot観測前に期限を超過しました')
         require(process_identity(self.native, self.adapter, os.getpid()) == binding['parent_data']
                 and self.parent == binding['parent'] and self.parent_data == binding['parent_data']
                 and self.process is binding['process'] and self.pipe is binding['pipe']

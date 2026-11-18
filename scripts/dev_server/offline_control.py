@@ -39,6 +39,7 @@ class _OfflineOpen:
         self.readers = {}
         self.starts = {}
         self.start_records = {}
+        self.close_recoveries = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -870,6 +871,50 @@ class _OfflineOpen:
                 checked(connection)
                 finished()
                 slot['encoded'] = encoded
+                values = ('key', 'row', 'opened', 'saved', 'encoded', 'result', 'snapshot')
+                fixed = deepcopy(tuple(slot[name] for name in values))
+                originals = tuple(slot[name] for name in values)
+                held = tuple(slot[name] for name in ('controller', 'workers', 'history', 'closeBinding', 'resources'))
+                actors = tuple(slot['resources'])
+                objects = tuple((actor.native, actor.adapter, actor.verify_owner, actor.controller,
+                                 getattr(process, 'process', None), getattr(pipe, 'incoming', None))
+                                for actor,process,pipe,_ in actors)
+                def resource_values():
+                    return tuple((actor.bundle, actor.diagnostics, actor.record_number,
+                        *(getattr(process, name, None) for name in ('handle','job','thread')),
+                        *(getattr(pipe, name, None) for name in
+                          ('input','output','child_input','child_output','outgoing','offset','incoming','expected')))
+                        for actor,process,pipe,_ in actors)
+                resource_snapshot = deepcopy(resource_values())
+                close_values = deepcopy({name:value for name,value in controller.close_binding.items()
+                                         if name not in {'process', 'pipe'}})
+                raw = canonical(result)
+
+                def recover_memory():
+                    require(self.close_recoveries.get(key) is packet
+                            and all(slot[name] is value for name,value in zip(
+                                ('controller', 'workers', 'history', 'closeBinding', 'resources'), held))
+                            and len(slot['resources']) == len(actors)
+                            and all(len(actual) == len(original) and all(a is b for a,b in zip(actual, original))
+                                    for actual,original in zip(slot['resources'], actors))
+                            and all(slot[name] is value for name,value in zip(values, originals))
+                            and tuple(slot[name] for name in values) == fixed
+                            and all(all(a is b for a,b in zip(
+                                (actor.native, actor.adapter, actor.verify_owner, actor.controller,
+                                 getattr(process, 'process', None), getattr(pipe, 'incoming', None)), original))
+                                for (actor,process,pipe,_),original in zip(actors, objects))
+                            and resource_values() == resource_snapshot
+                            and {name:value for name,value in controller.close_binding.items()
+                                 if name not in {'process', 'pipe'}} == close_values
+                            and controller.close_binding['process'] is controller.process
+                            and controller.close_binding['pipe'] is controller.pipe,
+                            'PROOF_MISMATCH', '元close確定時の保持bindingが変更されました')
+                    self._terminal_memory(slot)
+
+                packet = raw, slot, recover_memory
+                self.close_recoveries[key] = packet
+                recover_memory()
+                finished()
                 connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?",
                                    (encoded, opened['operationId']))
                 connection.execute('DELETE FROM reservations WHERE operation=?', (opened['operationId'],))
@@ -881,8 +926,74 @@ class _OfflineOpen:
             returned = deepcopy(result)
             with self.runtime._transaction(instance, read_only=True) as connection:
                 self._terminal(connection, token, slot, deadline)
+            recover_memory()
             finished()
             return returned
+
+    def recover_close(self, token, *, operation_id, open_operation_id, close_operation_id, termination_sha256, deadline):
+        """同じPの確定済みcloseを新しい照合要求でreadbackする。解放・再送・再採用は行わない。
+
+        元終端前に固定したpacketがなく、正本が未確定、又は保持資源が不明なら拒否する。
+        deadlineは今回の照合だけの期限であり、元closeの期限や進捗は変更しない。
+        """
+        token = deepcopy(token)
+        fields(token, TOKEN)
+        for value, name in ((operation_id, 'operationId'), (open_operation_id, 'openOperationId'),
+                            (close_operation_id, 'closeOperationId')):
+            identifier(value, name)
+        _hash(termination_sha256)
+        require(len({operation_id, open_operation_id, close_operation_id}) == 3,
+                'OPERATION_CONFLICT', '復旧照合には元open/closeとは別のIDが必要です')
+        key = token['instanceId'], open_operation_id
+        packet = self.close_recoveries.get(key)
+        require(packet is not None, 'RECOVERY_REQUIRED', '同じPが保持する元close完成packetが必要です')
+        raw, slot, memory = packet
+        require(digest(raw) == termination_sha256 and json.loads(raw)['operationId'] == close_operation_id,
+                'PROOF_MISMATCH', '指定された元closeと終端原文hashが一致しません')
+        request = canonical(dict(token=token, openOperationId=open_operation_id,
+            closeOperationId=close_operation_id, terminationSha256=termination_sha256))
+        fingerprint = digest(request)
+        result = dict(status='OFFLINE_CLOSE_RECOVERED', operationId=operation_id,
+            openOperationId=open_operation_id, closeOperationId=close_operation_id,
+            instanceId=token['instanceId'], terminationSha256=termination_sha256, original=json.loads(raw))
+        encoded = json.dumps(result)
+        response = canonical(result)
+        returned = None
+
+        def checked():
+            memory()
+            require(canonical(result) == response and (returned is None or canonical(returned) == response),
+                    'PROOF_MISMATCH', '復旧結果の固定原文が変更されました')
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'close復旧照合の期限を超過しました')
+
+        def saved(connection):
+            checked()
+            self._terminal_state(connection, token, slot, deadline)
+            for table in ('operations', 'writer_operations', 'reference_operations', 'snapshot_operations'):
+                require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
+                        'OPERATION_CONFLICT', '復旧IDが他の操作で使用されています')
+            old = connection.execute('SELECT * FROM runtime_operations WHERE id=?', (operation_id,)).fetchone()
+            require(old is None or (old['command'] == 'offline-recover-close' and old['instance'] == token['instanceId']
+                    and old['fingerprint'] == fingerprint and old['status'] == 'COMPLETED' and old['response'] == encoded),
+                    'OPERATION_CONFLICT', '元復旧要求の固定入力・結果が一致しません')
+            checked()
+            return old
+
+        checked()
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            checked()
+            self._terminal_resources(slot, deadline)
+            checked()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                if saved(connection) is None:
+                    connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
+                        (operation_id, fingerprint, 'offline-recover-close', token['instanceId'], 'COMPLETED', encoded))
+                saved(connection)
+            checked()
+            returned = deepcopy(result)
+            checked()
+        checked()
+        return returned
 
     def check_closed_ready(self, token, *, open_operation_id, ready, deadline):
         """独立明示Readyを保持した元offline終端証拠と照合する。
