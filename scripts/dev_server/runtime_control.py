@@ -117,6 +117,13 @@ class RuntimeControl:
         return self._offline.recover_close(token, operation_id=operation_id, open_operation_id=open_operation_id,
             close_operation_id=close_operation_id, termination_sha256=termination_sha256, deadline=deadline)
 
+    def _offline_recover_pending_close(self, token, *, operation_id, open_operation_id, close_operation_id,
+                                      termination_sha256, deadline):
+        """同じPの元終端意図・全解放証拠から、未commitのclose終端を新しい照合操作で確定する。"""
+        require(self._offline is not None, 'RECOVERY_REQUIRED', '元offline保持枠が必要です')
+        return self._offline.recover_pending_close(token, operation_id=operation_id, open_operation_id=open_operation_id,
+            close_operation_id=close_operation_id, termination_sha256=termination_sha256, deadline=deadline)
+
     def _offline_read_ready_original(self, token, *, open_operation_id, ready, deadline):
         """現在Ready原文と元CLOSED/終端の一致を返す。chain検証とstart受付は後続で行う。"""
         require(self._offline is not None, "PROOF_REQUIRED", "保持したoffline終端証拠が必要です")

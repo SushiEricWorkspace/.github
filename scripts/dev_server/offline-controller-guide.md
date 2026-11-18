@@ -581,3 +581,17 @@ CLIでは`--operation-id`を必須とし、本文は`--payload-stdin`又は`--pa
 今回のdeadlineは照合要求の単一期限であり、元close期限の更新や未完了処理の継続には使いません。Registry write内ではSQLと保持値の純比較だけを行い、write退出・返却copy・外側resource_use退出後にも固定値と期限を確認します。期限や照合の失敗では元正本・元資源・記録済みの復旧結果を保全します。解放済みprocessの再poll/再close、close再送、Cの差替え、保持枠の破棄は行いません。
 
 終端前の失敗、部分解放UNKNOWN、元packetのないP再起動、別run/世代は拒否します。この入口は旧generationの正常化・Ready/start許可を返しません。公開recoverへの接続、未確定の正規解決、保持枠再利用と#54の検証snapshotから新generationへのrestoreは後続です。現在の公開offline-startに再試行は追加しません。
+
+## 未commitのclose終端を確定する内部recover（第56スライス）
+
+`RuntimeControl._offline_recover_pending_close(token, operation_id=..., open_operation_id=..., close_operation_id=..., termination_sha256=..., deadline=...)`は、同じPが元終端write直前に固定したpacketと全C/W正常終了・解放原本を保持する場合に、元offline-openの終端を明示要求で確定します。元open/closeとは別の照合IDと元終端原文hashを指定します。結果は`OFFLINE_CLOSE_TERMINATED`と元終端結果です。今回の単一期限を使い、元close期限と終了・解放進捗は維持します。
+
+元終端意図を保存した原文は、元packetのcallbackへ一度固定して引き継ぎます。元offline-openのPENDING原文、元lease/epoch/generation/run/artifact、元run/proof/gate/writer台帳と元artifact予約を短いRegistry write内で照合し、元offline-openと今回照合のCOMPLETED、元予約終端とpending解除を同一transactionで確定します。正常renewでは現在のtoken有効性を確認し、入口期限は延長しません。
+
+元writeのrollbackでactive mapが既に外れた場合も、retiredに保持した同じobjectを使用します。別objectへ再利用された枠、変更された原文・資源・進捗・本人bindingは保全して拒否します。元C/Wへの再poll・再close、資源の追加解放、Data API再送、元Cの再生成は行いません。元packetがない場合、部分解放UNKNOWN、P再起動は引き続き拒否します。
+
+元latest workerの参照は元slot作成時に固定し、packetのcopy後に可変slotから基準を取り直しません。slotとactive mapを揃えて差し替えた場合も、元参照との不一致で終端writeを開始せず保全します。
+
+今回の照合がcommit済みなら、同じ入力・同じ照合IDでその記録をreadbackできます。別の新照合IDで既にCOMPLETEDの元操作を未確定として扱う要求は拒否します。既知COMPLETEDの照合には第55の入口を使います。write前の失効はPENDINGと予約を維持し、commit後の失効は確定済み終端と今回の記録を維持して正常返却を拒否します。
+
+P本人観測の後に短いSQL照合・更新を行い、write退出後、返却copy後、資源調停退出後は同じpacketと返却値の純比較・期限確認だけを行います。新しいfile・native・SQL作用を最終純比較後に置きません。保証はP側の観測時点に限られ、各観測・比較後の外部変更は残余窓として残ります。既存起動の最終gateと監督・受信接続を維持します。公開recoverへの接続、部分解放・作用後不明の追加復旧、保持枠の再利用と#54 restoreは後続です。実OS/native本人受入は未確認です。

@@ -815,8 +815,9 @@ class _OfflineOpen:
                         'WRITER_PENDING', '元終端意図と退避証拠を保全します')
                 row = dict(self.registry._instance(connection, instance))
                 history = self.history.get(instance, [])
+                latest = self.workers.get(instance)
                 slot = dict(key=key, controller=controller, workers=tuple(workers), history=history,
-                    latest=self.workers.get(instance), opened=opened, saved=deepcopy(saved), row=row,
+                    latest=latest, opened=opened, saved=deepcopy(saved), row=row,
                     closeBinding=controller.close_binding,
                     resources=[(actor,actor.process,actor.pipe,actor.creation_resources) for actor in (controller,*workers)],
                     snapshot=self._release_snapshot(controller, workers, history))
@@ -824,6 +825,7 @@ class _OfflineOpen:
                     writerClosedSha256=digest(controller.writer_closed_response))
                 saved['termination'] = ending
                 encoded = json.dumps(saved)
+                intent = encoded
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端意図の更新前に期限を超過しました')
                 self.retired[key] = slot
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
@@ -892,6 +894,7 @@ class _OfflineOpen:
 
                 def recover_memory():
                     require(self.close_recoveries.get(key) is packet
+                            and slot['latest'] is latest
                             and all(slot[name] is value for name,value in zip(
                                 ('controller', 'workers', 'history', 'closeBinding', 'resources'), held))
                             and len(slot['resources']) == len(actors)
@@ -910,6 +913,7 @@ class _OfflineOpen:
                             and controller.close_binding['pipe'] is controller.pipe,
                             'PROOF_MISMATCH', '元close確定時の保持bindingが変更されました')
                     self._terminal_memory(slot)
+                    return intent
 
                 packet = raw, slot, recover_memory
                 self.close_recoveries[key] = packet
@@ -993,6 +997,101 @@ class _OfflineOpen:
             returned = deepcopy(result)
             checked()
         checked()
+        return returned
+
+    def recover_pending_close(self, token, *, operation_id, open_operation_id, close_operation_id,
+                              termination_sha256, deadline):
+        """同じPの元終端意図と解放済みpacketから未commitの終端を確定する。
+
+        新しい照合要求のdeadlineを使い、元closeの期限・資源・原文を維持する。
+        元packetがない場合や解放証拠が変わった場合は保全して拒否する。
+        """
+        token = deepcopy(token)
+        fields(token, TOKEN)
+        for value, name in ((operation_id, 'operationId'), (open_operation_id, 'openOperationId'),
+                            (close_operation_id, 'closeOperationId')):
+            identifier(value, name)
+        _hash(termination_sha256)
+        require(len({operation_id, open_operation_id, close_operation_id}) == 3,
+                'OPERATION_CONFLICT', '終端照合には元open/closeとは別のIDが必要です')
+        instance = token['instanceId']
+        packet = self.close_recoveries.get((instance, open_operation_id))
+        require(packet is not None, 'RECOVERY_REQUIRED', '同じPが保持する元終端packetが必要です')
+        raw, slot, memory = packet
+        intent = memory()
+        require(isinstance(intent, str) and digest(raw) == termination_sha256
+                and json.loads(raw)['operationId'] == close_operation_id,
+                'PROOF_MISMATCH', '元終端意図・close ID・原文hashが一致しません')
+        fingerprint = digest(canonical(dict(token=token, openOperationId=open_operation_id,
+            closeOperationId=close_operation_id, terminationSha256=termination_sha256)))
+        result = dict(status='OFFLINE_CLOSE_TERMINATED', operationId=operation_id,
+            openOperationId=open_operation_id, closeOperationId=close_operation_id,
+            instanceId=instance, terminationSha256=termination_sha256, original=json.loads(raw))
+        encoded = json.dumps(result)
+        response = canonical(result)
+        returned = None
+
+        def checked():
+            require(memory() == intent and canonical(result) == response
+                    and (returned is None or canonical(returned) == response),
+                    'PROOF_MISMATCH', '元終端packetと今回の固定結果が一致しません')
+            require(all(instance not in mapping or mapping[instance] is original
+                        for mapping, original in ((self.controllers, slot['controller']),
+                            (self.workers, slot['latest']), (self.history, slot['history']))),
+                    'STALE_OPERATION', '元instanceの保持枠が別objectに置き換わりました')
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '未確定closeの終端照合期限を超過しました')
+
+        def finished():
+            checked()
+            require(all(instance not in mapping for mapping in (self.controllers, self.workers, self.history)),
+                    'STALE_OPERATION', '終端後の元保持枠が再利用されました')
+
+        checked()
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            checked()
+            self._terminal_resources(slot, deadline)
+            checked()
+            with self.runtime._transaction(instance) as connection:
+                checked()
+                for table in ('operations', 'writer_operations', 'reference_operations', 'snapshot_operations'):
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?', (operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT', '終端照合IDが別の操作で使用されています')
+                old = connection.execute('SELECT * FROM runtime_operations WHERE id=?', (operation_id,)).fetchone()
+                checked()
+                if old is None:
+                    self._reserved(connection, token, open_operation_id, slot['opened']['requestHash'], slot['saved']['binding'])
+                    checked()
+                    self.runtime._binding(self.registry._instance(connection, instance), slot['row'])
+                    checked()
+                    original = connection.execute('SELECT response FROM runtime_operations WHERE id=?',
+                                                  (open_operation_id,)).fetchone()[0]
+                    require(original == intent, 'STALE_OPERATION', '元終端意図の保存原文が変更されました')
+                    checked()
+                    changed = connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? "
+                        "WHERE id=? AND status='PENDING' AND response=?", (slot['encoded'], open_operation_id, intent))
+                    require(changed.rowcount == 1, 'STALE_OPERATION', '元終端意図の更新が競合しました')
+                    checked()
+                    connection.execute('DELETE FROM reservations WHERE instance=? AND operation=?', (instance, open_operation_id))
+                    checked()
+                    connection.execute('UPDATE instances SET pending=0 WHERE id=?', (instance,))
+                    checked()
+                    connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
+                        (operation_id, fingerprint, 'offline-recover-pending-close', instance, 'COMPLETED', encoded))
+                    checked()
+                    self.workers.pop(instance, None)
+                    self.history.pop(instance, None)
+                    self.controllers.pop(instance, None)
+                else:
+                    require(old['command'] == 'offline-recover-pending-close' and old['instance'] == instance
+                            and old['fingerprint'] == fingerprint and old['status'] == 'COMPLETED' and old['response'] == encoded,
+                            'OPERATION_CONFLICT', '終端照合要求の固定入力・結果が一致しません')
+                checked()
+                self._terminal_state(connection, token, slot, deadline)
+                finished()
+            finished()
+            returned = deepcopy(result)
+            finished()
+        finished()
         return returned
 
     def check_closed_ready(self, token, *, open_operation_id, ready, deadline):
