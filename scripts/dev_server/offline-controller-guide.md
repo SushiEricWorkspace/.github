@@ -572,4 +572,12 @@ CLIでは`--operation-id`を必須とし、本文は`--payload-stdin`又は`--pa
 
 公開起動contextはRegistry.execute外側のresource_useより後に退出します。資源調停の入場後、GC読取前にも同じ入口deadlineを確認します。起動contextは元結果を一度yieldし、counter解放とdb_lock待機を含む資源調停の退出完了後、元完成callbackのmemory_only・公開入力/packet・同一期限を純比較してから公開returned=Trueを確定します。入場中の期限到達はGC/起動作用を開始せず、退出中の期限到達はSTART_TIMEOUTで公開成功を拒否します。commit済みのRUNNING/COMPLETED・全ports・元M/接続は保全し、finallyの通知で既存受信へ引き継ぎます。db_lock待機を強制中断したり、期限を再設定したりはしません。
 
-失敗・作用後不明では元入力canonical・元M/connection/peer/channel・reader・原文・残る予約/終端正本を保全します。内部完成と公開返却を別の進捗として記録し、内部RUNNING確定後に公開gateで失効しても成功応答へ進みません。commit済みのMには第53と同じ監督/受信を引き継ぎ、再生成・再handshake・GRANT/ACK再送・自動解放・再確定はしません。既存の公開status/stop/STOPPING監督は同じsessionと受信進行を消費します。正規recoverと同一P/instanceの保持枠の再利用は後続とし、保全規則を緩めて再受付しません。
+失敗・作用後不明では元入力canonical・元M/connection/peer/channel・reader・原文・残る予約/終端正本を保全します。内部完成と公開返却を別の進捗として記録し、内部RUNNING確定後に公開gateで失効しても成功応答へ進みません。commit済みのMには第53と同じ監督/受信を引き継ぎ、再生成・再handshake・GRANT/ACK再送・自動解放・再確定はしません。既存の公開status/stop/STOPPING監督は同じsessionと受信進行を消費します。起動の正規recoverと同一P/instanceの保持枠の再利用は後続とし、保全規則を緩めて再受付しません。
+
+## 確定済みcloseの内部recover照合（第55スライス）
+
+`RuntimeControl._offline_recover_close`は、同じPが保持する元offline-open/close IDと終端原文のSHA-256を明示した、新しい照合operation専用です。元closeの終端write前に固定した原文・保持object・解放進捗・生成bindingのpacketを使用し、CLOSED/COMPLETED・元予約不在の正本とP本人を再照合して、`OFFLINE_CLOSE_RECOVERED`を記録・返却します。元closeのcommit後に返却が失敗した場合も、正本と同じ固定packetが一致する場合だけreadbackできます。
+
+今回のdeadlineは照合要求の単一期限であり、元close期限の更新や未完了処理の継続には使いません。Registry write内ではSQLと保持値の純比較だけを行い、write退出・返却copy・外側resource_use退出後にも固定値と期限を確認します。期限や照合の失敗では元正本・元資源・記録済みの復旧結果を保全します。解放済みprocessの再poll/再close、close再送、Cの差替え、保持枠の破棄は行いません。
+
+終端前の失敗、部分解放UNKNOWN、元packetのないP再起動、別run/世代は拒否します。この入口は旧generationの正常化・Ready/start許可を返しません。公開recoverへの接続、未確定の正規解決、保持枠再利用と#54の検証snapshotから新generationへのrestoreは後続です。現在の公開offline-startに再試行は追加しません。
