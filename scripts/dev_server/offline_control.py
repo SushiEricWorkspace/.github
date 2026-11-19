@@ -41,6 +41,7 @@ class _OfflineOpen:
         self.start_records = {}
         self.close_recoveries = {}
         self.close_preparations = {}
+        self.release_failures = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -564,10 +565,81 @@ class _OfflineOpen:
                 saved['workerRelease'] = release_record
                 encoded = json.dumps(saved)
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放意図の更新前に期限を超過しました')
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放の固定row読取前に期限を超過しました')
+                row = dict(self.registry._instance(connection, token['instanceId']))
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放の固定row読取後に期限を超過しました')
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
             resources = [(worker.process, worker.pipe) for worker in workers]
             progress = {binding['operationId']:dict(handle='NOT_STARTED', pipe='NOT_STARTED') for binding in bindings}
             controller.worker_release = progress
+
+            # 最初のWのhandle解放不明だけを、作用前の同じ基準で観測する。
+            failed = False
+            if workers:
+                instance = token['instanceId']
+                key = instance, opened['operationId']
+                history = self.history.get(instance)
+                history_refs = tuple(history or [])
+                latest = self.workers.get(instance)
+                close_binding = controller.close_binding
+                close_values = deepcopy({k:v for k,v in close_binding.items() if k not in {'process','pipe'}})
+                actors = (controller, *workers)
+                references = tuple((actor.process,actor.pipe,actor.creation_resources,tuple(actor.creation_resources),
+                    actor.native,actor.adapter,actor.verify_owner,actor.controller,
+                    getattr(actor.process,'process',None),getattr(actor.pipe,'incoming',None)) for actor in actors)
+                def values():
+                    return tuple((actor.bundle,actor.diagnostics,actor.record_number,
+                        *(getattr(actor.process,n,None) for n in ('handle','job','thread')),
+                        *(getattr(actor.pipe,n,None) for n in
+                          ('child_input','child_output','outgoing','offset','incoming','expected'))) for actor in actors)
+                fixed_values = deepcopy(values())
+                snapshot = self._release_snapshot(controller, workers, history or [])
+                snapshot[0][0][0]['worker_release'][bindings[0]['operationId']]['handle'] = 'UNKNOWN'
+                intent = encoded
+                expected = deepcopy(saved['binding'])
+                original_request = canonical(dict(token=token,openOperationId=opened['operationId'],releaseOperationId=operation_id))
+                facts = canonical(dict(instanceId=instance,openOperationId=opened['operationId'],
+                    releaseOperationId=operation_id,ownerReleaseSha256=digest(controller.owner_release_response),
+                    owner={'handle':'RELEASED','pipe':'RELEASED'},workers=[dict(binding,
+                        handle='UNKNOWN' if index==0 else 'NOT_STARTED',pipe='NOT_STARTED')
+                        for index,binding in enumerate(bindings)]))
+
+                def memory(request):
+                    require(request==original_request,'STALE_OPERATION','元W解放要求の固定bindingが一致しません')
+                    require(failed and self.runtime._offline is self and self.release_failures.get(key) is packet
+                        and self.controllers.get(instance) is controller and self.workers.get(instance) is latest
+                        and self.history.get(instance) is history and controller.worker_release is progress
+                        and len(history or [])==len(history_refs)
+                        and all(a is b and x is y for (a,x),(b,y) in zip(history or [],history_refs))
+                        and controller.close_binding is close_binding
+                        and close_binding['process'] is controller.process and close_binding['pipe'] is controller.pipe
+                        and {k:v for k,v in close_binding.items() if k not in {'process','pipe'}} == close_values
+                        and all(actor.process is refs[0] and actor.pipe is refs[1]
+                            and actor.creation_resources is refs[2]
+                            and len(actor.creation_resources)==len(refs[3])
+                            and all(a is b for a,b in zip(actor.creation_resources,refs[3]))
+                            and all(a is b for a,b in zip((actor.native,actor.adapter,actor.verify_owner,actor.controller,
+                                getattr(actor.process,'process',None),getattr(actor.pipe,'incoming',None)),refs[4:]))
+                            for actor,refs in zip(actors,references))
+                        and values()==fixed_values
+                        and self._release_snapshot(controller,workers,history or [])==snapshot,
+                        'PROOF_MISMATCH', '元W解放失敗の作用前bindingと保持証拠が一致しません')
+
+                def saved_failure(connection, current_token, request, limit):
+                    memory(request)
+                    require(time.monotonic()<limit,'STOP_TIMEOUT','元W予約の照合前に期限を超過しました')
+                    self._reserved(connection,current_token,opened['operationId'],opened['requestHash'],expected)
+                    require(time.monotonic()<limit,'STOP_TIMEOUT','元W固定rowの照合前に期限を超過しました')
+                    current=dict(self.registry._instance(connection,instance))
+                    require(time.monotonic()<limit,'STOP_TIMEOUT','元W意図原文の読取前に期限を超過しました')
+                    original=connection.execute('SELECT response FROM runtime_operations WHERE id=?',
+                        (opened['operationId'],)).fetchone()[0]
+                    require({k:v for k,v in current.items() if k!='expires'}=={k:v for k,v in row.items() if k!='expires'}
+                        and original==intent,
+                        'STALE_OPERATION', '元W解放意図・固定rowが変更されました')
+                    memory(request)
+                packet = facts, controller, memory, saved_failure
+                self.release_failures[key] = packet
 
             def checked(connection):
                 _, current = self._owner_released(connection, token, controller, operation_id, deadline)
@@ -582,7 +654,9 @@ class _OfflineOpen:
                 return current
 
             def verify():
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放の本人照合前に期限を超過しました')
                 controller.verify_owner()
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放の正本読取前に期限を超過しました')
                 with self.runtime._transaction(token['instanceId'], read_only=True) as connection:
                     checked(connection)
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W資源解放前後に期限を超過しました')
@@ -591,7 +665,11 @@ class _OfflineOpen:
                 state = progress[binding['operationId']]
                 verify()
                 state['handle'] = 'UNKNOWN'
-                process.close()
+                try:
+                    process.close()
+                except BaseException:
+                    failed = process is resources[0][0]
+                    raise
                 state['handle'] = 'RELEASED'
                 verify()
                 state['pipe'] = 'UNKNOWN'
@@ -632,6 +710,74 @@ class _OfflineOpen:
             verify()
             finished()
             return returned
+
+    def observe_worker_release_failure(self, token, *, operation_id, open_operation_id, release_operation_id, deadline):
+        """同じPの最初Wのhandle不明を照合記録する。解放・元終端・再採用は行わない。
+
+        新しい照合IDのCOMPLETEDは観測結果だけで、元openはPENDINGと予約を維持する。
+        他の失敗段階とP再起動は拒否する。deadlineは今回の観測全体の絶対期限。
+        """
+        token=deepcopy(token)
+        fields(token,TOKEN)
+        for value,name in ((operation_id,'operationId'),(open_operation_id,'openOperationId'),
+                           (release_operation_id,'releaseOperationId')):
+            identifier(value,name)
+        require(len({operation_id,open_operation_id,release_operation_id})==3,
+                'OPERATION_CONFLICT','元open/解放と別の照合IDが必要です')
+        packet=self.release_failures.get((token['instanceId'],open_operation_id))
+        require(packet is not None,'RECOVERY_REQUIRED','同じPの作用前W解放証拠が必要です')
+        raw,controller,memory,saved=packet
+        facts=json.loads(raw)
+        request=canonical(dict(token=token,openOperationId=open_operation_id,releaseOperationId=release_operation_id))
+        fingerprint=digest(request)
+        result=dict(status='OFFLINE_RELEASE_UNKNOWN',operationId=operation_id,source=facts,terminatesOriginal=False)
+        response=canonical(result)
+        encoded=json.dumps(result)
+        returned=None
+
+        def checked():
+            memory(request)
+            require(canonical(dict(token=token,openOperationId=open_operation_id,releaseOperationId=release_operation_id))==request,
+                    'PROOF_MISMATCH','観測要求の固定原文が変更されました')
+            require(canonical(result)==response and (returned is None or canonical(returned)==response),
+                    'PROOF_MISMATCH','元観測結果と返却値が一致しません')
+            require(time.monotonic()<deadline,'STOP_TIMEOUT','W解放不明の観測期限を超過しました')
+
+        def stored(connection):
+            checked()
+            saved(connection,token,request,deadline)
+            checked()
+            for table in ('operations','writer_operations','reference_operations','snapshot_operations'):
+                checked()
+                require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?',(operation_id,)).fetchone(),
+                        'OPERATION_CONFLICT','観測IDが他の操作で使用されています')
+            checked()
+            old=connection.execute('SELECT * FROM runtime_operations WHERE id=?',(operation_id,)).fetchone()
+            require(old is None or (old['command']=='offline-observe-worker-release' and old['instance']==token['instanceId']
+                and old['fingerprint']==fingerprint and old['status']=='COMPLETED' and old['response']==encoded),
+                'OPERATION_CONFLICT','元観測の入力・結果が一致しません')
+            checked()
+            return old
+
+        checked()
+        with self.registry.resource_use(),self.runtime._lock_wait(deadline):
+            checked()
+            controller._verify_close_binding(deadline)
+            checked()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                old=stored(connection)
+                if old is None:
+                    checked()
+                    connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
+                        (operation_id,fingerprint,'offline-observe-worker-release',token['instanceId'],'COMPLETED',encoded))
+                require(stored(connection) is not None,'PROOF_REQUIRED','W解放観測の記録がありません')
+            returned=deepcopy(result)
+            checked()
+            with self.runtime._transaction(token['instanceId'],read_only=True) as connection:
+                require(stored(connection) is not None,'PROOF_REQUIRED','W解放観測の正本がありません')
+            checked()
+        checked()
+        return returned
 
     def _workers_released(self, connection, token, controller, operation_id, deadline):
         opened, saved = self._owner_released(connection, token, controller, operation_id, deadline)
