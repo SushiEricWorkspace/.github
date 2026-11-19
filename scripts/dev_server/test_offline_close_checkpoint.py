@@ -29,8 +29,8 @@ class CloseCheckpointTests(unittest.TestCase):
 
     def record(self, after=lambda:None):
         original=self.c._record
-        def recorded():
-            original()
+        def recorded(**options):
+            original(**options)
             self.published=True
             after()
         return patch.object(self.c,'_record',side_effect=recorded)
@@ -157,15 +157,14 @@ class CloseCheckpointTests(unittest.TestCase):
 
     def test_record_exception_after_file_publication_still_requires_recovery_evidence(self):
         original=self.c._record
-        def uncertain():
-            original()
+        def uncertain(**options):
+            original(**options)
             raise OSError('正常復帰が確認できない')
         with patch.object(self.c,'_record',side_effect=uncertain):
             with self.assertRaises(OSError):self.base.finish()
         self.assertEqual(canonical(self.c.record),self.path.read_bytes())
-        self.assertNotIn(self.key,self.offline.close_recoveries)
-        with self.assertRaises(RegistryError):self.recover()
-        self.assertEqual((('LEASED_STOPPED',1),'PENDING',1),self.base.state())
+        self.pending()
+        self.recover();self.base.completed()
 
     def before_packet(self, change, *, in_place=False, rebase=True):
         transaction=self.runtime._transaction
@@ -198,7 +197,7 @@ class CloseCheckpointTests(unittest.TestCase):
             with self.assertRaises(RegistryError):self.recover()
         self.assertEqual([],updates)
         self.assertEqual((('LEASED_STOPPED',1),'PENDING',1),self.base.state())
-        if rebase:self.assertNotIn(self.key,self.offline.close_recoveries)
+        self.assertIn(self.key,self.offline.close_recoveries)
         slot,snapshot,raw,response=retained[0]
         self.assertIs(slot,self.offline.retired[self.key])
         if not rebase or in_place:self.assertIs(snapshot,slot['snapshot'])

@@ -23,14 +23,20 @@ from .mod_control_startup import _admission, _change, _Startup
 TOKEN = {"instanceId", "leaseId", "epoch", "expectedGeneration"}
 
 
-def write_json(path: Path, value: dict) -> None:
-    """新規記録だけを作り、既存証跡や世代を上書きしない。"""
+def write_json(path: Path, value: dict, *, observe=None) -> None:
+    """新規記録だけを作る。observeは全I/O正常完了後に実write原文を受け取る。
+
+    通知の例外でも作成済み証跡を上書き・再試行しない。既定の戻り値はNone。
+    """
     plain_path(path)
     with path.open("xb") as handle:
-        handle.write(canonical(value))
+        data = canonical(value)
+        handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
     make_private(path)
+    if observe is not None:
+        observe(data)
 
 
 def read_json(path: Path) -> dict:
@@ -122,6 +128,13 @@ class RuntimeControl:
         """同じPの元終端意図・全解放証拠から、未commitのclose終端を新しい照合操作で確定する。"""
         require(self._offline is not None, 'RECOVERY_REQUIRED', '元offline保持枠が必要です')
         return self._offline.recover_pending_close(token, operation_id=operation_id, open_operation_id=open_operation_id,
+            close_operation_id=close_operation_id, termination_sha256=termination_sha256, deadline=deadline)
+
+    def _offline_recover_recorded_close(self, token, *, operation_id, open_operation_id, close_operation_id,
+                                       termination_sha256, deadline):
+        """Pが保持する実write完了と元準備packetを照合し、第56の原子的終端へ接続する。"""
+        require(self._offline is not None, 'RECOVERY_REQUIRED', '元offline保持枠が必要です')
+        return self._offline.recover_recorded_close(token, operation_id=operation_id, open_operation_id=open_operation_id,
             close_operation_id=close_operation_id, termination_sha256=termination_sha256, deadline=deadline)
 
     def _offline_read_ready_original(self, token, *, open_operation_id, ready, deadline):

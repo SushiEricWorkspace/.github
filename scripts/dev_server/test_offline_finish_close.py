@@ -165,7 +165,7 @@ class OfflineFinishCloseTests(unittest.TestCase):
 
     def test_journal_deadline_does_not_terminate(self):
         original=self.c._record
-        def late():original();self.f.clock=10
+        def late(**options):original(**options);self.f.clock=10
         with patch.object(self.c,'_record',side_effect=late):
             with self.assertRaises(RegistryError):self.finish()
         self.assertEqual((('LEASED_STOPPED',1),'PENDING',1),self.state())
@@ -324,7 +324,7 @@ class OfflineFinishCloseTests(unittest.TestCase):
 
     def test_intent_and_terminal_compete_with_start_in_actual_registry(self):
         entered,leave=threading.Event(),threading.Event();original=self.c._record
-        def paused():entered.set();self.assertTrue(leave.wait(30));original()
+        def paused(**options):entered.set();self.assertTrue(leave.wait(30));original(**options)
         self.assertIs(self.runtime._transaction.__func__,runtime_control.RuntimeControl._transaction)
         with patch.object(self.c,'_record',side_effect=paused),ThreadPoolExecutor(max_workers=1) as pool:
             future=pool.submit(self.finish)
@@ -339,7 +339,7 @@ class OfflineFinishCloseTests(unittest.TestCase):
 
     def test_registry_change_during_journal_prevents_terminal(self):
         entered,leave=threading.Event(),threading.Event();original=self.c._record
-        def paused():entered.set();self.assertTrue(leave.wait(30));original()
+        def paused(**options):entered.set();self.assertTrue(leave.wait(30));original(**options)
         with patch.object(self.c,'_record',side_effect=paused),ThreadPoolExecutor(max_workers=1) as pool:
             future=pool.submit(self.finish)
             try:

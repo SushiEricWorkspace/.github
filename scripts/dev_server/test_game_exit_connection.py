@@ -70,7 +70,11 @@ def configure(test, runtime, managed, session, candidate, peer):
     runtime.process_adapter=peer.adapter
     managed.transport.native=peer.native
     test.enterContext(patch.object(offline_process,'os',SimpleNamespace(getpid=lambda:parent['pid'],environ=processes.os.environ)))
-    test.enterContext(patch.object(offline_process,'write_json',side_effect=lambda path,value:path.write_bytes(target.canonical(value))))
+    def write(path,value,*,observe=None):
+        data=target.canonical(value)
+        path.write_bytes(data)
+        if observe is not None:observe(data)
+    test.enterContext(patch.object(offline_process,'write_json',side_effect=write))
     Pipe.current=test
     test.enterContext(patch.object(offline_process,'ProxyPipe',Pipe))
     artifact=json.loads(born)['run']['artifactId']
