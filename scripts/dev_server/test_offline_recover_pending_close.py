@@ -26,8 +26,8 @@ class OfflineRecoverPendingCloseTests(unittest.TestCase):
                 with self.assertRaises(OSError):self.base.finish()
         else:
             original = self.c._record
-            def late():
-                original()
+            def late(**options):
+                original(**options)
                 self.f.clock = self.f.deadline
             with patch.object(self.c, '_record', side_effect=late):
                 with self.assertRaises(RegistryError):self.base.finish()

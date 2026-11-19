@@ -40,6 +40,7 @@ class _OfflineOpen:
         self.starts = {}
         self.start_records = {}
         self.close_recoveries = {}
+        self.close_preparations = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -888,20 +889,17 @@ class _OfflineOpen:
                                      if name not in {'process', 'pipe'}})
             raw = canonical(result)
 
-            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端局所記録の開始前に期限を超過しました')
-            controller._record()
+            record_raw = canonical(controller.record)
+            recorded = False
 
             def finished():
                 require(controller.termination_response == canonical(result) and controller.record.get('termination') == result,
                         'PROOF_MISMATCH', '終端結果の原文と局所記録が一致しません')
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端結果の照合後に期限を超過しました')
 
-            require(slot['snapshot'] is snapshot and snapshot == release_snapshot,
-                    'PROOF_MISMATCH', '検査済みの元解放snapshotが変更されました')
-            self._terminal_memory(slot)
-
             def recover_memory():
-                require(self.close_recoveries.get(key) is packet
+                require(recorded and self.close_preparations.get(key) is preparation
+                        and self.close_recoveries.get(key) is packet
                         and slot['latest'] is latest
                         and slot['snapshot'] is snapshot and snapshot == release_snapshot
                         and all(slot[name] is value for name,value in zip(
@@ -926,7 +924,29 @@ class _OfflineOpen:
                 return intent
 
             packet = raw, slot, recover_memory
-            self.close_recoveries[key] = packet
+            def publish(current_token):
+                require(recorded and self.close_preparations.get(key) is preparation,
+                        'RECOVERY_REQUIRED', '同じPの実write正常完了と元準備packetが必要です')
+                require(current_token == token,
+                        'STALE_OPERATION', '元closeのlease/epoch/generationが一致しません')
+                current = self.close_recoveries.get(key)
+                require(current is None or current is packet,
+                        'PROOF_MISMATCH', '元完成packetの保持先が変更されました')
+                self.close_recoveries[key] = packet
+                recover_memory()
+
+            def written(data):
+                nonlocal recorded
+                require(not recorded and data == record_raw,
+                        'PROOF_MISMATCH', '実write原文が作用前に固定した記録と一致しません')
+                recorded = True
+                publish(token)
+
+            preparation = packet, publish
+            self.close_preparations[key] = preparation
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端局所記録の開始前に期限を超過しました')
+            controller._record(observe=written)
+
             recover_memory()
             finished()
             verify()
@@ -954,6 +974,35 @@ class _OfflineOpen:
             recover_memory()
             finished()
             return returned
+
+    def recover_recorded_close(self, token, *, operation_id, open_operation_id, close_operation_id,
+                               termination_sha256, deadline):
+        """同じPの実write完了後の引渡し失敗を、元準備packetと第56 CASで照合する。
+
+        ファイル存在や記録番号から完了を推定せず、元記録・closeを再実行しない。
+        deadlineは今回の照合要求だけに使用し、元資源と期限を変更しない。
+        """
+        token = deepcopy(token)
+        fields(token, TOKEN)
+        for value, name in ((operation_id, 'operationId'), (open_operation_id, 'openOperationId'),
+                            (close_operation_id, 'closeOperationId')):
+            identifier(value, name)
+        _hash(termination_sha256)
+        require(len({operation_id, open_operation_id, close_operation_id}) == 3,
+                'OPERATION_CONFLICT', '終端照合には元open/closeとは別のIDが必要です')
+        preparation = self.close_preparations.get((token['instanceId'], open_operation_id))
+        require(preparation is not None, 'RECOVERY_REQUIRED', '同じPの元close準備packetが必要です')
+        packet, publish = preparation
+        require(digest(packet[0]) == termination_sha256 and json.loads(packet[0])['operationId'] == close_operation_id,
+                'PROOF_MISMATCH', '元close IDと終端原文hashが一致しません')
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', '実write証拠の照合前に期限を超過しました')
+        with self.registry.resource_use(), self.runtime._lock_wait(deadline):
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '元packet引渡し前に期限を超過しました')
+            publish(token)
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '元packet引渡し後に期限を超過しました')
+        require(time.monotonic() < deadline, 'STOP_TIMEOUT', '資源調停退出後に期限を超過しました')
+        return self.recover_pending_close(token, operation_id=operation_id, open_operation_id=open_operation_id,
+            close_operation_id=close_operation_id, termination_sha256=termination_sha256, deadline=deadline)
 
     def recover_close(self, token, *, operation_id, open_operation_id, close_operation_id, termination_sha256, deadline):
         """同じPの確定済みcloseを新しい照合要求でreadbackする。解放・再送・再採用は行わない。
