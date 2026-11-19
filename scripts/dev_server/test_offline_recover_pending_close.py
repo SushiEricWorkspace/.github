@@ -25,13 +25,11 @@ class OfflineRecoverPendingCloseTests(unittest.TestCase):
             with patch.object(self.offline, '_terminal', side_effect=OSError('終端write rollback')):
                 with self.assertRaises(OSError):self.base.finish()
         else:
-            original = offline_control.deepcopy
-            def late(value):
-                result = original(value)
-                if isinstance(value, tuple) and len(value) == 7 and value[0] == (self.token['instanceId'], self.base.opened['operationId']):
-                    self.f.clock = self.f.deadline
-                return result
-            with patch.object(offline_control, 'deepcopy', side_effect=late):
+            original = self.c._record
+            def late():
+                original()
+                self.f.clock = self.f.deadline
+            with patch.object(self.c, '_record', side_effect=late):
                 with self.assertRaises(RegistryError):self.base.finish()
         self.assertEqual((('LEASED_STOPPED',1),'PENDING',1), self.base.state())
         self.assertIn('termination', self.f.saved())

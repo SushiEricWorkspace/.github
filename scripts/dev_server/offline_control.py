@@ -816,11 +816,13 @@ class _OfflineOpen:
                 row = dict(self.registry._instance(connection, instance))
                 history = self.history.get(instance, [])
                 latest = self.workers.get(instance)
+                snapshot = self._release_snapshot(controller, workers, history)
+                release_snapshot = deepcopy(snapshot)
                 slot = dict(key=key, controller=controller, workers=tuple(workers), history=history,
                     latest=latest, opened=opened, saved=deepcopy(saved), row=row,
                     closeBinding=controller.close_binding,
                     resources=[(actor,actor.process,actor.pipe,actor.creation_resources) for actor in (controller,*workers)],
-                    snapshot=self._release_snapshot(controller, workers, history))
+                    snapshot=snapshot)
                 ending = dict(operationId=operation_id, generationId=row['generation'], runId=row['run_id'],
                     writerClosedSha256=digest(controller.writer_closed_response))
                 saved['termination'] = ending
@@ -831,20 +833,25 @@ class _OfflineOpen:
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
 
             def checked(connection):
+                require(self.retired.get(key) is slot and self.controllers.get(instance) is controller
+                        and self.workers.get(instance) is latest and slot['latest'] is latest,
+                        'STALE_OPERATION', '元終端の保持枠が変更されました')
                 _, current, held = self._writer_closed(connection, token, controller, operation_id, deadline)
-                require(current.get('termination') == ending and self.retired.get(key) is slot
-                        and self.controllers.get(instance) is controller and self.workers.get(instance) is slot['latest']
+                require(current.get('termination') == ending
                         and self.history.get(instance, []) == history and len(held) == len(workers)
                         and all(a is b for a,b in zip(held,workers))
                         and controller.close_binding is slot['closeBinding']
                         and all(actor.process is process and actor.pipe is pipe and actor.creation_resources is resources
                             for actor,process,pipe,resources in slot['resources'])
-                        and self._release_snapshot(controller, workers, history) == slot['snapshot'],
+                        and slot['snapshot'] is snapshot and snapshot == release_snapshot
+                        and self._release_snapshot(controller, workers, history) == release_snapshot,
                         'STALE_OPERATION', '終端意図と元C/全Wの保持証拠が変更されました')
                 return current
 
             def verify():
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端意図の本人照合前に期限を超過しました')
                 controller.verify_owner()
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端意図の正本読取前に期限を超過しました')
                 with self.runtime._transaction(instance, read_only=True) as connection:
                     checked(connection)
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端意図の照合後に期限を超過しました')
@@ -856,67 +863,81 @@ class _OfflineOpen:
             controller.termination_response = canonical(result)
             verify()
             controller.record['termination'] = deepcopy(result)
+            current = json.loads(intent)
+            current['termination'] = dict(ending, state='COMPLETED', responseSha256=digest(controller.termination_response))
+            encoded = json.dumps(current)
+            slot['encoded'] = encoded
+            values = ('key', 'row', 'opened', 'saved', 'encoded', 'result', 'snapshot')
+            fixed = deepcopy(tuple(slot[name] for name in values))
+            originals = tuple(slot[name] for name in values)
+            held = tuple(slot[name] for name in ('controller', 'workers', 'history', 'closeBinding', 'resources'))
+            actors = tuple(slot['resources'])
+            objects = tuple((actor.native, actor.adapter, actor.verify_owner, actor.controller,
+                             getattr(process, 'process', None), getattr(pipe, 'incoming', None))
+                            for actor,process,pipe,_ in actors)
+            def resource_values():
+                return tuple((actor.bundle, actor.diagnostics,
+                    *(getattr(process, name, None) for name in ('handle','job','thread')),
+                    *(getattr(pipe, name, None) for name in
+                      ('input','output','child_input','child_output','outgoing','offset','incoming','expected')))
+                    for actor,process,pipe,_ in actors)
+            resource_snapshot = deepcopy(resource_values())
+            record_numbers = tuple(actor.record_number + (1 if actor is controller else 0)
+                                   for actor,_,_,_ in actors)
+            close_values = deepcopy({name:value for name,value in controller.close_binding.items()
+                                     if name not in {'process', 'pipe'}})
+            raw = canonical(result)
+
             require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端局所記録の開始前に期限を超過しました')
             controller._record()
-            verify()
 
             def finished():
                 require(controller.termination_response == canonical(result) and controller.record.get('termination') == result,
                         'PROOF_MISMATCH', '終端結果の原文と局所記録が一致しません')
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端結果の照合後に期限を超過しました')
 
+            require(slot['snapshot'] is snapshot and snapshot == release_snapshot,
+                    'PROOF_MISMATCH', '検査済みの元解放snapshotが変更されました')
+            self._terminal_memory(slot)
+
+            def recover_memory():
+                require(self.close_recoveries.get(key) is packet
+                        and slot['latest'] is latest
+                        and slot['snapshot'] is snapshot and snapshot == release_snapshot
+                        and all(slot[name] is value for name,value in zip(
+                            ('controller', 'workers', 'history', 'closeBinding', 'resources'), held))
+                        and len(slot['resources']) == len(actors)
+                        and all(len(actual) == len(original) and all(a is b for a,b in zip(actual, original))
+                                for actual,original in zip(slot['resources'], actors))
+                        and all(slot[name] is value for name,value in zip(values, originals))
+                        and tuple(slot[name] for name in values) == fixed
+                        and all(all(a is b for a,b in zip(
+                            (actor.native, actor.adapter, actor.verify_owner, actor.controller,
+                             getattr(process, 'process', None), getattr(pipe, 'incoming', None)), original))
+                            for (actor,process,pipe,_),original in zip(actors, objects))
+                        and resource_values() == resource_snapshot
+                        and tuple(actor.record_number for actor,_,_,_ in actors) == record_numbers
+                        and {name:value for name,value in controller.close_binding.items()
+                             if name not in {'process', 'pipe'}} == close_values
+                        and controller.close_binding['process'] is controller.process
+                        and controller.close_binding['pipe'] is controller.pipe,
+                        'PROOF_MISMATCH', '元close確定時の保持bindingが変更されました')
+                self._terminal_memory(slot)
+                return intent
+
+            packet = raw, slot, recover_memory
+            self.close_recoveries[key] = packet
+            recover_memory()
+            finished()
+            verify()
             with self.runtime._transaction(instance) as connection:
                 current = checked(connection)
                 finished()
                 current['termination'] = dict(ending, state='COMPLETED', responseSha256=digest(controller.termination_response))
-                encoded = json.dumps(current)
-                checked(connection)
+                require(json.dumps(current) == encoded, 'STALE_OPERATION', '元意図から固定した終端原文が変更されました')
+                recover_memory()
                 finished()
-                slot['encoded'] = encoded
-                values = ('key', 'row', 'opened', 'saved', 'encoded', 'result', 'snapshot')
-                fixed = deepcopy(tuple(slot[name] for name in values))
-                originals = tuple(slot[name] for name in values)
-                held = tuple(slot[name] for name in ('controller', 'workers', 'history', 'closeBinding', 'resources'))
-                actors = tuple(slot['resources'])
-                objects = tuple((actor.native, actor.adapter, actor.verify_owner, actor.controller,
-                                 getattr(process, 'process', None), getattr(pipe, 'incoming', None))
-                                for actor,process,pipe,_ in actors)
-                def resource_values():
-                    return tuple((actor.bundle, actor.diagnostics, actor.record_number,
-                        *(getattr(process, name, None) for name in ('handle','job','thread')),
-                        *(getattr(pipe, name, None) for name in
-                          ('input','output','child_input','child_output','outgoing','offset','incoming','expected')))
-                        for actor,process,pipe,_ in actors)
-                resource_snapshot = deepcopy(resource_values())
-                close_values = deepcopy({name:value for name,value in controller.close_binding.items()
-                                         if name not in {'process', 'pipe'}})
-                raw = canonical(result)
-
-                def recover_memory():
-                    require(self.close_recoveries.get(key) is packet
-                            and slot['latest'] is latest
-                            and all(slot[name] is value for name,value in zip(
-                                ('controller', 'workers', 'history', 'closeBinding', 'resources'), held))
-                            and len(slot['resources']) == len(actors)
-                            and all(len(actual) == len(original) and all(a is b for a,b in zip(actual, original))
-                                    for actual,original in zip(slot['resources'], actors))
-                            and all(slot[name] is value for name,value in zip(values, originals))
-                            and tuple(slot[name] for name in values) == fixed
-                            and all(all(a is b for a,b in zip(
-                                (actor.native, actor.adapter, actor.verify_owner, actor.controller,
-                                 getattr(process, 'process', None), getattr(pipe, 'incoming', None)), original))
-                                for (actor,process,pipe,_),original in zip(actors, objects))
-                            and resource_values() == resource_snapshot
-                            and {name:value for name,value in controller.close_binding.items()
-                                 if name not in {'process', 'pipe'}} == close_values
-                            and controller.close_binding['process'] is controller.process
-                            and controller.close_binding['pipe'] is controller.pipe,
-                            'PROOF_MISMATCH', '元close確定時の保持bindingが変更されました')
-                    self._terminal_memory(slot)
-                    return intent
-
-                packet = raw, slot, recover_memory
-                self.close_recoveries[key] = packet
+                checked(connection)
                 recover_memory()
                 finished()
                 connection.execute("UPDATE runtime_operations SET status='COMPLETED',response=? WHERE id=?",

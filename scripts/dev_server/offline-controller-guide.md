@@ -595,3 +595,17 @@ CLIでは`--operation-id`を必須とし、本文は`--payload-stdin`又は`--pa
 今回の照合がcommit済みなら、同じ入力・同じ照合IDでその記録をreadbackできます。別の新照合IDで既にCOMPLETEDの元操作を未確定として扱う要求は拒否します。既知COMPLETEDの照合には第55の入口を使います。write前の失効はPENDINGと予約を維持し、commit後の失効は確定済み終端と今回の記録を維持して正常返却を拒否します。
 
 P本人観測の後に短いSQL照合・更新を行い、write退出後、返却copy後、資源調停退出後は同じpacketと返却値の純比較・期限確認だけを行います。新しいfile・native・SQL作用を最終純比較後に置きません。保証はP側の観測時点に限られ、各観測・比較後の外部変更は残余窓として残ります。既存起動の最終gateと監督・受信接続を維持します。公開recoverへの接続、部分解放・作用後不明の追加復旧、保持枠の再利用と#54 restoreは後続です。実OS/native本人受入は未確認です。
+
+## 局所記録の正常復帰後からの明示recover（第57スライス）
+
+解放snapshotは、最初のwriter CLOSED照合後の元slot作成時に参照と値を可変slotから独立して保持します。`_record()`前の通常照合、正常復帰後のpacket作成前、以後の保持callbackは、この同じ基準へ純比較します。解放進捗や局所recordとslot基準を同時に変更しても、新しい完成基準には採用しません。追加の記録I/Oは行いません。
+
+packetの元枠・C/全W・history・closeBinding・資源参照、handle/job/thread・Popen・pipe全FD/buffer、native/adapter/本人callbackと補助値も、`_record()`前に参照・値を固定します。記録後に初めて資源の基準を採用する処理はありません。記録番号は事前値からCだけが1進み、全Wは変わらないことを要求し、terminationは同じ固定結果へ照合します。記録中に変わった資源はそのまま保持して拒否し、再closeしません。
+
+`_offline_finish_close`は、終端局所記録の`_record()`が正常復帰した直後、次のowner callback・Registry照合より先に事前固定した基準を同じ完成packetへ結びます。元終端意図の保存原文から終端目標原文を固定し、元C/全W・終了/解放原文・資源・本人・artifact・期限の同じ参照と値を保持します。後続照合の失敗・期限到達で元終端がPENDINGのままでも、このpacketを同じPが保持していれば、第56の`_offline_recover_pending_close`で明示的に正本終端へ進めます。
+
+`_record()`の正常復帰は、新規ファイルへの原文write・flush/fsync・権限設定と記録番号の更新が完了したことを表します。元局所記録・close・資源解放を再実行せず、元意図と新しい照合要求を既存の短いRegistry writeで結びます。元終端目標はwrite内でも同じ原文へ照合し、slotや現在正本から完成基準を採用し直しません。終端前の枠比較をworker参照より先に行い、別objectの枠は保持して拒否します。
+
+結果エンコード後のverify開始前、owner callback復帰後の次Registry読取前にも元入口deadlineを確認します。局所記録からの復帰時点で期限に達した場合は純メモリの証拠固定だけを行い、後続のI/O・終端write・正常返却へ進みません。元deadlineは保持したまま、新しい明示recover要求の期限で元packetと正本を照合します。
+
+局所writeが例外・部分公開となって正常復帰を確認できない場合は、ファイルの存在だけで完成packetを作りません。部分解放UNKNOWN、元packet欠落、P再起動、保持bindingや元正本の不一致は保全して拒否します。これらの実観測による追加確定、保持枠再利用、公開recoverと#54 restoreは後続です。正常起動・第55/56のrecover・固定Mod/Data契約は従来の入口を使います。実OS/native本人受入は未確認です。

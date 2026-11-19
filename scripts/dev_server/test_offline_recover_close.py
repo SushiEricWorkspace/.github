@@ -155,8 +155,11 @@ class OfflineRecoverCloseTests(unittest.TestCase):
         @contextmanager
         def changed(instance, **kwargs):
             with original(instance,**kwargs) as db:yield db
-            if kwargs.get('read_only') and (self.token['instanceId'],self.base.opened['operationId']) in self.offline.close_recoveries:
-                self.c.process.handle=9993
+            if kwargs.get('read_only'):
+                with self.runtime.registry.transaction(read_only=True) as db:
+                    completed=db.execute('SELECT status FROM runtime_operations WHERE id=?',
+                        (self.base.opened['operationId'],)).fetchone()[0]=='COMPLETED'
+                if completed:self.c.process.handle=9993
         with patch.object(self.runtime,'_transaction',side_effect=changed):
             with self.assertRaises(RegistryError):self.base.finish()
         self.assertEqual((('LEASED_STOPPED',0),'COMPLETED',0),self.base.state())
