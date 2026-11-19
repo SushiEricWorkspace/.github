@@ -100,6 +100,12 @@ class RuntimeControl:
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")
         return self._offline.release_worker_handles(token, operation_id=operation_id, deadline=deadline)
 
+    def _offline_observe_worker_release_failure(self, token, *, operation_id, open_operation_id, release_operation_id, deadline):
+        """最初Wのhandle解放不明を同じPの元証拠で照合記録する。元終端/再解放は行わない。"""
+        require(self._offline is not None, 'RECOVERY_REQUIRED', '元W解放の保持Pが必要です')
+        return self._offline.observe_worker_release_failure(token, operation_id=operation_id,
+            open_operation_id=open_operation_id, release_operation_id=release_operation_id, deadline=deadline)
+
     def _offline_record_writer_closed(self, token, *, operation_id, deadline):
         """元C/全Wの解放正本からoffline writer CLOSEDを記録し、元予約は保持する。"""
         require(self._offline is not None, "WRITER_PENDING", "保持したoffline取得が必要です")

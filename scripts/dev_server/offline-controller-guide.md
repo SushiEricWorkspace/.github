@@ -619,3 +619,13 @@ packetの元枠・C/全W・history・closeBinding・資源参照、handle/job/th
 write・flush/fsync・close・権限設定の例外で完了通知がない場合は、ファイル全bytesや記録番号が一致しても完了とは扱いません。実write bytesの不一致、準備packetや資源の変更、部分解放UNKNOWN、P再起動も保全して拒否します。引渡し途中の失敗後も元準備packet・原文・識別・資源・予約を保持し、自動解放・再close・旧handle操作・追加の記録I/Oは行いません。
 
 今回の単一期限は準備packetの引渡し前後・資源調停退出後と第56の正本照合から返却まで継承します。元close期限は変更しません。保証はPが観測した正常I/O完了であり、電源断時の永続性や観測後の外部不変を保証しません。通知前の部分公開、P再起動、保持枠再利用と公開recoverは後続です。ゲームDBの種類や保存契約への前提は追加しません。
+
+## 最初Wのhandle解放不明の内部観測（第59スライス）
+
+`RuntimeControl._offline_observe_worker_release_failure(token, operation_id=..., open_operation_id=..., release_operation_id=..., deadline=...)`は、同じPでCの正常解放が正本記録済み、最初Wのhandle解放が例外となった場合だけを照合記録します。元open/解放とは別の観測IDを指定します。`OFFLINE_RELEASE_UNKNOWN`の`source`は元Cの正常解放hashと全Wの資源別進捗を区別し、`terminatesOriginal=False`を返します。新しい観測操作のCOMPLETEDは観測記録だけで、元openはPENDING・pending1・元予約保持のままです。CLOSED・start許可・正常解放への変更を意味しません。
+
+全保持群・資源値・元意図原文・固定row・期待進捗とpacket/callbackを、W解放作用前に一度固定します。最初Wのclose例外だけをlexicalな発生証拠として保持し、UNKNOWNを可変slotから正常解放へ読み替えません。元process/pipe/creation_resources、native/adapter/本人callback、全handle/job/thread/FD/buffer、C/W生成・終了/解放原文とhistory/latestを同じ基準へ比較します。P再起動、pipe段階、2件目以降W、未発生の例外、別object/原文/進捗は保全して拒否します。
+
+今回の単一期限で、P本人観測をwrite前に行います。write内は既存_reservedと元意図原文・固定row・保持値の純比較、新しい観測INSERTだけです。正常renewのexpiresは固定値から除き、現在の_tokenで有効性を確認します。最終readと資源調停退出後は純比較・期限確認だけで返却し、その後の外部変更は検出できない残余窓です。記録前の失効では観測をcommitせず、commit後の失効では観測正本と元資源・原文・予約を維持して正常返却を拒否します。
+
+旧PID/group/handleの再解決・再poll/再close、pipe追加解放、元Data API再送・局所記録I/Oは行いません。局所write再同期の選択肢1（明示recoverの新しい同期完了を元write成功と区別した別証拠へ結ぶ）は2026-11-20にユーザーが許可済みです。次スライスで実装し、本スライスには含めません。本スライスでは同期作用やpacket完成扱いを追加せず、第58の保全/拒否を維持します。部分解放の残りの段階・P再起動の追加復旧、保持枠再利用・公開recover・#54 snapshot/restoreは後続です。固定Mod/Data契約とゲームDBへの前提は変更しません。
