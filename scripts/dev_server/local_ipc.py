@@ -41,13 +41,18 @@ def make_private(path: Path, *, directory: bool = False, executable: bool = Fals
         require_private(path, directory=directory, executable=executable)
 
 
-def require_private(path: Path, *, directory: bool = False, executable: bool = False) -> None:
+def require_private(path: Path, *, directory: bool = False, executable: bool = False, fd=None) -> None:
+    """fd指定時は同じ保持fileの権限を検査し、pathはリンク検査に使う。"""
     plain_path(path)
     if os.name == "nt":
         from .windows_security import require_private as check
-        check(path=path)
+        if fd is None:
+            check(path=path)
+        else:
+            import msvcrt
+            check(handle=msvcrt.get_osfhandle(fd))
     else:
-        info = path.lstat()
+        info = path.lstat() if fd is None else os.fstat(fd)
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != (0o700 if directory or executable else 0o600):
             raise PermissionError("管理資源は所有者限定の権限にしてください")
 

@@ -221,8 +221,8 @@ class RuntimeControlTests(RegistryFixture, unittest.TestCase):
     def start(self, operation="start-01"):
         return self.command("start", dict(self.token, timeoutSeconds=2), operation)
 
-    def stop(self, operation="stop-01"):
-        return self.command("stop", dict(self.token, timeoutSeconds=2), operation)
+    def stop(self, operation="stop-01", *, timeout=2):
+        return self.command("stop", dict(self.token, timeoutSeconds=timeout), operation)
 
     def state(self):
         with self.registry.transaction(read_only=True) as connection:

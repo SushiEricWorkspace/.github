@@ -4,10 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 import json
 import threading
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from . import offline_control
+from . import offline_control, runtime_control
 from . import test_offline_worker_release as worker_tests
 from .build_inputs import digest
 from .registry import RegistryError
@@ -201,7 +203,8 @@ class ReleaseObservationTests(unittest.TestCase):
     def race(self,renew=False):
         self.failed();original=self.c._verify_close_binding
         def observed(deadline):original(deadline);self.commit(renew)
-        with patch.object(self.c,'_verify_close_binding',side_effect=observed):
+        with patch.object(self.c,'_verify_close_binding',side_effect=observed), \
+             patch.object(runtime_control,'time',SimpleNamespace(monotonic=lambda:self.f.clock,sleep=time.sleep)):
             if renew:
                 try:self.observe()
                 except RegistryError as error:self.fail('正常renewを拒否しました: '+error.code)

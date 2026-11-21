@@ -70,7 +70,7 @@ def configure(test, runtime, managed, session, candidate, peer):
     runtime.process_adapter=peer.adapter
     managed.transport.native=peer.native
     test.enterContext(patch.object(offline_process,'os',SimpleNamespace(getpid=lambda:parent['pid'],environ=processes.os.environ)))
-    def write(path,value,*,observe=None):
+    def write(path,value,*,observe=None,retain=None):
         data=target.canonical(value)
         path.write_bytes(data)
         if observe is not None:observe(data)

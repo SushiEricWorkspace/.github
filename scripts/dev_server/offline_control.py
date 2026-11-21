@@ -2,12 +2,16 @@
 
 from copy import deepcopy
 import json
+import os
+import stat
+import sys
+import threading
 import time
 import uuid
 
 from .build_inputs import canonical, digest, regular_bytes
 from .mod_control_runtime import _closed_writers
-from .local_ipc import make_private, plain_path
+from .local_ipc import make_private, plain_path, require_private
 from .snapshot_data import portable_properties, properties
 from .mod_control_startup import _admission, _change
 from .mod_control_wire import _canonical_uuid, _hash, _json, descriptor_path
@@ -41,6 +45,7 @@ class _OfflineOpen:
         self.start_records = {}
         self.close_recoveries = {}
         self.close_preparations = {}
+        self.close_synchronizations = {}
         self.release_failures = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
@@ -1036,16 +1041,27 @@ class _OfflineOpen:
             raw = canonical(result)
 
             record_raw = canonical(controller.record)
+            sync_request = canonical(dict(token=token,openOperationId=opened['operationId'],
+                closeOperationId=operation_id,terminationSha256=digest(raw)))
             recorded = False
+            synchronized = False
+            file = pin = identity = pin_fd = None
+            closed = False
+            sync_started = False
+            sync_lock = threading.Lock()
+            sync_raw = None
+            path = controller.diagnostics / f'creation-{controller.record_number:02d}.json'
 
             def finished():
                 require(controller.termination_response == canonical(result) and controller.record.get('termination') == result,
                         'PROOF_MISMATCH', '終端結果の原文と局所記録が一致しません')
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端結果の照合後に期限を超過しました')
 
-            def recover_memory():
-                require(recorded and self.close_preparations.get(key) is preparation
-                        and self.close_recoveries.get(key) is packet
+            def recover_memory(*, before_sync=False, allow_synchronized=False):
+                require((recorded or (synchronized and allow_synchronized) or before_sync)
+                        and self.close_preparations.get(key) is preparation
+                        and (self.close_recoveries.get(key) is packet
+                             or (before_sync and key not in self.close_recoveries))
                         and slot['latest'] is latest
                         and slot['snapshot'] is snapshot and snapshot == release_snapshot
                         and all(slot[name] is value for name,value in zip(
@@ -1060,7 +1076,8 @@ class _OfflineOpen:
                              getattr(process, 'process', None), getattr(pipe, 'incoming', None)), original))
                             for (actor,process,pipe,_),original in zip(actors, objects))
                         and resource_values() == resource_snapshot
-                        and tuple(actor.record_number for actor,_,_,_ in actors) == record_numbers
+                        and tuple(actor.record_number + (1 if before_sync and actor is controller else 0)
+                                  for actor,_,_,_ in actors) == record_numbers
                         and {name:value for name,value in controller.close_binding.items()
                              if name not in {'process', 'pipe'}} == close_values
                         and controller.close_binding['process'] is controller.process
@@ -1085,13 +1102,104 @@ class _OfflineOpen:
                 nonlocal recorded
                 require(not recorded and data == record_raw,
                         'PROOF_MISMATCH', '実write原文が作用前に固定した記録と一致しません')
+                if pin is not None and time.monotonic() < deadline:
+                    pin.close()
                 recorded = True
                 publish(token)
 
+            def retain(handle, stage):
+                nonlocal file, pin, identity, pin_fd, closed, synchronization
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '元記録実体の保持期限を超過しました')
+                if stage == 'opened':
+                    require(file is None and pin is None, 'PROOF_MISMATCH', '元記録の実体は一度だけ保持します')
+                    file = handle
+                    info = os.fstat(handle.fileno())
+                    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_ino != 0
+                            and not getattr(info, 'st_file_attributes', 0) & 0x400,
+                            'UNSUPPORTED_FILE', '元記録は識別できる独立した通常ファイルに限定します')
+                    identity = info.st_dev, info.st_ino
+                    require(time.monotonic() < deadline, 'STOP_TIMEOUT', '元記録pinの取得前に期限を超過しました')
+                    pin = os.fdopen(os.dup(handle.fileno()), 'r+b', buffering=0)
+                    pin_fd = pin.fileno()
+                    synchronization = packet, pin, file, identity, synchronize, sync_file, sync_memory, pin_fd, sync_lock
+                    self.close_synchronizations[key] = synchronization
+                else:
+                    require(file is handle, 'PROOF_MISMATCH', '元file objectが変更されました')
+                    if stage == 'closed':
+                        require(handle.closed, 'PROOF_MISMATCH', '元file closeの正常完了が必要です')
+                        closed = True
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '元記録の次作用前に期限を超過しました')
+
+            def sync_memory(request=sync_request):
+                require(request == sync_request, 'STALE_OPERATION', '元同期要求の固定bindingが一致しません')
+                require(self.close_synchronizations.get(key) is synchronization
+                        and pin is synchronization[1] and file is synchronization[2]
+                        and identity == synchronization[3] and closed and file.closed and not pin.closed
+                        and pin.fileno() == pin_fd == synchronization[7],
+                        'RECOVERY_REQUIRED', '同じPの元file close証拠と書込み前pinが必要です')
+                return recover_memory(before_sync=not synchronized, allow_synchronized=True)
+
+            def sync_file(limit):
+                sync_memory()
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '元記録パスの照合前に期限を超過しました')
+                plain_path(path)
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '元記録権限の照合前に期限を超過しました')
+                require_private(path, fd=pin_fd)
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '元記録pinの照合前に期限を超過しました')
+                info = os.fstat(pin.fileno())
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '元記録path実体の照合前に期限を超過しました')
+                current = path.lstat()
+                require((info.st_dev,info.st_ino) == identity == (current.st_dev,current.st_ino)
+                        and stat.S_ISREG(current.st_mode) and info.st_nlink == current.st_nlink == 1
+                        and not (getattr(info,'st_file_attributes',0) | getattr(current,'st_file_attributes',0)) & 0x400,
+                        'PROOF_MISMATCH', '元記録と同じ実体の肯定照合が必要です')
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '元記録の実読前に期限を超過しました')
+                pin.seek(0)
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '元記録bytesの実読前に期限を超過しました')
+                data = pin.read(len(record_raw) + 1)
+                require(data == record_raw, 'PROOF_MISMATCH', '元事前固定bytesと実読原文が一致しません')
+                sync_memory()
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '元記録の実読後に期限を超過しました')
+
+            def synchronize(current_token, recovery_id, limit, verify):
+                nonlocal sync_started, synchronized, sync_raw
+                sync_memory(canonical(dict(token=current_token,openOperationId=opened['operationId'],
+                    closeOperationId=operation_id,terminationSha256=digest(raw))))
+                if synchronized:
+                    require(json.loads(sync_raw)['operationId'] == recovery_id,
+                            'OPERATION_CONFLICT', '新しい同期は元の明示recover IDに限定します')
+                    return sync_raw
+                require(not recorded and not sync_started, 'RECOVERY_REQUIRED', '新しい同期は一度だけ開始します')
+                sync_file(limit)
+                verify()
+                sync_file(limit)
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '新しいflush前に期限を超過しました')
+                sync_started = True
+                pin.flush()
+                verify()
+                sync_file(limit)
+                require(time.monotonic() < limit, 'STOP_TIMEOUT', '新しいfsync前に期限を超過しました')
+                os.fsync(pin.fileno())
+                if sys.platform == 'darwin':
+                    import fcntl
+                    require(time.monotonic() < limit, 'STOP_TIMEOUT', '新しい完全同期前に期限を超過しました')
+                    fcntl.fcntl(pin.fileno(), fcntl.F_FULLFSYNC)
+                sync_file(limit)
+                sync_raw = canonical(dict(operationId=recovery_id, recordSha256=digest(record_raw),
+                    fileDevice=identity[0],fileId=identity[1],originalWriteCompleted=False,
+                    synchronizationCompleted=True))
+                synchronized = True
+                controller.record_number += 1
+                self.close_recoveries[key] = packet
+                recover_memory(allow_synchronized=True)
+                return sync_raw
+
+            synchronization = packet, pin, file, identity, synchronize, sync_file, sync_memory, pin_fd, sync_lock
             preparation = packet, publish
             self.close_preparations[key] = preparation
-            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端局所記録の開始前に期限を超過しました')
-            controller._record(observe=written)
+            with sync_lock:
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '終端局所記録の開始前に期限を超過しました')
+                controller._record(observe=written, retain=retain)
 
             recover_memory()
             finished()
@@ -1149,6 +1257,88 @@ class _OfflineOpen:
         require(time.monotonic() < deadline, 'STOP_TIMEOUT', '資源調停退出後に期限を超過しました')
         return self.recover_pending_close(token, operation_id=operation_id, open_operation_id=open_operation_id,
             close_operation_id=close_operation_id, termination_sha256=termination_sha256, deadline=deadline)
+
+    def recover_synchronized_close(self, token, *, operation_id, open_operation_id, close_operation_id,
+                                   termination_sha256, deadline):
+        """元close済み記録の新しい同期を別証拠とし、元意図CASで明示終端する。
+
+        書込み前pin・全bytes一致・現在権限が必要。失敗時は元資源とpinを保全し再同期しない。
+        deadlineは今回要求の絶対期限で、元close期限やMod/Data契約を変更しない。
+        """
+        token = deepcopy(token)
+        fields(token, TOKEN)
+        for value,name in ((operation_id,'operationId'),(open_operation_id,'openOperationId'),
+                           (close_operation_id,'closeOperationId')):
+            identifier(value,name)
+        _hash(termination_sha256)
+        require(len({operation_id,open_operation_id,close_operation_id}) == 3,
+                'OPERATION_CONFLICT', '元open/closeと別のrecover IDが必要です')
+        key = token['instanceId'],open_operation_id
+        original = self.close_synchronizations.get(key)
+        require(original is not None, 'RECOVERY_REQUIRED', '同じPの書込み前pinが必要です')
+        packet,pin,file,identity,synchronize,read,retained,pin_fd,sync_lock = original
+        raw,slot,memory = packet
+        require(digest(raw) == termination_sha256 and json.loads(raw)['operationId'] == close_operation_id,
+                'PROOF_MISMATCH', '元close IDと終端hashが一致しません')
+        request = canonical(dict(token=token,operationId=operation_id,openOperationId=open_operation_id,
+                                 closeOperationId=close_operation_id,terminationSha256=termination_sha256))
+        source_request = canonical(dict(token=token,openOperationId=open_operation_id,
+                                        closeOperationId=close_operation_id,terminationSha256=termination_sha256))
+
+        def checked():
+            require(self.close_synchronizations.get(key) is original, 'PROOF_MISMATCH', '元pin保持枠が変更されました')
+            intent = retained(source_request)
+            require(canonical(dict(token=token,operationId=operation_id,openOperationId=open_operation_id,
+                                   closeOperationId=close_operation_id,terminationSha256=termination_sha256)) == request,
+                    'PROOF_MISMATCH', '明示同期要求の固定原文が変更されました')
+            require(all(key[0] not in mapping or mapping[key[0]] is value for mapping,value in (
+                (self.controllers,slot['controller']),(self.workers,slot['latest']),(self.history,slot['history']))),
+                'STALE_OPERATION', '元instanceの保持枠が別objectに置き換わりました')
+            require(time.monotonic() < deadline, 'STOP_TIMEOUT', '明示同期recoverの期限を超過しました')
+            return intent
+
+        def verify():
+            checked()
+            self._terminal_resources(slot,deadline)
+            checked()
+            with self.runtime._transaction(key[0],read_only=True) as connection:
+                for table in ('operations','writer_operations','reference_operations','snapshot_operations'):
+                    checked()
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?',(operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT', '明示同期IDが別の操作で使用されています')
+                checked()
+                old = connection.execute('SELECT * FROM runtime_operations WHERE id=?',(operation_id,)).fetchone()
+                if old is None:
+                    self._reserved(connection,token,open_operation_id,slot['opened']['requestHash'],slot['saved']['binding'])
+                    checked()
+                    self.runtime._binding(self.registry._instance(connection,key[0]),slot['row'])
+                    checked()
+                    saved = connection.execute('SELECT response FROM runtime_operations WHERE id=?',(open_operation_id,)).fetchone()[0]
+                    require(saved == checked(), 'STALE_OPERATION', '元終端意図の原文が変更されました')
+                else:
+                    require(old['command'] == 'offline-recover-synchronized-close' and old['instance'] == key[0],
+                            'OPERATION_CONFLICT', 'recover IDが別の操作に使用されています')
+                    self._terminal_state(connection,token,slot,deadline)
+                checked()
+            checked()
+
+        require(sync_lock.acquire(blocking=False), 'RECOVERY_REQUIRED', '同じ元記録の明示同期recoverが進行中です')
+        try:
+            checked()
+            with self.registry.resource_use(),self.runtime._lock_wait(deadline):
+                verify()
+                evidence = synchronize(token,operation_id,deadline,verify)
+                checked()
+                result,finished = self.recover_pending_close(token,operation_id=operation_id,
+                    open_operation_id=open_operation_id,close_operation_id=close_operation_id,
+                    termination_sha256=termination_sha256,deadline=deadline,_synchronization=(evidence,checked))
+            checked()
+            read(deadline)
+            finished()
+            checked()
+            return result
+        finally:
+            sync_lock.release()
 
     def recover_close(self, token, *, operation_id, open_operation_id, close_operation_id, termination_sha256, deadline):
         """同じPの確定済みcloseを新しい照合要求でreadbackする。解放・再送・再採用は行わない。
@@ -1216,7 +1406,7 @@ class _OfflineOpen:
         return returned
 
     def recover_pending_close(self, token, *, operation_id, open_operation_id, close_operation_id,
-                              termination_sha256, deadline):
+                              termination_sha256, deadline, _synchronization=None):
         """同じPの元終端意図と解放済みpacketから未commitの終端を確定する。
 
         新しい照合要求のdeadlineを使い、元closeの期限・資源・原文を維持する。
@@ -1234,21 +1424,31 @@ class _OfflineOpen:
         packet = self.close_recoveries.get((instance, open_operation_id))
         require(packet is not None, 'RECOVERY_REQUIRED', '同じPが保持する元終端packetが必要です')
         raw, slot, memory = packet
-        intent = memory()
+        options = {} if _synchronization is None else {'allow_synchronized':True}
+        intent = memory(**options)
         require(isinstance(intent, str) and digest(raw) == termination_sha256
                 and json.loads(raw)['operationId'] == close_operation_id,
                 'PROOF_MISMATCH', '元終端意図・close ID・原文hashが一致しません')
-        fingerprint = digest(canonical(dict(token=token, openOperationId=open_operation_id,
-            closeOperationId=close_operation_id, terminationSha256=termination_sha256)))
+        request = dict(token=token, openOperationId=open_operation_id,
+            closeOperationId=close_operation_id, terminationSha256=termination_sha256)
         result = dict(status='OFFLINE_CLOSE_TERMINATED', operationId=operation_id,
             openOperationId=open_operation_id, closeOperationId=close_operation_id,
             instanceId=instance, terminationSha256=termination_sha256, original=json.loads(raw))
+        command = 'offline-recover-pending-close'
+        if _synchronization is not None:
+            evidence,verify_synchronization = _synchronization
+            command = 'offline-recover-synchronized-close'
+            request['synchronizationSha256'] = digest(evidence)
+            result.update(status='OFFLINE_CLOSE_SYNCHRONIZED',recordSynchronization=json.loads(evidence))
+        fingerprint = digest(canonical(request))
         encoded = json.dumps(result)
         response = canonical(result)
         returned = None
 
         def checked():
-            require(memory() == intent and canonical(result) == response
+            if _synchronization is not None:
+                verify_synchronization()
+            require(memory(**options) == intent and canonical(result) == response
                     and (returned is None or canonical(returned) == response),
                     'PROOF_MISMATCH', '元終端packetと今回の固定結果が一致しません')
             require(all(instance not in mapping or mapping[instance] is original
@@ -1292,13 +1492,13 @@ class _OfflineOpen:
                     connection.execute('UPDATE instances SET pending=0 WHERE id=?', (instance,))
                     checked()
                     connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
-                        (operation_id, fingerprint, 'offline-recover-pending-close', instance, 'COMPLETED', encoded))
+                        (operation_id, fingerprint, command, instance, 'COMPLETED', encoded))
                     checked()
                     self.workers.pop(instance, None)
                     self.history.pop(instance, None)
                     self.controllers.pop(instance, None)
                 else:
-                    require(old['command'] == 'offline-recover-pending-close' and old['instance'] == instance
+                    require(old['command'] == command and old['instance'] == instance
                             and old['fingerprint'] == fingerprint and old['status'] == 'COMPLETED' and old['response'] == encoded,
                             'OPERATION_CONFLICT', '終端照合要求の固定入力・結果が一致しません')
                 checked()
@@ -1308,7 +1508,7 @@ class _OfflineOpen:
             returned = deepcopy(result)
             finished()
         finished()
-        return returned
+        return returned if _synchronization is None else (returned,finished)
 
     def check_closed_ready(self, token, *, open_operation_id, ready, deadline):
         """独立明示Readyを保持した元offline終端証拠と照合する。

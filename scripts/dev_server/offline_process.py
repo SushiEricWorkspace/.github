@@ -92,7 +92,7 @@ class OfflineProcess:
         for name in ('assignedResponseSha256','assignedAcknowledgedSha256','completionResponseSha256','completionAcknowledgedSha256'):
             self.record.pop(name, None)
 
-    def _record(self, *, observe=None):
+    def _record(self, *, observe=None, retain=None):
         path = self.diagnostics / f'creation-{self.record_number:02d}.json'
         if observe is None:
             write_json(path, self.record)
@@ -101,7 +101,8 @@ class OfflineProcess:
             def written(data):
                 self.record_number += 1
                 observe(data)
-            write_json(path, self.record, observe=written)
+            options = {} if retain is None else {'retain':retain}
+            write_json(path, self.record, observe=written, **options)
 
     def verify(self):
         """private I/O前にPと所有child、Wの場合は元Cも再照合する。"""
