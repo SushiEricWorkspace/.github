@@ -1,5 +1,5 @@
 """固定bundleの起動/停止。世代構築はGenerationControlで行う。"""
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 import errno
 import json
@@ -26,11 +26,27 @@ TOKEN = {"instanceId", "leaseId", "epoch", "expectedGeneration"}
 def write_json(path: Path, value: dict, *, observe=None, retain=None) -> None:
     """新規記録だけを作る。observeは全I/O正常完了後に実write原文を受け取る。
 
-    retainには実write前と各I/O正常完了後に同じfileと段階名を渡す。
+    retainには実write前とI/O正常完了を同じfileと段階名で通知する。
+    closedはflush通知まで正常完了した場合だけ、本文の例外時もclose正常復帰を通知する。
     通知の例外でも作成済み証跡を上書き・再試行しない。既定の戻り値はNone。
     """
     plain_path(path)
-    with path.open("x+b" if retain is not None else "xb") as handle:
+    with ExitStack() as cleanup:
+        if retain is None:
+            handle = cleanup.enter_context(path.open("xb"))
+        else:
+            manager = path.open("x+b")
+            close = manager.__exit__
+            handle = manager.__enter__()
+            flushed = False
+
+            def closed(kind, error, trace):
+                result = close(kind, error, trace)
+                if flushed:
+                    retain(handle, 'closed')
+                return result
+
+            cleanup.push(closed)
         data = canonical(value)
         if retain is not None:
             retain(handle, 'opened')
@@ -40,11 +56,10 @@ def write_json(path: Path, value: dict, *, observe=None, retain=None) -> None:
         handle.flush()
         if retain is not None:
             retain(handle, 'flushed')
+            flushed = True
         os.fsync(handle.fileno())
         if retain is not None:
             retain(handle, 'synced')
-    if retain is not None:
-        retain(handle, 'closed')
     make_private(path)
     if observe is not None:
         observe(data)
