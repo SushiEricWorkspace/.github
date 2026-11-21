@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import partial
 import errno
 import json
 import sys
@@ -25,6 +26,7 @@ class OfflineConcurrencyTests(unittest.TestCase):
         self.f=f
         self.generation=f.prepare()
         f.start()
+        f.stop=partial(f.stop,timeout=30)
         f.stop()
         self.runtime=f.registry.runtime
         self.assertIs(self.runtime._transaction.__func__,runtime_control.RuntimeControl._transaction)

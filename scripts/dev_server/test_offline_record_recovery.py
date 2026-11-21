@@ -104,11 +104,16 @@ class RecordedCloseTests(unittest.TestCase):
         self.runtime,self.offline,self.c,self.f=self.case.runtime,self.case.offline,self.case.c,self.case.f
         self.token,self.key=self.case.token,self.case.key
         self.records=[]
-        def write(path,value,*,observe=None):
+        def write(path,value,*,observe=None,retain=None):
             self.records.append(path)
-            runtime_control.write_json(path,value,observe=observe)
+            runtime_control.write_json(path,value,observe=observe,retain=retain)
         self.enterContext(patch.object(offline_process,'write_json',side_effect=write))
         self.enterContext(patch.object(runtime_control,'make_private'))
+        def close_pins():
+            for frame in self.offline.close_synchronizations.values():
+                if frame[1] is not None and not frame[1].closed:
+                    frame[1].close()
+        self.addCleanup(close_pins)
 
     def recover(self,**changes):
         args=dict(operation_id='recover-recorded-close',open_operation_id=self.key[1],close_operation_id=self.f.close_operation,
@@ -220,7 +225,7 @@ class RecordedCloseTests(unittest.TestCase):
         original=Path.open
         def opened(path,*args,**options):
             file=original(path,*args,**options)
-            return _File(file,'write') if path==self.case.path and args==('xb',) else file
+            return _File(file,'write') if path==self.case.path and args in (('xb',),('x+b',)) else file
         with self.no_terminal_write(),patch.object(Path,'open',opened):
             with self.assertRaises(OSError):self.case.base.finish()
             with self.assertRaises(RegistryError):self.recover()

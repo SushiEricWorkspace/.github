@@ -23,17 +23,28 @@ from .mod_control_startup import _admission, _change, _Startup
 TOKEN = {"instanceId", "leaseId", "epoch", "expectedGeneration"}
 
 
-def write_json(path: Path, value: dict, *, observe=None) -> None:
+def write_json(path: Path, value: dict, *, observe=None, retain=None) -> None:
     """新規記録だけを作る。observeは全I/O正常完了後に実write原文を受け取る。
 
+    retainには実write前と各I/O正常完了後に同じfileと段階名を渡す。
     通知の例外でも作成済み証跡を上書き・再試行しない。既定の戻り値はNone。
     """
     plain_path(path)
-    with path.open("xb") as handle:
+    with path.open("x+b" if retain is not None else "xb") as handle:
         data = canonical(value)
+        if retain is not None:
+            retain(handle, 'opened')
         handle.write(data)
+        if retain is not None:
+            retain(handle, 'written')
         handle.flush()
+        if retain is not None:
+            retain(handle, 'flushed')
         os.fsync(handle.fileno())
+        if retain is not None:
+            retain(handle, 'synced')
+    if retain is not None:
+        retain(handle, 'closed')
     make_private(path)
     if observe is not None:
         observe(data)
@@ -142,6 +153,14 @@ class RuntimeControl:
         require(self._offline is not None, 'RECOVERY_REQUIRED', '元offline保持枠が必要です')
         return self._offline.recover_recorded_close(token, operation_id=operation_id, open_operation_id=open_operation_id,
             close_operation_id=close_operation_id, termination_sha256=termination_sha256, deadline=deadline)
+
+    def _offline_recover_synchronized_close(self, token, *, operation_id, open_operation_id, close_operation_id,
+                                           termination_sha256, deadline):
+        """元file close済みの局所記録を明示同期し、元write成功とは別証拠で終端する。"""
+        require(self._offline is not None, 'RECOVERY_REQUIRED', '元offline保持枠が必要です')
+        return self._offline.recover_synchronized_close(token, operation_id=operation_id,
+            open_operation_id=open_operation_id, close_operation_id=close_operation_id,
+            termination_sha256=termination_sha256, deadline=deadline)
 
     def _offline_read_ready_original(self, token, *, open_operation_id, ready, deadline):
         """現在Ready原文と元CLOSED/終端の一致を返す。chain検証とstart受付は後続で行う。"""

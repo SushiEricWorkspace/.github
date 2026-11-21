@@ -629,3 +629,17 @@ write・flush/fsync・close・権限設定の例外で完了通知がない場�
 今回の単一期限で、P本人観測をwrite前に行います。write内は既存_reservedと元意図原文・固定row・保持値の純比較、新しい観測INSERTだけです。正常renewのexpiresは固定値から除き、現在の_tokenで有効性を確認します。最終readと資源調停退出後は純比較・期限確認だけで返却し、その後の外部変更は検出できない残余窓です。記録前の失効では観測をcommitせず、commit後の失効では観測正本と元資源・原文・予約を維持して正常返却を拒否します。
 
 旧PID/group/handleの再解決・再poll/再close、pipe追加解放、元Data API再送・局所記録I/Oは行いません。局所write再同期の選択肢1（明示recoverの新しい同期完了を元write成功と区別した別証拠へ結ぶ）は2026-11-20にユーザーが許可済みです。次スライスで実装し、本スライスには含めません。本スライスでは同期作用やpacket完成扱いを追加せず、第58の保全/拒否を維持します。部分解放の残りの段階・P再起動の追加復旧、保持枠再利用・公開recover・#54 snapshot/restoreは後続です。固定Mod/Data契約とゲームDBへの前提は変更しません。
+
+## 元close済み局所記録の明示同期（第60スライス）
+
+2026-11-20に許可された再同期の最小ケースとして、`RuntimeControl._offline_recover_synchronized_close(token, operation_id=..., open_operation_id=..., close_operation_id=..., termination_sha256=..., deadline=...)`を追加しました。第59スライスの範囲外だった再同期の一部を本スライスで実装しています。同じPが元write・flush/fsync・元file closeの正常完了を観測し、権限設定の例外で完了通知を失った場合が対象です。部分write・元fsync/close不明・P再起動は保全して拒否します。
+
+元C/全Wの保持群・終端意図/期待record bytes・packet/callbackは_record前から保持し、新しい局所fileは元作成直後・実write前に元file objectからpinを取得します。元token/open/close/hashの要求canonicalも_record前に固定し、今回の要求を本人観測前から最終gateまで同じ基準へ比較します。元実体のdevice/file IDとpin object/FDを固定し、再openしたファイルを基準に採用しません。明示recoverでは保持pinから期待bytes長+1まで読み、全bytes一致・同じpath実体・独立通常file・現在の所有者限定権限と元Registry正本を照合した後だけ新しいflush/fsync（macOSは完全同期も）を行います。上書き・不足追記・権限の再設定は行いません。
+
+元_recordも同じframe専用lockを取得し、取得後に元期限を確認してから元write・権限設定・番号進行・written通知までを実行します。file close済みでも元writerが進行中なら、明示recoverはRECOVERY_REQUIREDとなり、同期・pin操作・終端DMLを開始しません。元writerが正常完了した場合は元の通知と通常終端へ進み、元pinを正常解放します。例外終了した場合だけlock解放後に既存の元close証拠・固定番号・原文を照合でき、条件を満たす元権限設定例外を新しい同期へ結べます。recorded=Falseだけで進行中の元writerを失敗扱いにしません。
+
+新しい同期は並行要求を含めて一度だけです。元write前に固定したframe専用lockを、明示recoverの最初の照合からpinのseek/read・同期・終端CAS・最終読取まで保持します。同じframeへの競合要求は、同一ID・異なるIDとも待たずにRECOVERY_REQUIREDで保全拒否し、新しい同期やpin操作へ進みません。file I/Oを囲む長いRegistry writeは追加しません。失敗・期限到達・結果不明時はpinと元資源/原文/予約を保持し、自動再同期・元記録の再書込・C/W再close・Data再送をしません。同期が正常完了した場合だけ元記録番号を一段進め、`recordSynchronization`に今回のID・元record hash・元実体ID・`originalWriteCompleted=False`と`synchronizationCompleted=True`を固定します。元write成功のflagは立てず、第58の実write完了recoverへ読み替えません。
+
+同じ元packet/callbackと新しい同期証拠を短いRegistry writeの純比較へ合成し、元offline-openのCOMPLETED・元予約終端・pending解除と新しい`offline-recover-synchronized-close/COMPLETED`を同一writeで確定して`OFFLINE_CLOSE_SYNCHRONIZED`を返します。正常renewでexpiresが変わっても元期限・今回期限を延長しません。元の正常write完了時は今回取得したpinを期限内に正常解放し、失敗時又は明示同期後のpinは同じPの証拠として保持します。
+
+最後のRegistry/native観測と資源調停退出の後、同じpinの原文/実体/権限を最後に照合し、以後は保持値の純比較と同一期限だけを確認して返します。権限はrequire_privateのfd指定を使い、Windowsは同じ保持HANDLEの既存GetSecurityInfo、macOSは同じFDのfstatで確認します。パスの権限だけを別実体から採用しません。fd未指定の既存呼出しは従来のパス検査を維持します。最後の実読後の変更は検出できない残余窓です。commit後に不一致・期限到達した場合も、正当な終端正本と元証拠・pinを保全して正常返却を拒否します。電源断耐久性、残る失敗段階・P再起動・公開recover・#54 restoreは未確認又は後続です。通常start・固定Mod/Data・ゲームDBの契約は変更しません。
