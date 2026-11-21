@@ -15,6 +15,9 @@ class _File:
     def __init__(self, file, stage):
         self.file,self.stage=file,stage
 
+    @property
+    def closed(self):return self.file.closed
+
     def __enter__(self):
         self.file.__enter__()
         return self

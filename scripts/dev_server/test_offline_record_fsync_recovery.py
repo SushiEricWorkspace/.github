@@ -9,15 +9,10 @@ import unittest
 from unittest.mock import patch
 
 from . import local_ipc, offline_control, runtime_control
-from . import test_offline_record_recovery as recorded
 from . import test_offline_record_synchronization as synchronized
 from .build_inputs import canonical
 from .registry import RegistryError
-
-
-class _File(recorded._File):
-    @property
-    def closed(self):return self.file.closed
+from .test_offline_record_recovery import _File
 
 
 class FsyncRecoveryTests(unittest.TestCase):
@@ -72,10 +67,15 @@ class FsyncRecoveryTests(unittest.TestCase):
 
     def test_flush_unknown_with_full_bytes_does_not_start_sync(self):
         original=Path.open
+        record=self.c._record
+        def unobserved(*,observe=None,retain=None):
+            def retained(handle,stage):
+                if stage!='closed':retain(handle,stage)
+            return record(observe=observe,retain=retained)
         def opened(path,*args,**options):
             file=original(path,*args,**options)
             return _File(file,'flush') if path==self.path and args==('x+b',) else file
-        with patch.object(Path,'open',opened):
+        with patch.object(Path,'open',opened),patch.object(self.c,'_record',side_effect=unobserved):
             with self.assertRaisesRegex(OSError,'flush不明'):self.base.finish()
         self.capture()
         self.assertEqual(self.expected,self.path.read_bytes())
