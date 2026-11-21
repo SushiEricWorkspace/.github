@@ -650,3 +650,10 @@ write・flush/fsync・close・権限設定の例外で完了通知がない場�
 第60スライスの権限設定例外に加え、元write・flushと元file closeの正常復帰を同じwriterで肯定観測でき、元fsyncだけが不明の場合を同じ内部recoverへ接続する。元作成時のpin・期待bytes・同一実体・権限・全保持bindingを再照合し、新しい同期完了を元write成功とは別の証拠として記録する。
 
 元writerと並行recoverは同じframe lockで排他し、新しい同期は並行要求を含め一度だけ開始する。元write/flush又はcloseの完了通知がない場合、全bytesやclosed属性だけでは受理しない。上書き・追記・再close・Data再送は行わず、不明時は元資源・原文・予約を保持する。通常writerの保存・通知順と既存公開start/stopは維持する。
+
+
+### 元flush不明と元buffered closeの肯定証拠（第62スライス）
+
+第61の対象を、元write通知は正常だが明示flushが例外となり、同じbuffered streamの元closeが正常復帰した場合へ拡張する。元exitは作用前の同じ参照を使い、開始前に未closeであることとbufferのflushを含むcloseの正常復帰を観測する。全bytes・closed属性・FD番号だけから完成を推測しない。元write不明、事前closed、close例外又は肯定通知がない場合は保全拒否する。
+
+このclosed通知は明示flush/fsyncや元write全体の成功を意味しない。元writerが終了した後だけ、同じ元pin・期待bytes・実体・権限と全保持bindingを既存の明示recoverへ結び、新しい同期完了を別証拠として扱う。元writer/並行recoverのframe排他と同期一度だけを維持する。追加close・再close・元記録の上書き/不足追記・権限修復・Data再送は行わない。同期不明は原本・予約・資源を保持し自動再同期しない。

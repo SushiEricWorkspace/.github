@@ -27,7 +27,7 @@ def write_json(path: Path, value: dict, *, observe=None, retain=None) -> None:
     """新規記録だけを作る。observeは全I/O正常完了後に実write原文を受け取る。
 
     retainには実write前とI/O正常完了を同じfileと段階名で通知する。
-    closedはflush通知まで正常完了した場合だけ、本文の例外時もclose正常復帰を通知する。
+    closedはwrite通知後、未closeの同じstreamからbufferのflushを含むcloseが正常復帰した場合に通知する。
     通知の例外でも作成済み証跡を上書き・再試行しない。既定の戻り値はNone。
     """
     plain_path(path)
@@ -38,11 +38,12 @@ def write_json(path: Path, value: dict, *, observe=None, retain=None) -> None:
             manager = path.open("x+b")
             close = manager.__exit__
             handle = manager.__enter__()
-            flushed = False
+            written = False
 
             def closed(kind, error, trace):
+                closing = written and not handle.closed
                 result = close(kind, error, trace)
-                if flushed:
+                if closing:
                     retain(handle, 'closed')
                 return result
 
@@ -53,10 +54,10 @@ def write_json(path: Path, value: dict, *, observe=None, retain=None) -> None:
         handle.write(data)
         if retain is not None:
             retain(handle, 'written')
+            written = True
         handle.flush()
         if retain is not None:
             retain(handle, 'flushed')
-            flushed = True
         os.fsync(handle.fileno())
         if retain is not None:
             retain(handle, 'synced')
