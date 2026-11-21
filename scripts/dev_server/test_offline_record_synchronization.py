@@ -414,7 +414,13 @@ class SynchronizedCloseTests(unittest.TestCase):
         self.pending()
 
     def test_original_fsync_exception_cannot_be_replaced_by_matching_file(self):
-        with patch.object(runtime_control.os,'fsync',side_effect=OSError('元fsync不明')):
+        original=self.c._record
+        def unobserved(*,observe=None,retain=None):
+            def retained(handle,stage):
+                if stage!='closed':retain(handle,stage)
+            return original(observe=observe,retain=retained)
+        with patch.object(self.c,'_record',side_effect=unobserved), \
+             patch.object(runtime_control.os,'fsync',side_effect=OSError('元fsync不明')):
             with self.assertRaises(OSError):self.case.case.base.finish()
         self.frame=self.offline.close_synchronizations[self.key];self.expected=canonical(self.c.record)
         self.assertEqual(self.expected,self.path.read_bytes())

@@ -643,3 +643,10 @@ write・flush/fsync・close・権限設定の例外で完了通知がない場�
 同じ元packet/callbackと新しい同期証拠を短いRegistry writeの純比較へ合成し、元offline-openのCOMPLETED・元予約終端・pending解除と新しい`offline-recover-synchronized-close/COMPLETED`を同一writeで確定して`OFFLINE_CLOSE_SYNCHRONIZED`を返します。正常renewでexpiresが変わっても元期限・今回期限を延長しません。元の正常write完了時は今回取得したpinを期限内に正常解放し、失敗時又は明示同期後のpinは同じPの証拠として保持します。
 
 最後のRegistry/native観測と資源調停退出の後、同じpinの原文/実体/権限を最後に照合し、以後は保持値の純比較と同一期限だけを確認して返します。権限はrequire_privateのfd指定を使い、Windowsは同じ保持HANDLEの既存GetSecurityInfo、macOSは同じFDのfstatで確認します。パスの権限だけを別実体から採用しません。fd未指定の既存呼出しは従来のパス検査を維持します。最後の実読後の変更は検出できない残余窓です。commit後に不一致・期限到達した場合も、正当な終端正本と元証拠・pinを保全して正常返却を拒否します。電源断耐久性、残る失敗段階・P再起動・公開recover・#54 restoreは未確認又は後続です。通常start・固定Mod/Data・ゲームDBの契約は変更しません。
+
+
+### 元fsync不明の明示同期（第61スライス）
+
+第60スライスの権限設定例外に加え、元write・flushと元file closeの正常復帰を同じwriterで肯定観測でき、元fsyncだけが不明の場合を同じ内部recoverへ接続する。元作成時のpin・期待bytes・同一実体・権限・全保持bindingを再照合し、新しい同期完了を元write成功とは別の証拠として記録する。
+
+元writerと並行recoverは同じframe lockで排他し、新しい同期は並行要求を含め一度だけ開始する。元write/flush又はcloseの完了通知がない場合、全bytesやclosed属性だけでは受理しない。上書き・追記・再close・Data再送は行わず、不明時は元資源・原文・予約を保持する。通常writerの保存・通知順と既存公開start/stopは維持する。
