@@ -1168,11 +1168,15 @@ class _OfflineOpen:
                 if synchronized:
                     require(json.loads(sync_raw)['operationId'] == recovery_id,
                             'OPERATION_CONFLICT', '新しい同期は元の明示recover IDに限定します')
+                    sync_file(limit)
                     return sync_raw
                 require(not recorded and not sync_started, 'RECOVERY_REQUIRED', '新しい同期は一度だけ開始します')
                 sync_file(limit)
                 verify()
                 sync_file(limit)
+                completed = canonical(dict(operationId=recovery_id, recordSha256=digest(record_raw),
+                    fileDevice=identity[0],fileId=identity[1],originalWriteCompleted=False,
+                    synchronizationCompleted=True))
                 require(time.monotonic() < limit, 'STOP_TIMEOUT', '新しいflush前に期限を超過しました')
                 sync_started = True
                 pin.flush()
@@ -1184,14 +1188,13 @@ class _OfflineOpen:
                     import fcntl
                     require(time.monotonic() < limit, 'STOP_TIMEOUT', '新しい完全同期前に期限を超過しました')
                     fcntl.fcntl(pin.fileno(), fcntl.F_FULLFSYNC)
-                sync_file(limit)
-                sync_raw = canonical(dict(operationId=recovery_id, recordSha256=digest(record_raw),
-                    fileDevice=identity[0],fileId=identity[1],originalWriteCompleted=False,
-                    synchronizationCompleted=True))
+                sync_memory()
+                sync_raw = completed
                 synchronized = True
                 controller.record_number += 1
                 self.close_recoveries[key] = packet
                 recover_memory(allow_synchronized=True)
+                sync_file(limit)
                 return sync_raw
 
             synchronization = packet, pin, file, identity, synchronize, sync_file, sync_memory, pin_fd, sync_lock
