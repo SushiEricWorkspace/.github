@@ -667,3 +667,11 @@ write・flush/fsync・close・権限設定の例外で完了通知がない場�
 この正常復帰を保持する同じP・同じrecover IDからの明示照合は、新しい同期を繰り返さず、元pinの原文・実体・権限と全保持binding、元意図/正本を再照合して既存の短い終端CASへ進める。別IDは拒否し、元write成功へ読み替えない。今回要求の入口期限は延長せず、別の明示照合要求はその入口で受け取った期限を使う。同期作用自体の例外・正常復帰を保持できない場合は、ファイル全bytesや番号だけで補わず保全拒否し、自動再同期しない。
 
 元writerと並行recoverは従来と同じframe lockで排他し、cached証拠を使う場合も終端write前の実体照合を省かない。資源調停退出後の最後の実読まとまりと、その後の純比較/期限確認を維持する。最後の実読後の外部変更は残余窓であり、以後の不変や電源断耐久性は保証しない。元write/通知・元closeの残る不明段階、部分解放UNKNOWN・P再起動・公開recover・#54 snapshot/restoreは対象外とする。
+
+### 最初Wの元process close完了の独立観測（第64スライス）
+
+最初のWの元process closeで、Windowsの元process HANDLEとjobのclose、又はmacOSの元Popenのwaitがすべて正常復帰した事実を、その元呼出し内で保持する。保持する原文・資源参照・期待値は作用前に一度固定し、完了後の値や可変slotから基準を取り直さない。各native作用の直前には同じ元期限と元正本を再照合する。native作用自体の例外や完了通知の喪失は、番号・全bytes・終了PIDだけで補わない。
+
+元closeの正常復帰観測を保持した後、外側の返却を失って第59のhandle UNKNOWNとなった同じPは、内部入口`RuntimeControl._offline_observe_worker_close_completion`から新しい照合IDを記録できる。元packetの固定callback、同じ資源と正常復帰観測、元意図・有効token・固定rowを短いRegistry write内でも純比較し、`offline-observe-worker-close/COMPLETED`と`OFFLINE_WORKER_CLOSE_OBSERVED`を返す。正常renewのexpiresだけは固定列に含めず、今回の入口期限は延長しない。
+
+この結果はprocess資源群の正常close観測であり、元操作の成功、pipeの解放、全WのRELEASED又は元予約終端を意味しない。元offline-open PENDING・pending1・予約1、handle UNKNOWN・pipe NOT_STARTED、元C/W・原文・識別を保持する。同じ照合IDのreadbackは再closeせず、元解放操作の再実行も拒否する。失敗・期限到達・不一致では追加解放せず保全する。P再起動・真のnative close不明・残る解放段階と公開recoverは後続とし、通常start/stop、固定Mod/DataとゲームDBの契約は変更しない。最後の外部/Registry観測の後は保持値の純比較と期限確認のみで返し、観測以後の外部不変は保証しない。

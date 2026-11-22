@@ -215,13 +215,17 @@ if os.name == "nt":
                     raise ctypes.WinError(ctypes.get_last_error())
                 size *= 2
 
-        def close(self, verify=None):
+        def close(self, verify=None, observe=None):
+            """元process資源を閉じ、全close正常復帰後だけobserveへ通知する。"""
+            handle, job = self.handle, self.job
             if verify is not None:
                 verify()
-            _winapi.CloseHandle(self.handle)
+            _winapi.CloseHandle(handle)
             if verify is not None:
                 verify()
-            _check(kernel.CloseHandle(self.job))
+            _check(kernel.CloseHandle(job))
+            if observe is not None:
+                observe()
 
 else:
     class BsdInfo(ctypes.Structure):
@@ -369,10 +373,14 @@ else:
                     return result
                 size = count
 
-        def close(self, verify=None):
+        def close(self, verify=None, observe=None):
+            """元Popenを回収し、wait正常復帰後だけobserveへ通知する。"""
+            process = self.process
             if verify is not None:
                 verify()
-            self.process.wait(timeout=0)
+            process.wait(timeout=0)
+            if observe is not None:
+                observe()
 
 
 def recorded_members(creation: dict, nonce: str) -> list[int]:
