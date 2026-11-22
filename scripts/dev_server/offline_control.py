@@ -47,6 +47,7 @@ class _OfflineOpen:
         self.close_preparations = {}
         self.close_synchronizations = {}
         self.release_failures = {}
+        self.release_completions = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -575,6 +576,7 @@ class _OfflineOpen:
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W解放の固定row読取後に期限を超過しました')
                 connection.execute('UPDATE runtime_operations SET response=? WHERE id=?', (encoded, opened['operationId']))
             resources = [(worker.process, worker.pipe) for worker in workers]
+            closes = tuple(process.close for process, _ in resources)
             progress = {binding['operationId']:dict(handle='NOT_STARTED', pipe='NOT_STARTED') for binding in bindings}
             controller.worker_release = progress
 
@@ -609,9 +611,9 @@ class _OfflineOpen:
                         handle='UNKNOWN' if index==0 else 'NOT_STARTED',pipe='NOT_STARTED')
                         for index,binding in enumerate(bindings)]))
 
-                def memory(request):
+                def memory(request, *, require_failure=True, require_completion=False):
                     require(request==original_request,'STALE_OPERATION','元W解放要求の固定bindingが一致しません')
-                    require(failed and self.runtime._offline is self and self.release_failures.get(key) is packet
+                    require((failed or not require_failure) and self.runtime._offline is self and self.release_failures.get(key) is packet
                         and self.controllers.get(instance) is controller and self.workers.get(instance) is latest
                         and self.history.get(instance) is history and controller.worker_release is progress
                         and len(history or [])==len(history_refs)
@@ -629,6 +631,9 @@ class _OfflineOpen:
                         and values()==fixed_values
                         and self._release_snapshot(controller,workers,history or [])==snapshot,
                         'PROOF_MISMATCH', '元W解放失敗の作用前bindingと保持証拠が一致しません')
+                    if require_completion:
+                        require(completed and self.release_completions.get(key) is completion,
+                                'RECOVERY_REQUIRED', '同じPが保持する元process close正常完了が必要です')
 
                 def saved_failure(connection, current_token, request, limit):
                     memory(request)
@@ -645,6 +650,19 @@ class _OfflineOpen:
                     memory(request)
                 packet = facts, controller, memory, saved_failure
                 self.release_failures[key] = packet
+                completed = False
+                receipt = canonical(dict(sourceSha256=digest(facts), workerOperationId=bindings[0]['operationId'],
+                    workerExitSha256=bindings[0]['workerExitSha256'], processResourcesClosed=True, pipeReleased=False))
+
+                def observe_completion():
+                    nonlocal completed
+                    memory(original_request, require_failure=False)
+                    require(not completed and self.release_completions.get(key) is completion,
+                            'PROOF_MISMATCH', '元process close完了の保持先が変更されました')
+                    completed = True
+
+                completion = receipt, packet
+                self.release_completions[key] = completion
 
             def checked(connection):
                 _, current = self._owner_released(connection, token, controller, operation_id, deadline)
@@ -666,12 +684,20 @@ class _OfflineOpen:
                     checked(connection)
                 require(time.monotonic() < deadline, 'STOP_TIMEOUT', 'W資源解放前後に期限を超過しました')
 
-            for binding,(process,pipe) in zip(bindings,resources):
+            def releasing():
+                verify()
+                memory(original_request, require_failure=False)
+                require(time.monotonic() < deadline, 'STOP_TIMEOUT', '元process資源のclose前に期限を超過しました')
+
+            for binding,(process,pipe),close in zip(bindings,resources,closes):
                 state = progress[binding['operationId']]
                 verify()
                 state['handle'] = 'UNKNOWN'
                 try:
-                    process.close()
+                    if process is resources[0][0]:
+                        close(verify=releasing, observe=observe_completion)
+                    else:
+                        close()
                 except BaseException:
                     failed = process is resources[0][0]
                     raise
@@ -716,7 +742,8 @@ class _OfflineOpen:
             finished()
             return returned
 
-    def observe_worker_release_failure(self, token, *, operation_id, open_operation_id, release_operation_id, deadline):
+    def observe_worker_release_failure(self, token, *, operation_id, open_operation_id, release_operation_id, deadline,
+                                       _completion=False):
         """同じPの最初Wのhandle不明を照合記録する。解放・元終端・再採用は行わない。
 
         新しい照合IDのCOMPLETEDは観測結果だけで、元openはPENDINGと予約を維持する。
@@ -732,16 +759,25 @@ class _OfflineOpen:
         packet=self.release_failures.get((token['instanceId'],open_operation_id))
         require(packet is not None,'RECOVERY_REQUIRED','同じPの作用前W解放証拠が必要です')
         raw,controller,memory,saved=packet
+        completion=self.release_completions.get((token['instanceId'],open_operation_id)) if _completion else None
+        if _completion:
+            require(completion is not None and completion[1] is packet,
+                    'RECOVERY_REQUIRED', '元W解放packetと同じclose完了証拠が必要です')
+            receipt,_=completion
         facts=json.loads(raw)
         request=canonical(dict(token=token,openOperationId=open_operation_id,releaseOperationId=release_operation_id))
         fingerprint=digest(request)
         result=dict(status='OFFLINE_RELEASE_UNKNOWN',operationId=operation_id,source=facts,terminatesOriginal=False)
+        command='offline-observe-worker-release'
+        if _completion:
+            result.update(status='OFFLINE_WORKER_CLOSE_OBSERVED',processRelease=json.loads(receipt))
+            command='offline-observe-worker-close'
         response=canonical(result)
         encoded=json.dumps(result)
         returned=None
 
         def checked():
-            memory(request)
+            memory(request, require_completion=_completion)
             require(canonical(dict(token=token,openOperationId=open_operation_id,releaseOperationId=release_operation_id))==request,
                     'PROOF_MISMATCH','観測要求の固定原文が変更されました')
             require(canonical(result)==response and (returned is None or canonical(returned)==response),
@@ -758,7 +794,7 @@ class _OfflineOpen:
                         'OPERATION_CONFLICT','観測IDが他の操作で使用されています')
             checked()
             old=connection.execute('SELECT * FROM runtime_operations WHERE id=?',(operation_id,)).fetchone()
-            require(old is None or (old['command']=='offline-observe-worker-release' and old['instance']==token['instanceId']
+            require(old is None or (old['command']==command and old['instance']==token['instanceId']
                 and old['fingerprint']==fingerprint and old['status']=='COMPLETED' and old['response']==encoded),
                 'OPERATION_CONFLICT','元観測の入力・結果が一致しません')
             checked()
@@ -774,7 +810,7 @@ class _OfflineOpen:
                 if old is None:
                     checked()
                     connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
-                        (operation_id,fingerprint,'offline-observe-worker-release',token['instanceId'],'COMPLETED',encoded))
+                        (operation_id,fingerprint,command,token['instanceId'],'COMPLETED',encoded))
                 require(stored(connection) is not None,'PROOF_REQUIRED','W解放観測の記録がありません')
             returned=deepcopy(result)
             checked()
