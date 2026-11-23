@@ -37,7 +37,7 @@ class OfflineOwnerReleaseTests(unittest.TestCase):
         self.before_close=self.after_close=lambda:None
         self.process.close=Mock(side_effect=self.close_handle)
         self.enterContext(patch.object(self.pipe,'close_after_exit',side_effect=lambda **kw:
-            database_proxy_pipe.ProxyPipe.close_after_exit(self.pipe,**kw)))
+            type(self.pipe).close_after_exit(self.pipe,close=os.close,**kw)))
         original=os.close
         def close_fd(fd):
             role=next((k for k,v in self.fds.items() if fd==v),None)

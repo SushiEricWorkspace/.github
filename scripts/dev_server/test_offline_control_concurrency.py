@@ -25,7 +25,7 @@ class OfflineConcurrencyTests(unittest.TestCase):
         self.addCleanup(f.doCleanups)
         self.f=f
         self.generation=f.prepare()
-        f.start()
+        f.command('start',dict(f.token,timeoutSeconds=30),'start-01')
         f.stop=partial(f.stop,timeout=30)
         f.stop()
         self.runtime=f.registry.runtime

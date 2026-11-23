@@ -179,9 +179,6 @@ if header:
                 pipe.send(payload, time.monotonic() + 5, lambda: None)
                 self.assertEqual(payload, pipe.receive(time.monotonic() + 5, lambda: None))
             finally:
-                if pipe.output is not None:
-                    os.close(pipe.output)
-                    pipe.output = None
                 deadline = time.monotonic() + 5
                 while process.pid is not None and time.monotonic() < deadline:
                     if process.poll() is not None and process.members() == []:

@@ -376,7 +376,13 @@ class OfflineProcess:
         if command == 'verify-ready':
             verify()
         self._record()
-        self.pipe = ProxyPipe()
+        try:
+            self.pipe = ProxyPipe()
+        except BaseException as error:
+            self.pipe = getattr(error, 'pipe', self.pipe)
+            if self.pipe is not None:
+                self.creation_resources = (self.process, self.pipe)
+            raise
         self.creation_resources = (self.process, self.pipe)
         if command == 'verify-ready':
             resources = self.creation_resources
