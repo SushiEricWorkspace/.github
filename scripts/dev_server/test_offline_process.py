@@ -106,12 +106,14 @@ class Pipe:
     def close_child_ends(self):
         self.child_input = self.child_output = None
 
-    def close_after_exit(self, verify=None):
+    def close_after_exit(self, verify=None, close=None):
         self.close_child_ends()
         for name in ('input', 'output'):
             if getattr(self, name) is not None:
                 if verify is not None:
                     verify()
+                if close is not None:
+                    close(getattr(self, name))
                 setattr(self, name, None)
 
     def send(self, request, deadline, verify):

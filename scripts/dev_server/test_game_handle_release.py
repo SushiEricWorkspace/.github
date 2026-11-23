@@ -33,9 +33,15 @@ class HandleReleaseTests(unittest.TestCase):
         pipe=database_proxy_pipe.ProxyPipe()
         pipe.close_child_ends()
         self.slot['observer'].pipe=pipe
-        runtime,run,stop=self.runtime,base.case.session['run'],self.stop_id
+        owned={fd for pin in pipe.pins if pin.state!='RELEASED' for fd in pin.binding[1:]}
+        native_close=os.close
+        def tracked_close(fd):
+            native_close(fd);owned.discard(fd)
+        tracking=patch.object(database_proxy_pipe.os,'close',side_effect=tracked_close)
+        tracking.start();self.addCleanup(tracking.stop)
         def cleanup_pipe():
-            runtime._game_exit(run,stop)[0]['observer'].pipe.close_after_exit()
+            for fd in tuple(owned):
+                native_close(fd);owned.remove(fd)
         self.addCleanup(cleanup_pipe)
         original=self.m.close
         def close_m():
@@ -362,7 +368,7 @@ class HandleReleaseTests(unittest.TestCase):
         self.pending();self.no_retry()
 
     def test_deadline_after_final_fd_preserves_released_without_success(self):
-        pipe=self.pipe_state();last=pipe.output;original=os.close
+        pipe=self.pipe_state();last=pipe.pins[-1].binding[2];original=os.close
         def close(fd):
             original(fd)
             if fd==last:self.base.case.clock=21

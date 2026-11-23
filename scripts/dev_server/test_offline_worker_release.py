@@ -44,7 +44,7 @@ class OfflineWorkerReleaseTests(unittest.TestCase):
             w.process.close=Mock(side_effect=lambda i=index,**options:close_process(i,**options))
             for role in ('input','output'):self.fds[getattr(w.pipe,role)]=(index,role)
             self.enterContext(patch.object(w.pipe,'close_after_exit',side_effect=lambda p=w.pipe,**kw:
-                database_proxy_pipe.ProxyPipe.close_after_exit(p,**kw)))
+                type(p).close_after_exit(p,close=os.close,**kw)))
         original=os.close
         def close_fd(fd):
             if fd not in self.fds:return original(fd)

@@ -59,7 +59,11 @@ class DatabaseProxy:
         self.record = {'bindingSha256': self.binding_hash,
                        'commandHash': runtime_process.command_hash(arguments), 'creation': None, 'identity': None}
         self._record()
-        self.pipe = ProxyPipe()
+        try:
+            self.pipe = ProxyPipe()
+        except BaseException as error:
+            self.pipe = getattr(error, 'pipe', self.pipe)
+            raise
 
         def created():
             self.record['creation'] = {'pid': self.process.pid, 'stage': self.process.stage,
