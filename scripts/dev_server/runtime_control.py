@@ -186,6 +186,14 @@ class RuntimeControl:
             open_operation_id=open_operation_id, release_operation_id=release_operation_id,
             deadline=deadline, _completion=True)
 
+    def _offline_recover_worker_pipe(self, token, *, operation_id, open_operation_id,
+                                     release_operation_id, observation_operation_id, deadline):
+        """元process closeの完了観測から最初Wの未開始pipeだけを一度解放する。"""
+        require(self._offline is not None, 'RECOVERY_REQUIRED', '元offline保持枠が必要です')
+        return self._offline.recover_worker_pipe(token, operation_id=operation_id,
+            open_operation_id=open_operation_id, release_operation_id=release_operation_id,
+            observation_operation_id=observation_operation_id, deadline=deadline)
+
     def _offline_read_ready_original(self, token, *, open_operation_id, ready, deadline):
         """現在Ready原文と元CLOSED/終端の一致を返す。chain検証とstart受付は後続で行う。"""
         require(self._offline is not None, "PROOF_REQUIRED", "保持したoffline終端証拠が必要です")

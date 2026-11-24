@@ -35,6 +35,7 @@ class OfflineProcess:
         self.adapter = process_adapter
         self.process = process_adapter.OwnedProcess()
         self.pipe = None
+        self.pipe_pins = None
         self.creation_resources = None
         self.identity = self.parent = self.data_identity = self.parent_data = None
         self.request = self.response = None
@@ -383,6 +384,7 @@ class OfflineProcess:
             if self.pipe is not None:
                 self.creation_resources = (self.process, self.pipe)
             raise
+        self.pipe_pins = getattr(self.pipe, 'pins', None)
         self.creation_resources = (self.process, self.pipe)
         if command == 'verify-ready':
             resources = self.creation_resources
