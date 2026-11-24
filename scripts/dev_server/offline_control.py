@@ -49,6 +49,7 @@ class _OfflineOpen:
         self.release_failures = {}
         self.release_completions = {}
         self.release_pipes = {}
+        self.release_pipe_results = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -913,12 +914,14 @@ class _OfflineOpen:
         encoded=json.dumps(result)
         attempt=request,response
         started=False
+        committed=False
         returned=None
 
-        def checked():
+        def checked(limit=deadline):
             require(self.release_pipes.get(key) is frame and self.release_failures.get(key) is packet
                 and self.release_completions.get(key) is completion
-                and (not started or len(attempts)==1 and attempts[0] is attempt),
+                and (not started or len(attempts)==1 and attempts[0] is attempt
+                    and self.release_pipe_results.get(key) is result_packet),
                 'PROOF_MISMATCH','元pipe・close完了packetの保持先が変更されました')
             memory(source_request,require_completion=True,pipe_release=started)
             require(canonical(dict(operationId=operation_id,source=dict(token=token,
@@ -926,25 +929,33 @@ class _OfflineOpen:
                 observationOperationId=observation_operation_id))==request
                 and canonical(result)==response and (returned is None or canonical(returned)==response),
                 'PROOF_MISMATCH','recover要求・完成結果の固定原文が変更されました')
-            require(time.monotonic()<deadline,'STOP_TIMEOUT','元pipe recoverの期限を超過しました')
+            require(time.monotonic()<limit,'STOP_TIMEOUT','元pipe recoverの期限を超過しました')
 
-        def stored(connection, *, status=None):
-            checked()
-            saved(connection,token,source_request,deadline,pipe_release=started)
-            checked()
+        def stored(connection, *, status=None, limit=deadline):
+            checked(limit)
+            saved(connection,token,source_request,limit,pipe_release=started)
+            checked(limit)
             row=connection.execute('SELECT * FROM runtime_operations WHERE id=?',(observation_operation_id,)).fetchone()
             require(row is not None and row['command']=='offline-observe-worker-close'
                 and row['instance']==token['instanceId'] and row['fingerprint']==digest(source_request)
                 and row['status']=='COMPLETED' and row['response']==source_encoded,
                 'PROOF_REQUIRED','元process closeの正常完了観測正本が一致しません')
-            checked()
+            checked(limit)
             if status is not None:
                 row=connection.execute('SELECT * FROM runtime_operations WHERE id=?',(operation_id,)).fetchone()
                 require(row is not None and row['command']=='offline-recover-worker-pipe'
                     and row['instance']==token['instanceId'] and row['fingerprint']==fingerprint
                     and row['status']==status and row['response']==encoded,
                     'OPERATION_CONFLICT','元pipe recoverの固定意図・結果が一致しません')
-                checked()
+                checked(limit)
+
+        def finished(limit):
+            checked(limit)
+            require(committed and all(pin.state=='RELEASED' and pin.pin is None
+                    and getattr(pipe,pin.name) is None for pin in pins),
+                    'RECOVERY_REQUIRED','同じPの元pipe正常解放と独立commit証拠が必要です')
+
+        result_packet=request,response,controller,finished,stored
 
         def verify():
             checked()
@@ -968,6 +979,7 @@ class _OfflineOpen:
             checked()
             claim(attempt)
             started=True
+            self.release_pipe_results[key]=result_packet
             checked()
             verify()
             pipe.close_after_exit(verify=verify)
@@ -985,6 +997,7 @@ class _OfflineOpen:
                 connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
                     (operation_id,fingerprint,'offline-recover-worker-pipe',token['instanceId'],'COMPLETED',encoded))
                 stored(connection,status='COMPLETED')
+            committed=True
             returned=deepcopy(result)
             checked()
             controller._verify_close_binding(deadline)
@@ -993,6 +1006,83 @@ class _OfflineOpen:
                 stored(connection,status='COMPLETED')
             checked()
         checked()
+        return returned
+
+    def observe_worker_released(self, token, *, operation_id, open_operation_id, pipe_operation_id, deadline):
+        """最初Wの元process観測と独立pipe完了を合成する。元意図・全W終端は変更しない。
+
+        同じPがpipe作用前から保持するpacketと独立COMPLETED正本が必要。
+        資源への再作用は行わず、今回期限で新しい照合結果だけを独立記録する。
+        """
+        token=deepcopy(token)
+        fields(token,TOKEN)
+        for value,name in ((operation_id,'operationId'),(open_operation_id,'openOperationId'),
+                           (pipe_operation_id,'pipeOperationId')):
+            identifier(value,name)
+        source=self.release_pipe_results.get((token['instanceId'],open_operation_id))
+        require(source is not None,'RECOVERY_REQUIRED','同じPの作用前pipe結果packetが必要です')
+        source_raw,pipe_raw,controller,finished,stored_pipe=source
+        original=json.loads(source_raw)
+        require(original['source']['token']==token and original['source']['openOperationId']==open_operation_id
+                and original['operationId']==pipe_operation_id,
+                'PROOF_MISMATCH','元pipe要求と今回の固定bindingが一致しません')
+        require(len({operation_id,open_operation_id,pipe_operation_id,original['observationOperationId'],
+                    original['source']['releaseOperationId']})==5,
+                'OPERATION_CONFLICT','元操作と別の照合IDが必要です')
+        request=canonical(dict(token=token,openOperationId=open_operation_id,pipeOperationId=pipe_operation_id))
+        fingerprint=digest(request)
+        pipe_result=json.loads(pipe_raw)
+        result=dict(status='OFFLINE_WORKER_RELEASE_CONFIRMED',operationId=operation_id,
+            pipeOperationId=pipe_operation_id,workerOperationId=pipe_result['workerOperationId'],
+            sourceSha256=pipe_result['sourceSha256'],processReleaseSha256=pipe_result['processReleaseSha256'],
+            pipeReleaseSha256=digest(pipe_raw),workerResourcesReleased=True,terminatesOriginal=False)
+        response=canonical(result)
+        encoded=json.dumps(result)
+        returned=None
+
+        def memory():
+            finished(deadline)
+            require(self.release_pipe_results.get((token['instanceId'],open_operation_id)) is source
+                and canonical(dict(token=token,openOperationId=open_operation_id,pipeOperationId=pipe_operation_id))==request
+                and canonical(result)==response and (returned is None or canonical(returned)==response),
+                'PROOF_MISMATCH','元pipe結果packet・合成要求・返却値が変更されました')
+            require(time.monotonic()<deadline,'STOP_TIMEOUT','W解放証拠の合成期限を超過しました')
+
+        def stored(connection):
+            memory()
+            stored_pipe(connection,status='COMPLETED',limit=deadline)
+            memory()
+            for table in ('operations','writer_operations','reference_operations','snapshot_operations'):
+                require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?',(operation_id,)).fetchone(),
+                        'OPERATION_CONFLICT','照合IDが他の操作で使用されています')
+                memory()
+            old=connection.execute('SELECT * FROM runtime_operations WHERE id=?',(operation_id,)).fetchone()
+            require(old is None or (old['command']=='offline-observe-worker-released'
+                and old['instance']==token['instanceId'] and old['fingerprint']==fingerprint
+                and old['status']=='COMPLETED' and old['response']==encoded),
+                'OPERATION_CONFLICT','元W解放照合の固定要求・結果が一致しません')
+            memory()
+            return old
+
+        memory()
+        with self.registry.resource_use(),self.runtime._lock_wait(deadline):
+            memory()
+            controller._verify_close_binding(deadline)
+            memory()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                if stored(connection) is None:
+                    memory()
+                    connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
+                        (operation_id,fingerprint,'offline-observe-worker-released',token['instanceId'],'COMPLETED',encoded))
+                require(stored(connection) is not None,'PROOF_REQUIRED','元W解放照合の記録がありません')
+            returned=deepcopy(result)
+            memory()
+            controller._verify_close_binding(deadline)
+            memory()
+            with self.runtime._transaction(token['instanceId'],read_only=True) as connection:
+                require(stored(connection) is not None,'PROOF_REQUIRED','元W解放照合の正本がありません')
+            memory()
+        memory()
         return returned
 
     def _workers_released(self, connection, token, controller, operation_id, deadline):
