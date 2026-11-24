@@ -48,6 +48,7 @@ class _OfflineOpen:
         self.close_synchronizations = {}
         self.release_failures = {}
         self.release_completions = {}
+        self.release_pipes = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -600,6 +601,13 @@ class _OfflineOpen:
                         *(getattr(actor.pipe,n,None) for n in
                           ('child_input','child_output','outgoing','offset','incoming','expected'))) for actor in actors)
                 fixed_values = deepcopy(values())
+                pin_groups = tuple(getattr(actor,'pipe_pins',None) for actor in actors)
+                pin_locks = tuple(getattr(actor.pipe,'_lock',None) for actor in actors)
+                pin_bindings = tuple(tuple(pin.binding for pin in group) if group is not None else None
+                    for group in pin_groups)
+                pin_values = tuple(tuple((pin.name,pin.fd,pin.pin,pin.state) for pin in group)
+                    if group is not None else None for group in pin_groups)
+                pipe_started = False
                 snapshot = self._release_snapshot(controller, workers, history or [])
                 snapshot[0][0][0]['worker_release'][bindings[0]['operationId']]['handle'] = 'UNKNOWN'
                 intent = encoded
@@ -611,8 +619,41 @@ class _OfflineOpen:
                         handle='UNKNOWN' if index==0 else 'NOT_STARTED',pipe='NOT_STARTED')
                         for index,binding in enumerate(bindings)]))
 
-                def memory(request, *, require_failure=True, require_completion=False):
+                def memory(request, *, require_failure=True, require_completion=False, pipe_release=False):
                     require(request==original_request,'STALE_OPERATION','元W解放要求の固定bindingが一致しません')
+                    expected_snapshot = snapshot
+                    if pipe_release:
+                        require(pipe_started and self.release_pipes.get(key) is pipe_frame,
+                                'RECOVERY_REQUIRED','元pipeの明示解放開始が必要です')
+                        states=tuple(pin.state for pin in pin_groups[1])
+                        require(states in (
+                            ('RELEASED','RELEASED','OPEN','OPEN'),
+                            ('RELEASED','RELEASED','PIN_PENDING','OPEN'),
+                            ('RELEASED','RELEASED','RELEASED','OPEN'),
+                            ('RELEASED','RELEASED','RELEASED','PIN_PENDING'),
+                            ('RELEASED','RELEASED','RELEASED','RELEASED')),
+                            'RECOVERY_REQUIRED','元pipeの正常解放進捗を確認できません')
+                        expected_snapshot=deepcopy(snapshot)
+                        item=expected_snapshot[0][1]
+                        expected_snapshot[0][1]=(*item[:4],
+                            item[4] if states[2]=='OPEN' else None,
+                            item[5] if states[3]=='OPEN' else None)
+                    for index,(actor,group,lock,group_bindings,group_values) in enumerate(
+                            zip(actors,pin_groups,pin_locks,pin_bindings,pin_values)):
+                        require(getattr(actor,'pipe_pins',None) is group and getattr(actor.pipe,'_lock',None) is lock,
+                                'PROOF_MISMATCH','元pipe生成時の外部保持pin又はlockが変更されました')
+                        if group is None:
+                            continue
+                        require(actor.pipe.pins is group and len(group)==4,
+                                'PROOF_MISMATCH','元pipe生成時のpin群が変更されました')
+                        for number,(pin,binding,value) in enumerate(zip(group,group_bindings,group_values)):
+                            expected_value=value
+                            if pipe_release and index==1 and number>=2:
+                                state=states[number]
+                                expected_value=(*value[:2],None if state=='RELEASED' else value[2],state)
+                            require(pin.owner is actor.pipe and pin.binding is binding
+                                and (pin.name,pin.fd,pin.pin,pin.state)==expected_value,
+                                'PROOF_MISMATCH','元pinのobject・binding・正常解放進捗が一致しません')
                     require((failed or not require_failure) and self.runtime._offline is self and self.release_failures.get(key) is packet
                         and self.controllers.get(instance) is controller and self.workers.get(instance) is latest
                         and self.history.get(instance) is history and controller.worker_release is progress
@@ -629,14 +670,14 @@ class _OfflineOpen:
                                 getattr(actor.process,'process',None),getattr(actor.pipe,'incoming',None)),refs[4:]))
                             for actor,refs in zip(actors,references))
                         and values()==fixed_values
-                        and self._release_snapshot(controller,workers,history or [])==snapshot,
+                        and self._release_snapshot(controller,workers,history or [])==expected_snapshot,
                         'PROOF_MISMATCH', '元W解放失敗の作用前bindingと保持証拠が一致しません')
                     if require_completion:
                         require(completed and self.release_completions.get(key) is completion,
                                 'RECOVERY_REQUIRED', '同じPが保持する元process close正常完了が必要です')
 
-                def saved_failure(connection, current_token, request, limit):
-                    memory(request)
+                def saved_failure(connection, current_token, request, limit, *, pipe_release=False):
+                    memory(request,pipe_release=pipe_release)
                     require(time.monotonic()<limit,'STOP_TIMEOUT','元W予約の照合前に期限を超過しました')
                     self._reserved(connection,current_token,opened['operationId'],opened['requestHash'],expected)
                     require(time.monotonic()<limit,'STOP_TIMEOUT','元W固定rowの照合前に期限を超過しました')
@@ -647,7 +688,7 @@ class _OfflineOpen:
                     require({k:v for k,v in current.items() if k!='expires'}=={k:v for k,v in row.items() if k!='expires'}
                         and original==intent,
                         'STALE_OPERATION', '元W解放意図・固定rowが変更されました')
-                    memory(request)
+                    memory(request,pipe_release=pipe_release)
                 packet = facts, controller, memory, saved_failure
                 self.release_failures[key] = packet
                 completed = False
@@ -663,6 +704,21 @@ class _OfflineOpen:
 
                 completion = receipt, packet
                 self.release_completions[key] = completion
+
+                pipe_attempts=[]
+
+                def claim_pipe(attempt):
+                    nonlocal pipe_started
+                    require(not pipe_started and not pipe_attempts and self.release_pipes.get(key) is pipe_frame
+                        and pin_groups[1] is not None and len(pin_groups[1])==4,
+                        'RECOVERY_REQUIRED','生成時pinのある元pipeの未開始作用だけを受理します')
+                    require(tuple(v[3] for v in pin_values[1])==('RELEASED','RELEASED','OPEN','OPEN'),
+                            'RECOVERY_REQUIRED','元pipeが未開始の親端点と正常解放済み子端点ではありません')
+                    pipe_attempts.append(attempt)
+                    pipe_started=True
+
+                pipe_frame=packet,resources[0][1],pin_groups[1],claim_pipe,pipe_attempts
+                self.release_pipes[key]=pipe_frame
 
             def checked(connection):
                 _, current = self._owner_released(connection, token, controller, operation_id, deadline)
@@ -816,6 +872,125 @@ class _OfflineOpen:
             checked()
             with self.runtime._transaction(token['instanceId'],read_only=True) as connection:
                 require(stored(connection) is not None,'PROOF_REQUIRED','W解放観測の正本がありません')
+            checked()
+        checked()
+        return returned
+
+    def recover_worker_pipe(self, token, *, operation_id, open_operation_id,
+                            release_operation_id, observation_operation_id, deadline):
+        """最初Wの未開始pipeだけを明示解放し、元UNKNOWN・PENDING・予約を維持する。
+
+        同じPの生成時pinと元close完了のCOMPLETED観測が必要。各端点の正常遷移だけを
+        元packetへ引き継ぐ。一度開始した要求は再実行せず、途中不明では資源を保全する。
+        """
+        token=deepcopy(token)
+        fields(token,TOKEN)
+        ids=((operation_id,'operationId'),(open_operation_id,'openOperationId'),
+             (release_operation_id,'releaseOperationId'),(observation_operation_id,'observationOperationId'))
+        for value,name in ids:
+            identifier(value,name)
+        require(len({value for value,_ in ids})==4,'OPERATION_CONFLICT','元操作と別のrecover IDが必要です')
+        key=token['instanceId'],open_operation_id
+        frame=self.release_pipes.get(key)
+        require(frame is not None,'RECOVERY_REQUIRED','同じPの作用前pipe保持枠が必要です')
+        packet,pipe,pins,claim,attempts=frame
+        raw,controller,memory,saved=packet
+        completion=self.release_completions.get(key)
+        require(completion is not None and completion[1] is packet,
+                'RECOVERY_REQUIRED','同じ元close完了packetが必要です')
+        receipt=completion[0]
+        source_request=canonical(dict(token=token,openOperationId=open_operation_id,releaseOperationId=release_operation_id))
+        request=canonical(dict(operationId=operation_id,source=json.loads(source_request),observationOperationId=observation_operation_id))
+        fingerprint=digest(request)
+        source_result=dict(status='OFFLINE_WORKER_CLOSE_OBSERVED',operationId=observation_operation_id,
+            source=json.loads(raw),terminatesOriginal=False,processRelease=json.loads(receipt))
+        source_encoded=json.dumps(source_result)
+        result=dict(status='OFFLINE_WORKER_PIPE_RELEASED',operationId=operation_id,
+            observationOperationId=observation_operation_id,sourceSha256=digest(raw),
+            processReleaseSha256=digest(receipt),workerOperationId=json.loads(receipt)['workerOperationId'],
+            pipeReleased=True,terminatesOriginal=False)
+        response=canonical(result)
+        encoded=json.dumps(result)
+        attempt=request,response
+        started=False
+        returned=None
+
+        def checked():
+            require(self.release_pipes.get(key) is frame and self.release_failures.get(key) is packet
+                and self.release_completions.get(key) is completion
+                and (not started or len(attempts)==1 and attempts[0] is attempt),
+                'PROOF_MISMATCH','元pipe・close完了packetの保持先が変更されました')
+            memory(source_request,require_completion=True,pipe_release=started)
+            require(canonical(dict(operationId=operation_id,source=dict(token=token,
+                openOperationId=open_operation_id,releaseOperationId=release_operation_id),
+                observationOperationId=observation_operation_id))==request
+                and canonical(result)==response and (returned is None or canonical(returned)==response),
+                'PROOF_MISMATCH','recover要求・完成結果の固定原文が変更されました')
+            require(time.monotonic()<deadline,'STOP_TIMEOUT','元pipe recoverの期限を超過しました')
+
+        def stored(connection, *, status=None):
+            checked()
+            saved(connection,token,source_request,deadline,pipe_release=started)
+            checked()
+            row=connection.execute('SELECT * FROM runtime_operations WHERE id=?',(observation_operation_id,)).fetchone()
+            require(row is not None and row['command']=='offline-observe-worker-close'
+                and row['instance']==token['instanceId'] and row['fingerprint']==digest(source_request)
+                and row['status']=='COMPLETED' and row['response']==source_encoded,
+                'PROOF_REQUIRED','元process closeの正常完了観測正本が一致しません')
+            checked()
+            if status is not None:
+                row=connection.execute('SELECT * FROM runtime_operations WHERE id=?',(operation_id,)).fetchone()
+                require(row is not None and row['command']=='offline-recover-worker-pipe'
+                    and row['instance']==token['instanceId'] and row['fingerprint']==fingerprint
+                    and row['status']==status and row['response']==encoded,
+                    'OPERATION_CONFLICT','元pipe recoverの固定意図・結果が一致しません')
+                checked()
+
+        def verify():
+            checked()
+            controller._verify_close_binding(deadline)
+            checked()
+            with self.runtime._transaction(token['instanceId'],read_only=True) as connection:
+                stored(connection)
+            checked()
+
+        checked()
+        with self.registry.resource_use(),self.runtime._lock_wait(deadline):
+            checked()
+            controller._verify_close_binding(deadline)
+            checked()
+            with self.runtime._transaction(token['instanceId'],read_only=True) as connection:
+                stored(connection)
+                for table in ('operations','writer_operations','reference_operations','snapshot_operations','runtime_operations'):
+                    checked()
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?',(operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT','recover IDは既に使用されています')
+            checked()
+            claim(attempt)
+            started=True
+            checked()
+            verify()
+            pipe.close_after_exit(verify=verify)
+            verify()
+            require(all(pin.state=='RELEASED' and pin.pin is None and getattr(pipe,pin.name) is None for pin in pins),
+                    'RECOVERY_REQUIRED','元pipeの正常解放が完了していません')
+            checked()
+            with self.runtime._transaction(token['instanceId']) as connection:
+                stored(connection)
+                for table in ('operations','writer_operations','reference_operations','snapshot_operations','runtime_operations'):
+                    checked()
+                    require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?',(operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT','recover IDは既に使用されています')
+                checked()
+                connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
+                    (operation_id,fingerprint,'offline-recover-worker-pipe',token['instanceId'],'COMPLETED',encoded))
+                stored(connection,status='COMPLETED')
+            returned=deepcopy(result)
+            checked()
+            controller._verify_close_binding(deadline)
+            checked()
+            with self.runtime._transaction(token['instanceId'],read_only=True) as connection:
+                stored(connection,status='COMPLETED')
             checked()
         checked()
         return returned

@@ -454,6 +454,7 @@ class PipeCallerTests(unittest.TestCase):
         self.assertEqual('open', request['command'])
         self.assertEqual(1, helper.process.starts)
         self.assertIs(helper.pipe, helper.creation_resources[1])
+        self.assertIs(helper.pipe.pins, helper.pipe_pins)
         self.assertEqual(['RELEASED', 'RELEASED', 'OPEN', 'OPEN'], [p.state for p in helper.pipe.pins])
         self.assertEqual(helper.pipe.pins[0].fd, helper.process.stdio['input_fd'])
         self.assertEqual(helper.pipe.pins[1].fd, helper.process.stdio['output_fd'])
