@@ -707,3 +707,12 @@ pinは生成時の元ProxyPipe owner参照も保持し、ProxyPipe自体の浅�
 正常結果は`offline-observe-worker-released/COMPLETED`と`OFFLINE_WORKER_RELEASE_CONFIRMED`であり、最初Wだけの`workerResourcesReleased=true`を表す。元process UNKNOWN・pipe NOT_STARTEDは元意図の履歴として維持し、元open PENDING・pending1・予約1と他Wを変更しない。全W完成・元終端・start許可を意味しない。同じ照合IDのreadbackも元packetと正本を再照合し、再close・旧FD操作・元Data再送・追加同期を行わない。正常commitを保持できない場合、部分解放不明、元packetのないP再起動は保全拒否する。
 
 新しい照合要求の期限を全照合と資源調停退出後まで使い、元の解放期限は変更しない。失敗・不明時は元資源・原文・予約とcommit済みの独立結果を保持し、自動解放・再送しない。最後の外部/Registry観測以降は純比較と期限確認のみであり、その観測以後の外部不変は保証しない。残るWの解放作用・全W完成への合成と公開recoverは後続とする。
+
+
+### 最初Wの完成証拠から次Wの未開始process closeへ進む内部recover
+
+`RuntimeControl._offline_recover_next_worker_close`は、最初Wの`offline-observe-worker-released/COMPLETED`と、同じPが元W解放作用前に固定した第二Wのobject・close callable・bindingを必要とする。新しいoperation ID、元open/pipe/合成観測ID、対象worker IDと今回の絶対deadlineを指定する。現在のlatestやclose属性から対象を選び直さない。第67 helperの正常readbackと固定callbackを一体で受け取り、各native作用前・短いRegistry write内・調停退出後の最終返却まで元証拠を照合する。
+
+同じframeの専用lockと単発claimで並行要求と再実行を拒否する。対象の元OwnedProcess.closeだけを一度呼び、全native正常復帰通知と独立commitの正常通知を別に保持する。`OFFLINE_NEXT_WORKER_CLOSE_COMPLETED`と`offline-recover-next-worker-close/COMPLETED`は次Wのprocess資源だけの証拠で、対象pipe・以降のW・全W完成・元終端を意味しない。元UNKNOWN/NOT_STARTED・元意図・open PENDING・pending・予約は変更しない。部分失敗・通知/返却喪失では元object・原文・識別と予約を保持し、再close・旧番号への追加作用・pipe解放・Data再送・局所同期を行わない。
+
+生成時pinの原本性は、constructor由来の保持欄が元packet固定前に書き換えられない既存の前提に依拠する。今回その書込み経路は増やしていない。元作用の期限やclose bindingを延長せず、後続で肯定証拠を照合する場合の期限だけを純比較/正本確認へ明示的に渡せる。最終の外部観測と資源調停退出後は保持値の純比較・期限確認だけで返却する。最後の観測後の外部変更は検出できない残余窓であり、以後の不変を保証しない。
