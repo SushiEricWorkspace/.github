@@ -50,6 +50,7 @@ class _OfflineOpen:
         self.release_completions = {}
         self.release_pipes = {}
         self.release_pipe_results = {}
+        self.release_next_workers = {}
 
     def _state(self, connection, token, *, reserved, release_operation_id=None):
         row = dict(self.registry._instance(connection, token['instanceId']))
@@ -671,7 +672,8 @@ class _OfflineOpen:
                                 getattr(actor.process,'process',None),getattr(actor.pipe,'incoming',None)),refs[4:]))
                             for actor,refs in zip(actors,references))
                         and values()==fixed_values
-                        and self._release_snapshot(controller,workers,history or [])==expected_snapshot,
+                        and self._release_snapshot(controller,workers,history or [])==expected_snapshot
+                        and self.release_next_workers.get(key) is next_frame,
                         'PROOF_MISMATCH', '元W解放失敗の作用前bindingと保持証拠が一致しません')
                     if require_completion:
                         require(completed and self.release_completions.get(key) is completion,
@@ -692,6 +694,9 @@ class _OfflineOpen:
                     memory(request,pipe_release=pipe_release)
                 packet = facts, controller, memory, saved_failure
                 self.release_failures[key] = packet
+                next_frame = (packet, workers[1], closes[1], canonical(bindings[1]), [], threading.Lock()) if len(workers)>1 else None
+                if next_frame is not None:
+                    self.release_next_workers[key] = next_frame
                 completed = False
                 receipt = canonical(dict(sourceSha256=digest(facts), workerOperationId=bindings[0]['operationId'],
                     workerExitSha256=bindings[0]['workerExitSha256'], processResourcesClosed=True, pipeReleased=False))
@@ -1008,11 +1013,13 @@ class _OfflineOpen:
         checked()
         return returned
 
-    def observe_worker_released(self, token, *, operation_id, open_operation_id, pipe_operation_id, deadline):
+    def observe_worker_released(self, token, *, operation_id, open_operation_id, pipe_operation_id, deadline,
+                                _handoff=False):
         """最初Wの元process観測と独立pipe完了を合成する。元意図・全W終端は変更しない。
 
         同じPがpipe作用前から保持するpacketと独立COMPLETED正本が必要。
         資源への再作用は行わず、今回期限で新しい照合結果だけを独立記録する。
+        内部handoffは正常commit通知と固定callbackを返却値と一体で引き渡す。
         """
         token=deepcopy(token)
         fields(token,TOKEN)
@@ -1039,31 +1046,37 @@ class _OfflineOpen:
         response=canonical(result)
         encoded=json.dumps(result)
         returned=None
+        committed=False
 
-        def memory():
-            finished(deadline)
+        def memory(limit=deadline):
+            finished(limit)
             require(self.release_pipe_results.get((token['instanceId'],open_operation_id)) is source
                 and canonical(dict(token=token,openOperationId=open_operation_id,pipeOperationId=pipe_operation_id))==request
                 and canonical(result)==response and (returned is None or canonical(returned)==response),
                 'PROOF_MISMATCH','元pipe結果packet・合成要求・返却値が変更されました')
-            require(time.monotonic()<deadline,'STOP_TIMEOUT','W解放証拠の合成期限を超過しました')
+            require(time.monotonic()<limit,'STOP_TIMEOUT','W解放証拠の合成期限を超過しました')
 
-        def stored(connection):
-            memory()
-            stored_pipe(connection,status='COMPLETED',limit=deadline)
-            memory()
+        def stored(connection, limit=deadline):
+            memory(limit)
+            stored_pipe(connection,status='COMPLETED',limit=limit)
+            memory(limit)
             for table in ('operations','writer_operations','reference_operations','snapshot_operations'):
                 require(not connection.execute(f'SELECT 1 FROM {table} WHERE id=?',(operation_id,)).fetchone(),
                         'OPERATION_CONFLICT','照合IDが他の操作で使用されています')
-                memory()
+                memory(limit)
             old=connection.execute('SELECT * FROM runtime_operations WHERE id=?',(operation_id,)).fetchone()
             require(old is None or (old['command']=='offline-observe-worker-released'
                 and old['instance']==token['instanceId'] and old['fingerprint']==fingerprint
                 and old['status']=='COMPLETED' and old['response']==encoded),
                 'OPERATION_CONFLICT','元W解放照合の固定要求・結果が一致しません')
-            memory()
+            memory(limit)
             return old
 
+        def complete(limit=deadline):
+            memory(limit)
+            require(committed,'RECOVERY_REQUIRED','同じ合成要求の正常commit通知が必要です')
+
+        handoff=request,response,controller,complete,stored
         memory()
         with self.registry.resource_use(),self.runtime._lock_wait(deadline):
             memory()
@@ -1075,6 +1088,7 @@ class _OfflineOpen:
                     connection.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
                         (operation_id,fingerprint,'offline-observe-worker-released',token['instanceId'],'COMPLETED',encoded))
                 require(stored(connection) is not None,'PROOF_REQUIRED','元W解放照合の記録がありません')
+            committed=True
             returned=deepcopy(result)
             memory()
             controller._verify_close_binding(deadline)
@@ -1083,6 +1097,140 @@ class _OfflineOpen:
                 require(stored(connection) is not None,'PROOF_REQUIRED','元W解放照合の正本がありません')
             memory()
         memory()
+        if _handoff:
+            complete()
+            return returned,handoff
+        return returned
+
+    def recover_next_worker_close(self, token, *, operation_id, open_operation_id, pipe_operation_id,
+                                  observation_operation_id, worker_operation_id, deadline):
+        """最初Wの完成証拠から、履歴順で次のWの未開始process closeだけを一度行う。
+
+        元の作用前callableと全保持群を使用する。正常close/commit通知を別々に保持し、
+        不明時は再closeしない。元意図・進捗・予約と対象pipe、以降のWは変更しない。
+        """
+        token=deepcopy(token)
+        fields(token,TOKEN)
+        ids=((operation_id,'operationId'),(open_operation_id,'openOperationId'),
+             (pipe_operation_id,'pipeOperationId'),(observation_operation_id,'observationOperationId'),
+             (worker_operation_id,'workerOperationId'))
+        for value,name in ids:
+            identifier(value,name)
+        require(len({value for value,_ in ids})==5,'OPERATION_CONFLICT','元操作と別のrecover IDが必要です')
+        key=token['instanceId'],open_operation_id
+        frame=self.release_next_workers.get(key)
+        require(frame is not None,'RECOVERY_REQUIRED','同じPが作用前に固定した次Wの保持枠が必要です')
+        packet,worker,close,binding_raw,attempts,lock=frame
+        binding=json.loads(binding_raw)
+        require(binding['operationId']==worker_operation_id,'PROOF_MISMATCH','履歴順の次Wが一致しません')
+        facts=json.loads(packet[0])
+        require(operation_id not in {facts['releaseOperationId'],*(w['operationId'] for w in facts['workers'])},
+                'OPERATION_CONFLICT','元W解放・各Wと別のrecover IDが必要です')
+        require(time.monotonic()<deadline,'STOP_TIMEOUT','次Wのrecover入口で期限を超過しました')
+        require(lock.acquire(blocking=False),'RECOVERY_REQUIRED','同じ次Wのrecoverが進行中です')
+        try:
+            with self.registry.resource_use(),self.runtime._lock_wait(deadline):
+                require(not attempts,'RECOVERY_REQUIRED','同じ次Wのcloseを再実行しません')
+                require(time.monotonic()<deadline,'STOP_TIMEOUT','次Wの正本読取前に期限を超過しました')
+                with self.runtime._transaction(token['instanceId'],read_only=True) as db:
+                    row=db.execute('SELECT command,status FROM runtime_operations WHERE id=?',
+                                   (observation_operation_id,)).fetchone()
+                    require(row is not None and row['command']=='offline-observe-worker-released'
+                        and row['status']=='COMPLETED','PROOF_REQUIRED','最初Wの合成COMPLETEDが必要です')
+                    require(time.monotonic()<deadline,'STOP_TIMEOUT','最初Wの固定packet読取前に期限を超過しました')
+                require(time.monotonic()<deadline,'STOP_TIMEOUT','最初Wの固定packet照合前に期限を超過しました')
+                observed,source=self.observe_worker_released(token,operation_id=observation_operation_id,
+                    open_operation_id=open_operation_id,pipe_operation_id=pipe_operation_id,deadline=deadline,_handoff=True)
+                _,source_response,controller,source_finished,source_stored=source
+                request=canonical(dict(token=token,operationId=operation_id,openOperationId=open_operation_id,
+                    pipeOperationId=pipe_operation_id,observationOperationId=observation_operation_id,
+                    workerOperationId=worker_operation_id))
+                fingerprint=digest(request)
+                result=dict(status='OFFLINE_NEXT_WORKER_CLOSE_COMPLETED',operationId=operation_id,
+                    openOperationId=open_operation_id,observationOperationId=observation_operation_id,
+                    workerOperationId=worker_operation_id,workerBindingSha256=digest(binding_raw),
+                    firstWorkerReleaseSha256=digest(source_response),processResourcesClosed=True,
+                    pipeReleased=False,allWorkersReleased=False,terminatesOriginal=False)
+                response=canonical(result)
+                encoded=json.dumps(result)
+                started=False
+                completed=False
+                committed=False
+                returned=None
+
+                def memory(limit=deadline):
+                    source_finished(limit)
+                    require(self.release_next_workers.get(key) is frame and self.release_failures.get(key) is packet
+                        and (not started and not attempts or started and len(attempts)==1 and attempts[0] is attempt)
+                        and canonical(observed)==source_response
+                        and canonical(dict(token=token,operationId=operation_id,openOperationId=open_operation_id,
+                            pipeOperationId=pipe_operation_id,observationOperationId=observation_operation_id,
+                            workerOperationId=worker_operation_id))==request
+                        and canonical(result)==response and (returned is None or canonical(returned)==response),
+                        'PROOF_MISMATCH','次Wの元保持枠・要求・完成結果が変更されました')
+                    require(time.monotonic()<limit,'STOP_TIMEOUT','次Wのrecover期限を超過しました')
+
+                def stored(db, limit=deadline, *, present=False):
+                    memory(limit)
+                    require(source_stored(db,limit) is not None,'PROOF_REQUIRED','最初Wの合成正本がありません')
+                    memory(limit)
+                    for table in ('operations','writer_operations','reference_operations','snapshot_operations'):
+                        require(not db.execute(f'SELECT 1 FROM {table} WHERE id=?',(operation_id,)).fetchone(),
+                            'OPERATION_CONFLICT','recover IDが別操作で使用されています')
+                        memory(limit)
+                    row=db.execute('SELECT * FROM runtime_operations WHERE id=?',(operation_id,)).fetchone()
+                    require((not present and row is None) or (present and row is not None
+                        and row['command']=='offline-recover-next-worker-close' and row['instance']==token['instanceId']
+                        and row['fingerprint']==fingerprint and row['status']=='COMPLETED' and row['response']==encoded),
+                        'OPERATION_CONFLICT','次Wのrecover意図・結果が一致しません')
+                    memory(limit)
+
+                def verify():
+                    memory()
+                    controller._verify_close_binding(deadline)
+                    memory()
+                    with self.runtime._transaction(token['instanceId'],read_only=True) as db:
+                        stored(db)
+                    memory()
+
+                def observe():
+                    nonlocal completed
+                    memory()
+                    require(not completed,'RECOVERY_REQUIRED','次Wの正常close通知は一度だけです')
+                    completed=True
+
+                def complete(limit=deadline):
+                    memory(limit)
+                    require(completed and committed,'RECOVERY_REQUIRED','次Wの正常closeと正常commit通知が必要です')
+
+                attempt=request,response,worker,complete,stored
+                memory()
+                verify()
+                attempts.append(attempt)
+                started=True
+                verify()
+                close(verify=verify,observe=observe)
+                memory()
+                require(completed,'RECOVERY_REQUIRED','元closeの正常完了通知がありません')
+                verify()
+                with self.runtime._transaction(token['instanceId']) as db:
+                    stored(db)
+                    require(completed,'RECOVERY_REQUIRED','次Wの正常close通知がありません')
+                    memory()
+                    db.execute('INSERT INTO runtime_operations VALUES (?,?,?,?,?,?)',
+                        (operation_id,fingerprint,'offline-recover-next-worker-close',token['instanceId'],'COMPLETED',encoded))
+                    stored(db,present=True)
+                committed=True
+                returned=deepcopy(result)
+                complete()
+                controller._verify_close_binding(deadline)
+                complete()
+                with self.runtime._transaction(token['instanceId'],read_only=True) as db:
+                    stored(db,present=True)
+                complete()
+        finally:
+            lock.release()
+        complete()
         return returned
 
     def _workers_released(self, connection, token, controller, operation_id, deadline):
